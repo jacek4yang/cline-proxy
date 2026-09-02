@@ -1,0 +1,304 @@
+# cline-proxy
+
+`cline-proxy` is a small Rust gateway that exposes OpenAI Chat Completions and
+Anthropic Messages APIs over one or more Cline API keys. Its primary use is
+running Claude Code against Cline while filling one configured key at a time.
+
+> **Routing invariant: ONLY an upstream HTTP 429 response triggers API-key
+> switching.** No other HTTP status, network error, timeout, malformed body,
+> or interrupted stream switches keys or replays a request.
+
+## Architecture
+
+The binary contains five intentionally small subsystems:
+
+- Axum serves `/v1/messages`, `/v1/messages/count_tokens`,
+  `/v1/chat/completions`, `/v1/models`, `/healthz`, and `/readyz`.
+- One long-lived rustls `reqwest::Client` provides HTTP/2, gzip, pooling,
+  keep-alive, connect timeout, and read-inactivity timeout behavior.
+- A concurrency-safe pool holds the sticky active key and per-key 429
+  cooldown metadata. No lock is held over a network await.
+- The Anthropic adapter converts structured messages, images, tool use/results,
+  reasoning, usage, stop reasons, and stateful OpenAI SSE into Anthropic SSE.
+- Central error and redaction paths remove configured secrets, Bearer values,
+  API-key fields, cookies, and JWT-like values.
+
+There is no OAuth, credential refresh, database, Redis, web UI, balance poller,
+or admin API. Configuration is read once from JSON at startup.
+
+## Build and install
+
+Rust 1.88 or newer is required by the locked dependency graph.
+
+```bash
+cargo build --release
+install -m 0755 target/release/cline-proxy ~/.local/bin/cline-proxy
+```
+
+The binary can also be run directly with `cargo run --release`.
+
+## Configuration
+
+Copy the example and replace every placeholder locally:
+
+```bash
+cp config.example.json config.json
+chmod 600 config.json
+```
+
+The default path is `./config.json`. Override it with `--config PATH` or
+`CLINE_PROXY_CONFIG=PATH`.
+
+The key list is ordered. Disabled entries remain configured but are not loaded:
+
+```json
+"cline_api_keys": [
+  { "name": "cline-1", "api_key": "YOUR_CLINE_API_KEY_1", "enabled": true },
+  { "name": "cline-2", "api_key": "YOUR_CLINE_API_KEY_2", "enabled": true },
+  { "name": "spare",   "api_key": "YOUR_CLINE_API_KEY_3", "enabled": false }
+]
+```
+
+Startup rejects an empty or non-header-safe gateway key, zero enabled Cline
+keys, empty or duplicate key entries, an invalid bind address or URL, embedded
+URL credentials, zero timeout/size limits, invalid tracing filters, and
+malformed or reserved upstream headers. Validation errors identify a key by
+index only and never print its value.
+
+### Cline-facing headers
+
+`upstream.headers` deliberately describes the Cline client identity. The
+example sends:
+
+```text
+HTTP-Referer: https://cline.bot
+User-Agent: Cline/4.1.16
+X-Client-Type: cline-vscode
+X-Client-Version: 4.1.16
+X-Core-Version: 4.1.16
+X-Platform: vscode
+X-Platform-Version: 1.106.0
+X-Title: Cline
+```
+
+These are HTTP semantic compatibility settings, not a claim that rustls
+reproduces a Chromium, Node, or VS Code TLS ClientHello fingerprint.
+
+The gateway owns `Authorization`, `Host`, `Content-Length`,
+`Transfer-Encoding`, `Connection`, `Accept`, `Content-Type`,
+`Accept-Encoding`, `Cookie`, and `x-api-key`; configuration cannot override
+them. Client headers are not blindly copied upstream. Each upstream request is
+constructed with `Authorization: Bearer <selected Cline key>` after all other
+headers have been selected.
+
+### Models and aliases
+
+`models.default` plus alias names and targets form the deterministic local
+`/v1/models` result. Aliases are applied consistently to OpenAI chat,
+Anthropic Messages, and token-count request accounting. For example:
+
+```json
+"models": {
+  "default": "z-ai/glm-5.3-flash",
+  "aliases": {
+    "claude-sonnet-4-6": "z-ai/glm-5.3-flash"
+  }
+}
+```
+
+No live model-list request is needed for readiness or model discovery.
+
+## Run
+
+```bash
+cargo run --release -- --config config.json
+# or
+./target/release/cline-proxy --config config.json
+```
+
+`SIGINT` and `SIGTERM` stop new accepts and allow active requests to drain for
+`runtime.shutdown_timeout_secs` before remaining connections are aborted.
+
+Set `RUST_LOG` to override `runtime.log_level`. `runtime.log_format` accepts
+`pretty` or `json`.
+
+## Gateway authentication
+
+API routes require the gateway's `server.api_key`, supplied in either form:
+
+```text
+Authorization: Bearer <gateway key>
+x-api-key: <gateway key>
+```
+
+Health endpoints are intentionally unauthenticated. The gateway key is never
+forwarded. The Cline keys are never returned to clients.
+
+## Claude Code
+
+Point Claude Code's Anthropic base URL at the local gateway. Provide
+`CLINE_PROXY_GATEWAY_KEY` through your normal secret-management mechanism; it
+must equal `server.api_key`:
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8788
+export ANTHROPIC_AUTH_TOKEN="${CLINE_PROXY_GATEWAY_KEY:?set CLINE_PROXY_GATEWAY_KEY}"
+export ANTHROPIC_MODEL=claude-sonnet-4-6
+export ANTHROPIC_DEFAULT_OPUS_MODEL=claude-sonnet-4-6
+export ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-6
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-sonnet-4-6
+export API_TIMEOUT_MS=600000
+claude
+```
+
+If a Claude Code version uses `ANTHROPIC_API_KEY` instead, set it to the same
+gateway key. The gateway accepts both Bearer and `x-api-key` authentication.
+
+Messages compatibility includes system and mid-conversation system content,
+text, base64/URL images, documents where the upstream supports OpenAI file
+parts, assistant `tool_use`, user `tool_result`, tools/input schemas,
+tool choice, parallel tools, sampling and stop fields, response usage, and
+reasoning fields that can be represented as Anthropic thinking blocks.
+
+Streaming uses a bounded, stateful SSE decoder. It emits `message_start`,
+content block start/delta/stop, `message_delta`, and `message_stop`; tool
+arguments can be split at arbitrary chunk boundaries and multiple call indexes
+can be interleaved. Malformed or truncated upstream streams produce one
+Anthropic error event and are never replayed. Dropping the downstream body
+drops the reqwest body so abandoned streaming work is cancelled upstream.
+
+`POST /v1/messages/count_tokens` is a local UTF-8/JSON byte-based estimate
+(`ceil(serialized prompt bytes / 4)`), not the exact tokenizer for the selected
+Cline model. It performs no billable upstream request and returns
+`x-cline-proxy-token-count: approximate` so this limitation is explicit.
+
+## Manual integration tests
+
+Set `CLINE_PROXY_GATEWAY_KEY` to `server.api_key` through your normal
+secret-management mechanism. These commands do not use or reveal a Cline key.
+
+Model list:
+
+```bash
+curl -sS http://127.0.0.1:8788/v1/models \
+  -H "Authorization: Bearer ${CLINE_PROXY_GATEWAY_KEY:?set CLINE_PROXY_GATEWAY_KEY}"
+```
+
+OpenAI non-stream:
+
+```bash
+curl -sS http://127.0.0.1:8788/v1/chat/completions \
+  -H "Authorization: Bearer ${CLINE_PROXY_GATEWAY_KEY:?set CLINE_PROXY_GATEWAY_KEY}" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"Reply with OK"}]}'
+```
+
+OpenAI stream:
+
+```bash
+curl -N http://127.0.0.1:8788/v1/chat/completions \
+  -H "Authorization: Bearer ${CLINE_PROXY_GATEWAY_KEY:?set CLINE_PROXY_GATEWAY_KEY}" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"claude-sonnet-4-6","stream":true,"messages":[{"role":"user","content":"Count to three"}]}'
+```
+
+Anthropic stream:
+
+```bash
+curl -N http://127.0.0.1:8788/v1/messages \
+  -H "x-api-key: ${CLINE_PROXY_GATEWAY_KEY:?set CLINE_PROXY_GATEWAY_KEY}" \
+  -H 'anthropic-version: 2023-06-01' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"claude-sonnet-4-6","max_tokens":128,"stream":true,"messages":[{"role":"user","content":"Reply with OK"}]}'
+```
+
+Health checks:
+
+```bash
+curl -fsS http://127.0.0.1:8788/healthz
+curl -fsS http://127.0.0.1:8788/readyz
+```
+
+## Exact rate-limit behavior
+
+Selection is sticky and sequential. With keys 1, 2, and 3, normal requests
+continue using key 1. If and only if key 1 returns HTTP 429, that key enters
+cooldown and the same logical request may try key 2. Later requests stay on key
+2 until it returns 429. When the current key is limited, selection scans
+forward and wraps to any older key whose cooldown has expired.
+
+For one request, every enabled key is tried at most once. The maximum number of
+upstream attempts is therefore the enabled key count. If all are cooling or all
+return 429, the client receives HTTP 429 with `all Cline API keys are currently
+rate-limited` and, when known, an approximate earliest `Retry-After`.
+
+Cooldown precedence is:
+
+1. `Retry-After` delta-seconds or HTTP date.
+2. Clear structured JSON retry fields.
+3. Text such as `Try again in 2h 30m`, `Retry in 3h`, or `Retry after 30ms`.
+4. `upstream.fallback_429_cooldown_secs`.
+
+The parser accepts `d`, `h`, `m`, `s`, and `ms`, combines components, checks
+overflow, caps unreasonable values, handles invalid UTF-8 lossily, and never
+panics on malformed input.
+
+Every non-429 status—including 400, 401, 402, 403, 404, 408, 409, 422 and all
+5xx responses—is sanitized and returned without switching keys. DNS, TLS,
+connection, reset, timeout, body-read, invalid JSON, and SSE errors also return
+without switching. There are no hidden 5xx retries or automatic auth retries.
+
+Failover happens from the initial HTTP response status, before a response body
+is exposed downstream. After an OpenAI or Anthropic stream body exists, no
+retry path is reachable. This prevents duplicate text, tool calls, commands,
+file edits, or patches.
+
+## Logging and security
+
+Logs include request ID, protocol, model/alias, streaming mode, selected key
+name/index, status, duration, attempt/failover count, cooldown source and
+duration, first Anthropic event, periodic stream counters, completion, and
+sanitized error class. Prompts and full request headers are not logged.
+
+Configured Cline and gateway key strings are removed from upstream error bodies
+in addition to structural redaction of Authorization, API keys, access/refresh
+tokens, cookies, Bearer values, and JWT-like strings. Key names are operational
+labels and may appear in logs; do not put secret material in a key name.
+
+Protect `config.json` as a credential file, bind to loopback unless remote
+access is deliberately secured, use a long random gateway key, and put TLS in
+front of the service before exposing it beyond a trusted host. This gateway
+does not encrypt the config file or provide credential management.
+
+## Troubleshooting
+
+- Startup `server.api_key must not be empty`: choose a local gateway key; it is
+  separate from all Cline keys.
+- `all Cline API keys are currently rate-limited`: wait for the earliest
+  cooldown or add another enabled key and restart.
+- A 401/403 does not move to another key by design. Correct or replace that
+  configured Cline key, then restart.
+- `could not connect to upstream`: check DNS, TLS roots, firewall/proxy policy,
+  and `upstream.base_url`. The request is not retried on another key.
+- `upstream stream ended unexpectedly`: the provider closed without a final
+  stop reason; the gateway intentionally did not replay generation.
+- Token counts differ from provider billing: this endpoint is documented as a
+  local approximation because no Cline tokenizer endpoint is assumed.
+
+## Development
+
+The test suite is offline and uses deterministic loopback mock upstreams. It
+covers normal OpenAI/Anthropic requests, SSE and cancellation, reasoning,
+usage, tool loops and fragmented parallel tools, exact status routing,
+cooldowns, bounded attempts, concurrency, header ownership, and secret
+redaction.
+
+```bash
+cargo fmt --all -- --check
+cargo check --all-targets
+cargo test --all-targets
+cargo clippy --all-targets --all-features -- -D warnings
+```
+
+Some restricted sandboxes require permission for `cargo test` to bind
+ephemeral `127.0.0.1` ports. No test contacts `api.cline.bot`.

@@ -1,0 +1,48 @@
+{
+  "server": {
+    "bind": "127.0.0.1:8788",
+    "api_key": "change-me-to-a-long-random-gateway-key"
+  },
+  "upstream": {
+    "base_url": "https://api.cline.bot/api/v1",
+    "chat_path": "/chat/completions",
+    "timeout_secs": 600,
+    "connect_timeout_secs": 20,
+    "fallback_429_cooldown_secs": 3600,
+    "headers": {
+      "http-referer": "https://cline.bot",
+      "user-agent": "Cline/4.1.16",
+      "x-client-type": "cline-vscode",
+      "x-client-version": "4.1.16",
+      "x-core-version": "4.1.16",
+      "x-platform": "vscode",
+      "x-platform-version": "1.106.0",
+      "x-title": "Cline"
+    }
+  },
+  "cline_api_keys": [
+    {
+      "name": "cline-1",
+      "api_key": "YOUR_CLINE_API_KEY_1",
+      "enabled": true
+    },
+    {
+      "name": "cline-2",
+      "api_key": "YOUR_CLINE_API_KEY_2",
+      "enabled": true
+    }
+  ],
+  "models": {
+    "default": "z-ai/glm-5.3-flash",
+    "aliases": {
+      "claude-sonnet-4-6": "z-ai/glm-5.3-flash"
+    }
+  },
+  "runtime": {
+    "max_request_bytes": 33554432,
+    "log_level": "info",
+    "log_format": "pretty",
+    "stream_progress_secs": 30,
+    "shutdown_timeout_secs": 30
+  }
+}
