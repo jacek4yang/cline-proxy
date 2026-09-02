@@ -1,8 +1,8 @@
-//! Safe HTTP 429 retry-hint extraction.
+//! Effective upstream HTTP 429 classification and safe retry-hint extraction.
 
 use std::time::{Duration, SystemTime};
 
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use serde_json::Value;
 
 const MAX_PARSED_COOLDOWN: Duration = Duration::from_secs(366 * 24 * 60 * 60);
@@ -21,6 +21,183 @@ pub struct RetryHint {
     pub source: RetryHintSource,
     pub message: Option<String>,
     pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamDisposition {
+    Success,
+    DirectRateLimited429,
+    ProxyWrappedRateLimited429,
+    NonFailoverHttpError,
+}
+
+impl UpstreamDisposition {
+    pub fn error_class(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::DirectRateLimited429 => "direct_rate_limit",
+            Self::ProxyWrappedRateLimited429 => "proxy_wrapped_rate_limit",
+            Self::NonFailoverHttpError => "non_failover_http_error",
+        }
+    }
+
+    pub fn is_rate_limited(self) -> bool {
+        matches!(
+            self,
+            Self::DirectRateLimited429 | Self::ProxyWrappedRateLimited429
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ClassifiedUpstreamResponse {
+    pub outer_status: StatusCode,
+    pub effective_status: StatusCode,
+    pub disposition: UpstreamDisposition,
+    pub retry_hint: Option<RetryHint>,
+}
+
+/// Classify one concrete HTTP response from the configured upstream. Transport
+/// errors never enter this function. Text wrappers are deliberately restricted
+/// to outer 5xx responses and require both a known wrapper phrase and explicit
+/// rate-limit semantics.
+pub fn classify_upstream_response(
+    outer_status: StatusCode,
+    headers: &HeaderMap,
+    body: &[u8],
+    fallback: Duration,
+) -> ClassifiedUpstreamResponse {
+    let disposition = if outer_status.is_success() {
+        UpstreamDisposition::Success
+    } else if outer_status == StatusCode::TOO_MANY_REQUESTS {
+        UpstreamDisposition::DirectRateLimited429
+    } else if outer_status.is_server_error() && is_proxy_wrapped_429(body) {
+        UpstreamDisposition::ProxyWrappedRateLimited429
+    } else {
+        UpstreamDisposition::NonFailoverHttpError
+    };
+    let effective_status = if disposition.is_rate_limited() {
+        StatusCode::TOO_MANY_REQUESTS
+    } else {
+        outer_status
+    };
+    let retry_hint = disposition
+        .is_rate_limited()
+        .then(|| retry_hint(headers, body, fallback));
+    ClassifiedUpstreamResponse {
+        outer_status,
+        effective_status,
+        disposition,
+        retry_hint,
+    }
+}
+
+fn is_proxy_wrapped_429(body: &[u8]) -> bool {
+    if serde_json::from_slice::<Value>(body)
+        .ok()
+        .as_ref()
+        .is_some_and(structured_upstream_429)
+    {
+        return true;
+    }
+    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
+    wrapper_reports_status(&text, 429) && has_rate_limit_semantics(&text)
+}
+
+fn structured_upstream_429(value: &Value) -> bool {
+    structured_status(value, false)
+}
+
+fn structured_status(value: &Value, inside_error: bool) -> bool {
+    match value {
+        Value::Object(object) => object.iter().any(|(name, value)| {
+            let normalized = name.to_ascii_lowercase().replace(['-', '_'], "");
+            let explicit_status = matches!(
+                normalized.as_str(),
+                "upstreamstatus" | "statuscode" | "httpstatus"
+            );
+            if (explicit_status || inside_error && normalized == "status")
+                && value_is_status(value, 429)
+            {
+                return true;
+            }
+            let child_inside_error = inside_error || normalized == "error";
+            structured_status(value, child_inside_error)
+        }),
+        Value::Array(values) => values
+            .iter()
+            .any(|value| structured_status(value, inside_error)),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => false,
+    }
+}
+
+fn value_is_status(value: &Value, expected: u64) -> bool {
+    value.as_u64() == Some(expected)
+        || value
+            .as_str()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            == Some(expected)
+}
+
+fn wrapper_reports_status(text: &str, expected: u16) -> bool {
+    const WRAPPER_STEMS: &[&str] = &[
+        "upstream returned",
+        "upstream response status",
+        "upstream status",
+        "upstream error",
+    ];
+    WRAPPER_STEMS.iter().any(|stem| {
+        let mut remaining = text;
+        while let Some(position) = remaining.find(stem) {
+            let tail = &remaining[position + stem.len()..];
+            if leading_status(tail) == Some(expected) {
+                return true;
+            }
+            remaining = tail;
+        }
+        false
+    })
+}
+
+fn leading_status(input: &str) -> Option<u16> {
+    let mut input = input.trim_start_matches(|character: char| {
+        character.is_ascii_whitespace() || matches!(character, ':' | '=' | '-')
+    });
+    if input
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http"))
+        && input.as_bytes().get(4).is_none_or(u8::is_ascii_whitespace)
+    {
+        input = input[4..].trim_start_matches(|character: char| {
+            character.is_ascii_whitespace() || matches!(character, ':' | '=' | '-')
+        });
+    }
+    let digits = input
+        .as_bytes()
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if digits == 0 {
+        return None;
+    }
+    input.get(..digits)?.parse().ok()
+}
+
+fn has_rate_limit_semantics(text: &str) -> bool {
+    [
+        "daily free limit reached",
+        "rate limit",
+        "rate-limit",
+        "rate limited",
+        "rate-limited",
+        "quota exceeded",
+        "too many requests",
+        "try again in",
+        "retry after",
+        "retry-after",
+    ]
+    .iter()
+    .any(|phrase| text.contains(phrase))
 }
 
 pub fn retry_hint(headers: &HeaderMap, body: &[u8], fallback: Duration) -> RetryHint {
@@ -260,6 +437,179 @@ mod tests {
             parse_retry_duration("TRY AGAIN IN 1D 3H 59M 9S"),
             Some(Duration::from_secs(100_749))
         );
+        assert_eq!(
+            parse_retry_duration("Try again in 23h 17m"),
+            Some(Duration::from_secs(83_820))
+        );
+        assert_eq!(
+            parse_retry_duration("Try again in 1d 2h 3m"),
+            Some(Duration::from_secs(93_780))
+        );
+        assert_eq!(
+            parse_retry_duration("Retry after 500ms"),
+            Some(Duration::from_millis(500))
+        );
+    }
+
+    #[test]
+    fn exact_proxy_wrapped_429_is_classified_and_parsed() {
+        let body = b"upstream returned 429: Error 429: Daily free limit reached on model z-ai/glm-5.3-flash. Try again in 23h 17m";
+        let classified = classify_upstream_response(
+            StatusCode::BAD_GATEWAY,
+            &HeaderMap::new(),
+            body,
+            Duration::from_secs(60),
+        );
+        assert_eq!(classified.outer_status, StatusCode::BAD_GATEWAY);
+        assert_eq!(classified.effective_status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            classified.disposition,
+            UpstreamDisposition::ProxyWrappedRateLimited429
+        );
+        let hint = classified.retry_hint.expect("wrapped 429 needs a hint");
+        assert_eq!(hint.duration, Duration::from_secs(83_820));
+        assert_eq!(hint.source, RetryHintSource::HumanText);
+        assert_eq!(hint.model.as_deref(), Some("z-ai/glm-5.3-flash"));
+    }
+
+    #[test]
+    fn proxy_wrapped_429_uses_outer_retry_after_first() {
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", HeaderValue::from_static("17"));
+        let classified = classify_upstream_response(
+            StatusCode::BAD_GATEWAY,
+            &headers,
+            b"upstream returned 429: rate limited; Try again in 23h 17m",
+            Duration::from_secs(60),
+        );
+        let hint = classified.retry_hint.expect("wrapped 429 needs a hint");
+        assert_eq!(hint.duration, Duration::from_secs(17));
+        assert_eq!(hint.source, RetryHintSource::RetryAfter);
+    }
+
+    #[test]
+    fn known_text_wrappers_require_rate_limit_semantics() {
+        for body in [
+            "upstream returned 429: rate limited",
+            "upstream returned HTTP 429: Too Many Requests",
+            "upstream status 429: quota exceeded",
+            "upstream response status: 429; Retry-After 30s",
+            "upstream error: 429; Try again in 3h",
+        ] {
+            let classified = classify_upstream_response(
+                StatusCode::BAD_GATEWAY,
+                &HeaderMap::new(),
+                body.as_bytes(),
+                Duration::from_secs(60),
+            );
+            assert_eq!(
+                classified.disposition,
+                UpstreamDisposition::ProxyWrappedRateLimited429,
+                "{body}"
+            );
+        }
+
+        let weak = classify_upstream_response(
+            StatusCode::BAD_GATEWAY,
+            &HeaderMap::new(),
+            b"upstream returned 429: proxy operation failed",
+            Duration::from_secs(60),
+        );
+        assert_eq!(weak.disposition, UpstreamDisposition::NonFailoverHttpError);
+    }
+
+    #[test]
+    fn structured_proxy_status_fields_are_explicit() {
+        for body in [
+            json_bytes(serde_json::json!({"error":{"upstream_status":429}})),
+            json_bytes(serde_json::json!({"error":{"upstreamStatus":"429"}})),
+            json_bytes(serde_json::json!({"error":{"status_code":429}})),
+            json_bytes(serde_json::json!({"error":{"statusCode":429}})),
+            json_bytes(serde_json::json!({"error":{"http_status":429}})),
+            json_bytes(serde_json::json!({"error":{"httpStatus":429}})),
+            json_bytes(serde_json::json!({"status":502,"error":{"status":429}})),
+        ] {
+            let classified = classify_upstream_response(
+                StatusCode::BAD_GATEWAY,
+                &HeaderMap::new(),
+                &body,
+                Duration::from_secs(60),
+            );
+            assert_eq!(
+                classified.disposition,
+                UpstreamDisposition::ProxyWrappedRateLimited429
+            );
+        }
+
+        for body in [
+            json_bytes(serde_json::json!({"error":{"operation_id":429}})),
+            json_bytes(serde_json::json!({"details":{"status":429}})),
+            json_bytes(serde_json::json!({"status":429})),
+        ] {
+            let classified = classify_upstream_response(
+                StatusCode::BAD_GATEWAY,
+                &HeaderMap::new(),
+                &body,
+                Duration::from_secs(60),
+            );
+            assert_eq!(
+                classified.disposition,
+                UpstreamDisposition::NonFailoverHttpError
+            );
+        }
+    }
+
+    #[test]
+    fn arbitrary_429_text_and_success_output_are_not_proxy_wrappers() {
+        for (status, body) in [
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal operation 429 failed",
+            ),
+            (StatusCode::BAD_GATEWAY, "proxy request id 429123 failed"),
+            (StatusCode::INTERNAL_SERVER_ERROR, "error 429"),
+            (StatusCode::BAD_GATEWAY, "bad gateway"),
+            (
+                StatusCode::OK,
+                "upstream returned 429: rate limited; model output only",
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                "upstream returned 429: rate limited; user input",
+            ),
+        ] {
+            let classified = classify_upstream_response(
+                status,
+                &HeaderMap::new(),
+                body.as_bytes(),
+                Duration::from_secs(60),
+            );
+            let expected = if status.is_success() {
+                UpstreamDisposition::Success
+            } else {
+                UpstreamDisposition::NonFailoverHttpError
+            };
+            assert_eq!(classified.disposition, expected, "{body}");
+        }
+    }
+
+    #[test]
+    fn direct_429_needs_no_body_semantics() {
+        let classified = classify_upstream_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            &HeaderMap::new(),
+            b"arbitrary body",
+            Duration::from_secs(60),
+        );
+        assert_eq!(
+            classified.disposition,
+            UpstreamDisposition::DirectRateLimited429
+        );
+        assert_eq!(classified.effective_status, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    fn json_bytes(value: Value) -> Vec<u8> {
+        serde_json::to_vec(&value).expect("test JSON must serialize")
     }
 
     #[test]
@@ -306,11 +656,23 @@ mod tests {
         #[test]
         fn arbitrary_text_never_panics(input in any::<String>()) {
             let _ = parse_retry_duration(&input);
+            let _ = classify_upstream_response(
+                StatusCode::BAD_GATEWAY,
+                &HeaderMap::new(),
+                input.as_bytes(),
+                Duration::from_secs(1),
+            );
         }
 
         #[test]
         fn arbitrary_bytes_never_panic(input in proptest::collection::vec(any::<u8>(), 0..4096)) {
             let _ = retry_hint(&HeaderMap::new(), &input, Duration::from_secs(1));
+            let _ = classify_upstream_response(
+                StatusCode::BAD_GATEWAY,
+                &HeaderMap::new(),
+                &input,
+                Duration::from_secs(1),
+            );
         }
     }
 }

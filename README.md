@@ -4,9 +4,11 @@
 Anthropic Messages APIs over one or more Cline API keys. Its primary use is
 running Claude Code against Cline while filling one configured key at a time.
 
-> **Routing invariant: ONLY an upstream HTTP 429 response triggers API-key
-> switching.** No other HTTP status, network error, timeout, malformed body,
-> or interrupted stream switches keys or replays a request.
+> **Routing invariant: ONLY an effective upstream HTTP 429 may trigger Cline
+> API-key switching.** This includes a direct HTTP 429 and a high-confidence
+> proxy wrapper that explicitly reports an upstream HTTP 429. Generic 5xx,
+> network failures, timeouts, ambiguous error text, and interrupted streams
+> never switch keys or replay a request.
 
 ## Architecture
 
@@ -16,7 +18,7 @@ The binary contains five intentionally small subsystems:
   `/v1/chat/completions`, `/v1/models`, `/healthz`, and `/readyz`.
 - One long-lived rustls `reqwest::Client` provides HTTP/2, gzip, pooling,
   keep-alive, connect timeout, and read-inactivity timeout behavior.
-- A concurrency-safe pool holds the sticky active key and per-key 429
+- A concurrency-safe pool holds the sticky active key and per-key effective-429
   cooldown metadata. No lock is held over a network await.
 - The Anthropic adapter converts structured messages, images, tool use/results,
   reasoning, usage, stop reasons, and stateful OpenAI SSE into Anthropic SSE.
@@ -222,10 +224,20 @@ curl -fsS http://127.0.0.1:8788/readyz
 ## Exact rate-limit behavior
 
 Selection is sticky and sequential. With keys 1, 2, and 3, normal requests
-continue using key 1. If and only if key 1 returns HTTP 429, that key enters
-cooldown and the same logical request may try key 2. Later requests stay on key
-2 until it returns 429. When the current key is limited, selection scans
-forward and wraps to any older key whose cooldown has expired.
+continue using key 1. If and only if key 1 produces an effective HTTP 429, that
+key enters cooldown and the same logical request may try key 2. Later requests
+stay on key 2 until it is rate-limited. When the current key is limited,
+selection scans forward and wraps to any older key whose cooldown has expired.
+
+An effective 429 is either the configured upstream's direct HTTP 429 response,
+or an outer HTTP 5xx whose bounded error body provides high-confidence proxy
+evidence. Structured wrappers recognize explicit `upstream_status`,
+`upstreamStatus`, `status_code`, `statusCode`, `http_status`, and `httpStatus`
+fields; `error.status` is also accepted inside an error object. Text wrappers
+recognize `upstream returned [HTTP] 429`, `upstream status 429`, `upstream
+response status: 429`, and `upstream error: 429` only when the same body also
+contains rate-limit or quota semantics. Merely containing the number `429` is
+never sufficient.
 
 For one request, every enabled key is tried at most once. The maximum number of
 upstream attempts is therefore the enabled key count. If all are cooling or all
@@ -243,22 +255,28 @@ The parser accepts `d`, `h`, `m`, `s`, and `ms`, combines components, checks
 overflow, caps unreasonable values, handles invalid UTF-8 lossily, and never
 panics on malformed input.
 
-Every non-429 status—including 400, 401, 402, 403, 404, 408, 409, 422 and all
-5xx responses—is sanitized and returned without switching keys. DNS, TLS,
-connection, reset, timeout, body-read, invalid JSON, and SSE errors also return
-without switching. There are no hidden 5xx retries or automatic auth retries.
+Every response not classified as an effective 429—including 400, 401, 402,
+403, 404, 408, 409, 422 and generic 5xx responses—is sanitized and returned
+without switching keys. DNS, TLS, connection, reset, timeout, body-read,
+invalid JSON, and SSE errors also return without switching. Transport-error
+strings are never inspected for status codes. There are no hidden generic 5xx
+retries or automatic auth retries.
 
-Failover happens from the initial HTTP response status, before a response body
-is exposed downstream. After an OpenAI or Anthropic stream body exists, no
-retry path is reachable. This prevents duplicate text, tool calls, commands,
-file edits, or patches.
+Failover classification happens on the initial HTTP error response before any
+response body is exposed downstream. Error inspection is capped at 64 KiB and
+the same buffered, sanitized body is used if the error is returned to the
+client. After an OpenAI or Anthropic stream body exists, no retry path is
+reachable. This prevents duplicate text, tool calls, commands, file edits, or
+patches.
 
 ## Logging and security
 
 Logs include request ID, protocol, model/alias, streaming mode, selected key
 name/index, status, duration, attempt/failover count, cooldown source and
 duration, first Anthropic event, periodic stream counters, completion, and
-sanitized error class. Prompts and full request headers are not logged.
+sanitized error class. Rate-limit logs preserve both the proxy's outer status
+and the classified effective status. Prompts and full request headers are not
+logged.
 
 Configured Cline and gateway key strings are removed from upstream error bodies
 in addition to structural redaction of Authorization, API keys, access/refresh
@@ -289,9 +307,9 @@ does not encrypt the config file or provide credential management.
 
 The test suite is offline and uses deterministic loopback mock upstreams. It
 covers normal OpenAI/Anthropic requests, SSE and cancellation, reasoning,
-usage, tool loops and fragmented parallel tools, exact status routing,
-cooldowns, bounded attempts, concurrency, header ownership, and secret
-redaction.
+usage, tool loops and fragmented parallel tools, direct and proxy-wrapped 429
+routing, false-positive wrapper rejection, cooldowns, bounded attempts,
+concurrency, header ownership, and secret redaction.
 
 ```bash
 cargo fmt --all -- --check

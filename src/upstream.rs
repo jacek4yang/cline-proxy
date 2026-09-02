@@ -1,4 +1,4 @@
-//! Shared Cline HTTP client and the exact HTTP-429-only failover loop.
+//! Shared Cline HTTP client and effective-HTTP-429-only failover loop.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -11,10 +11,10 @@ use thiserror::Error;
 
 use crate::config::Config;
 use crate::pool::{KeyPool, SelectedKey};
-use crate::rate_limit::{retry_hint, RetryHintSource};
+use crate::rate_limit::{classify_upstream_response, ClassifiedUpstreamResponse, RetryHintSource};
 use crate::redaction::sanitize_text;
 
-const MAX_RATE_LIMIT_BODY_BYTES: usize = 64 * 1024;
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 
 #[derive(Clone)]
 pub struct ClineUpstream {
@@ -31,10 +31,30 @@ struct Inner {
 }
 
 pub struct UpstreamResult {
-    pub response: reqwest::Response,
+    pub response: UpstreamResponse,
     pub selected: SelectedKey,
     pub attempt: usize,
     pub failover_count: usize,
+}
+
+pub enum UpstreamResponse {
+    Success(reqwest::Response),
+    HttpError(BufferedUpstreamError),
+}
+
+impl UpstreamResponse {
+    pub fn status(&self) -> StatusCode {
+        match self {
+            Self::Success(response) => response.status(),
+            Self::HttpError(error) => error.classification.outer_status,
+        }
+    }
+}
+
+pub struct BufferedUpstreamError {
+    pub headers: HeaderMap,
+    pub body: Bytes,
+    pub classification: ClassifiedUpstreamResponse,
 }
 
 #[derive(Debug, Error)]
@@ -106,9 +126,9 @@ impl ClineUpstream {
             .collect()
     }
 
-    /// Send one logical chat request. The equality check below is the sole
-    /// failover gate in the gateway: only an actual HTTP 429 enters the retry
-    /// branch. Every other HTTP status and every transport error returns now.
+    /// Send one logical chat request. Only a classified effective HTTP 429 can
+    /// enter the retry branch. Transport errors return before response-body
+    /// classification, and successful responses retain streaming ownership.
     pub async fn send_chat(
         &self,
         body: Bytes,
@@ -130,10 +150,10 @@ impl ClineUpstream {
                 .await
                 .map_err(UpstreamError::Transport)?;
 
-            // CORE INVARIANT: no status other than exactly 429 can switch keys.
-            if response.status() != StatusCode::TOO_MANY_REQUESTS {
+            let outer_status = response.status();
+            if outer_status.is_success() {
                 return Ok(UpstreamResult {
-                    response,
+                    response: UpstreamResponse::Success(response),
                     selected,
                     attempt,
                     failover_count: attempt.saturating_sub(1),
@@ -141,8 +161,40 @@ impl ClineUpstream {
             }
 
             let headers = response.headers().clone();
-            let body = read_limited(response, MAX_RATE_LIMIT_BODY_BYTES).await;
-            let hint = retry_hint(&headers, &body, self.inner.fallback_cooldown);
+            let error_body = read_limited(response, MAX_ERROR_BODY_BYTES).await;
+            let classification = classify_upstream_response(
+                outer_status,
+                &headers,
+                &error_body,
+                self.inner.fallback_cooldown,
+            );
+            if !classification.disposition.is_rate_limited() {
+                return Ok(UpstreamResult {
+                    response: UpstreamResponse::HttpError(BufferedUpstreamError {
+                        headers,
+                        body: error_body,
+                        classification,
+                    }),
+                    selected,
+                    attempt,
+                    failover_count: attempt.saturating_sub(1),
+                });
+            }
+            let Some(hint) = classification.retry_hint.as_ref() else {
+                // A rate-limited classification always carries a retry hint.
+                // If that internal invariant changes, fail closed without
+                // rotating rather than risking an unbounded retry policy.
+                return Ok(UpstreamResult {
+                    response: UpstreamResponse::HttpError(BufferedUpstreamError {
+                        headers,
+                        body: error_body,
+                        classification,
+                    }),
+                    selected,
+                    attempt,
+                    failover_count: attempt.saturating_sub(1),
+                });
+            };
             let secret_refs = self.exact_secrets();
             let safe_message = hint
                 .message
@@ -158,22 +210,27 @@ impl ClineUpstream {
                 safe_message.clone(),
                 safe_model.clone(),
             );
+            let will_failover = attempted.len() < self.inner.pool.len();
             tracing::warn!(
                 request_id,
                 selected_key_name = %selected.name,
                 selected_key_index = selected.configured_index,
-                upstream_status = 429,
+                outer_status = classification.outer_status.as_u16(),
+                effective_status = classification.effective_status.as_u16(),
+                error_class = classification.disposition.error_class(),
                 attempt,
                 failover_count = attempt,
+                failover = will_failover,
                 cooldown_ms = update.cooldown.as_millis(),
+                retry_after_secs = duration_ceil_secs(update.cooldown),
                 cooldown_until_unix = update.cooldown_until
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs(),
                 cooldown_source = retry_source_name(hint.source),
-                retry_model = safe_model.as_deref().unwrap_or(""),
+                rate_limited_model = safe_model.as_deref().unwrap_or(""),
                 rate_limit_message = safe_message.as_deref().unwrap_or(""),
-                "Cline key entered cooldown; trying the next eligible key"
+                "effective upstream HTTP 429 placed Cline key in cooldown"
             );
             if attempted.len() >= self.inner.pool.len() {
                 return Err(UpstreamError::AllRateLimited {
@@ -240,7 +297,7 @@ impl ClineUpstream {
                 selected_key_name = %selected.name,
                 selected_key_index = selected.configured_index,
                 attempt,
-                upstream_status = response.status().as_u16(),
+                outer_status = response.status().as_u16(),
                 duration_ms = started.elapsed().as_millis(),
                 stream,
                 "Cline upstream response"
@@ -283,6 +340,12 @@ fn retry_source_name(source: RetryHintSource) -> &'static str {
         RetryHintSource::HumanText => "human_text",
         RetryHintSource::Fallback => "fallback",
     }
+}
+
+fn duration_ceil_secs(duration: Duration) -> u64 {
+    duration
+        .as_secs()
+        .saturating_add(u64::from(duration.subsec_nanos() > 0))
 }
 
 pub fn transport_error_class(error: &reqwest::Error) -> &'static str {

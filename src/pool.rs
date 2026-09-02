@@ -141,8 +141,8 @@ impl KeyPool {
         None
     }
 
-    /// Mark a key cooling after an actual HTTP 429. No other call site may
-    /// mutate cooldown or move the active key.
+    /// Mark a key cooling after a classified effective HTTP 429. No other call
+    /// site may mutate cooldown or move the active key.
     pub fn mark_http_429(
         &self,
         index: usize,

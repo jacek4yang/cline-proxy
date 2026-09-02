@@ -21,7 +21,10 @@ use crate::anthropic::{self, ProtocolError};
 use crate::config::Config;
 use crate::pool::KeyPool;
 use crate::redaction::{sanitize_json, sanitize_text};
-use crate::upstream::{transport_error_class, ClineUpstream, UpstreamError, UpstreamResult};
+use crate::upstream::{
+    transport_error_class, BufferedUpstreamError, ClineUpstream, UpstreamError, UpstreamResponse,
+    UpstreamResult,
+};
 
 const MAX_UPSTREAM_BODY_BYTES: usize = 16 * 1024 * 1024;
 
@@ -259,9 +262,12 @@ async fn anthropic_messages(
         upstream_status = status.as_u16(),
         "Anthropic upstream attempt selected"
     );
-    if !status.is_success() {
-        return sanitized_upstream_error(&state, result.response, true, &request_id).await;
-    }
+    let response = match result.response {
+        UpstreamResponse::Success(response) => response,
+        UpstreamResponse::HttpError(error) => {
+            return sanitized_upstream_error(&state, error, true, &request_id)
+        }
+    };
     if converted.stream {
         let mut response = Response::builder()
             .status(StatusCode::OK)
@@ -269,7 +275,7 @@ async fn anthropic_messages(
             .header(header::CACHE_CONTROL, "no-cache")
             .header("x-accel-buffering", "no")
             .body(anthropic::stream_body(
-                result.response,
+                response,
                 request_id.clone(),
                 upstream_model,
                 result.selected.name.to_string(),
@@ -280,7 +286,7 @@ async fn anthropic_messages(
         insert_request_id(response.headers_mut(), &request_id);
         return response;
     }
-    let value = match anthropic::parse_json_response(result.response).await {
+    let value = match anthropic::parse_json_response(response).await {
         Ok(value) => value,
         Err(error) => return protocol_error(error, StatusCode::BAD_GATEWAY, &request_id),
     };
@@ -362,9 +368,12 @@ async fn openai_upstream_response(
         upstream_status = status.as_u16(),
         "OpenAI upstream attempt selected"
     );
-    if !status.is_success() {
-        return sanitized_upstream_error(state, result.response, false, request_id).await;
-    }
+    let response = match result.response {
+        UpstreamResponse::Success(response) => response,
+        UpstreamResponse::HttpError(error) => {
+            return sanitized_upstream_error(state, error, false, request_id)
+        }
+    };
     if requested_stream {
         let mut response = Response::builder()
             .status(status)
@@ -372,7 +381,7 @@ async fn openai_upstream_response(
             .header(header::CACHE_CONTROL, "no-cache")
             .header("x-accel-buffering", "no")
             .body(openai_stream_body(
-                result.response,
+                response,
                 request_id.to_owned(),
                 result.selected.name.to_string(),
                 started,
@@ -381,7 +390,7 @@ async fn openai_upstream_response(
         insert_request_id(response.headers_mut(), request_id);
         return response;
     }
-    let bytes = match read_response_limited(result.response, MAX_UPSTREAM_BODY_BYTES).await {
+    let bytes = match read_response_limited(response, MAX_UPSTREAM_BODY_BYTES).await {
         Ok(bytes) => bytes,
         Err(message) => return openai_error(StatusCode::BAD_GATEWAY, message, request_id),
     };
@@ -523,28 +532,25 @@ fn upstream_failure(
     }
 }
 
-async fn sanitized_upstream_error(
+fn sanitized_upstream_error(
     state: &AppState,
-    response: reqwest::Response,
+    error: BufferedUpstreamError,
     anthropic: bool,
     request_id: &str,
 ) -> Response {
     let secrets = state.upstream.exact_secrets();
-    raw_upstream_error(response, anthropic, request_id, &secrets).await
+    raw_upstream_error(error, anthropic, request_id, &secrets)
 }
 
-async fn raw_upstream_error(
-    response: reqwest::Response,
+fn raw_upstream_error(
+    error: BufferedUpstreamError,
     anthropic: bool,
     request_id: &str,
     secrets: &[&str],
 ) -> Response {
-    let status =
-        StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let upstream_headers = response.headers().clone();
-    let bytes = read_response_limited(response, 64 * 1024)
-        .await
-        .unwrap_or_default();
+    let status = error.classification.outer_status;
+    let upstream_headers = error.headers;
+    let bytes = error.body;
     let text = String::from_utf8_lossy(&bytes);
     let sanitized = serde_json::from_slice::<Value>(&bytes)
         .map(|value| sanitize_json(value, secrets))
@@ -1195,6 +1201,208 @@ mod tests {
         assert!(!message.contains("gateway-secret"));
         assert!(!message.contains("cline-key-1"));
         assert_eq!(snapshot.last_429_model.as_deref(), Some("[REDACTED]"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn proxy_wrapped_429_parses_cooldown_switches_once_and_stays_sticky() {
+        let (base, mock, task) = start_mock().await;
+        mock.set(
+            "cline-key-1",
+            vec![Spec::json(
+                502,
+                "upstream returned 429: Error 429: Daily free limit reached on model \
+                 z-ai/glm-5.3-flash. Try again in 23h 17m",
+            )],
+        )
+        .await;
+        mock.set(
+            "cline-key-2",
+            vec![Spec::json(200, successful_json("after wrapped failover"))],
+        )
+        .await;
+        let state = AppState::new(test_config(base, 3)).unwrap();
+        let app = router(state.clone());
+        let response = app
+            .oneshot(gateway_request("/v1/chat/completions", chat_body(false)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let seen = mock.seen().await;
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].authorization, "Bearer cline-key-1");
+        assert_eq!(seen[1].authorization, "Bearer cline-key-2");
+
+        let snapshots = state.upstream.pool().snapshots();
+        let remaining = snapshots[0].cooldown_remaining.unwrap();
+        assert!(remaining <= Duration::from_secs(83_820));
+        assert!(remaining > Duration::from_secs(83_700));
+        assert_eq!(
+            snapshots[0].last_429_model.as_deref(),
+            Some("z-ai/glm-5.3-flash")
+        );
+        assert_eq!(
+            state.upstream.pool().select(&HashSet::new()).unwrap().index,
+            1
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn structured_proxy_upstream_status_429_switches_keys() {
+        let (base, mock, task) = start_mock().await;
+        mock.set(
+            "cline-key-1",
+            vec![Spec::json(
+                502,
+                json!({"error":{
+                    "upstream_status":429,
+                    "message":"Daily free limit reached on model z-ai/glm-5.3-flash. Try again in 23h 17m"
+                }})
+                .to_string(),
+            )],
+        )
+        .await;
+        mock.set(
+            "cline-key-2",
+            vec![Spec::json(200, successful_json("structured failover"))],
+        )
+        .await;
+        let app = router(AppState::new(test_config(base, 2)).unwrap());
+        let response = app
+            .oneshot(gateway_request("/v1/chat/completions", chat_body(false)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let seen = mock.seen().await;
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].authorization, "Bearer cline-key-1");
+        assert_eq!(seen[1].authorization, "Bearer cline-key-2");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn ambiguous_429_text_and_model_output_never_switch_keys() {
+        let (base, mock, task) = start_mock().await;
+        mock.set(
+            "cline-key-1",
+            vec![
+                Spec::json(502, "bad gateway"),
+                Spec::json(502, "proxy request id 429123 failed"),
+                Spec::json(500, "error 429"),
+                Spec::json(200, successful_json("HTTP status 429 means rate limited")),
+            ],
+        )
+        .await;
+        let state = AppState::new(test_config(base, 2)).unwrap();
+        let app = router(state.clone());
+        for (expected_status, expected_text) in [
+            (502, "bad gateway"),
+            (502, "request id 429123"),
+            (500, "error 429"),
+            (200, "status 429"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(gateway_request("/v1/chat/completions", chat_body(false)))
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), expected_status);
+            assert!(response_text(response).await.contains(expected_text));
+        }
+        let seen = mock.seen().await;
+        assert_eq!(seen.len(), 4);
+        assert!(seen
+            .iter()
+            .all(|request| request.authorization == "Bearer cline-key-1"));
+        assert_eq!(
+            state.upstream.pool().select(&HashSet::new()).unwrap().index,
+            0
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn proxy_wrapped_429_walks_each_key_once_then_stays_on_third() {
+        let (base, mock, task) = start_mock().await;
+        mock.set(
+            "cline-key-1",
+            vec![Spec::json(
+                502,
+                "upstream returned 429: Daily free limit reached. Try again in 23h 17m",
+            )],
+        )
+        .await;
+        mock.set(
+            "cline-key-2",
+            vec![Spec::json(
+                503,
+                "upstream returned HTTP 429: rate limited. Try again in 4h",
+            )],
+        )
+        .await;
+        mock.set(
+            "cline-key-3",
+            vec![Spec::json(200, successful_json("third key"))],
+        )
+        .await;
+        let state = AppState::new(test_config(base, 3)).unwrap();
+        let app = router(state.clone());
+        let response = app
+            .oneshot(gateway_request("/v1/chat/completions", chat_body(false)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let authorizations = mock
+            .seen()
+            .await
+            .into_iter()
+            .map(|request| request.authorization)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            authorizations,
+            [
+                "Bearer cline-key-1",
+                "Bearer cline-key-2",
+                "Bearer cline-key-3"
+            ]
+        );
+        let snapshots = state.upstream.pool().snapshots();
+        assert!(snapshots[0].cooldown_remaining.is_some());
+        assert!(snapshots[1].cooldown_remaining.is_some());
+        assert_eq!(
+            state.upstream.pool().select(&HashSet::new()).unwrap().index,
+            2
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn all_proxy_wrapped_429_is_bounded_and_returns_semantic_429() {
+        let (base, mock, task) = start_mock().await;
+        for index in 1..=3 {
+            mock.set(
+                &format!("cline-key-{index}"),
+                vec![Spec::json(
+                    502,
+                    format!(
+                        "upstream response status: 429; quota exceeded; Try again in {}h",
+                        index + 1
+                    ),
+                )],
+            )
+            .await;
+        }
+        let app = router(AppState::new(test_config(base, 3)).unwrap());
+        let response = app
+            .oneshot(gateway_request("/v1/chat/completions", chat_body(false)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(response.headers().contains_key(header::RETRY_AFTER));
+        let body = response_text(response).await;
+        assert!(body.contains("all Cline API keys are currently rate-limited"));
+        assert_eq!(mock.seen().await.len(), 3);
         task.abort();
     }
 
