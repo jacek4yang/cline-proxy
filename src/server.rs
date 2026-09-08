@@ -1,8 +1,10 @@
 //! Axum routes, authentication, protocol dispatch, and graceful shutdown.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use axum::body::Body;
@@ -18,9 +20,10 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 
 use crate::anthropic::{self, ProtocolError};
-use crate::config::Config;
+use crate::config::{defaults, Config};
 use crate::pool::KeyPool;
 use crate::redaction::{sanitize_json, sanitize_text};
+use crate::state::{self, StateLoadOutcome};
 use crate::upstream::{
     transport_error_class, BufferedUpstreamError, ClineUpstream, UpstreamError, UpstreamResponse,
     UpstreamResult,
@@ -32,6 +35,9 @@ const MAX_UPSTREAM_BODY_BYTES: usize = 16 * 1024 * 1024;
 pub struct AppState {
     pub config: Arc<Config>,
     pub upstream: ClineUpstream,
+    pub state_file: Option<Arc<PathBuf>>,
+    pub persistence_healthy: Arc<AtomicBool>,
+    pub started: Instant,
 }
 
 impl AppState {
@@ -41,11 +47,68 @@ impl AppState {
         if pool.is_empty() {
             anyhow::bail!("at least one enabled Cline API key is required");
         }
+        let state_file = config.state_file_path().map(|path| Arc::new(path.clone()));
+        if let Some(path) = &state_file {
+            match state::load(path) {
+                StateLoadOutcome::Loaded(persisted) => {
+                    let summary = pool.restore(&persisted);
+                    tracing::info!(
+                        state_file = %path.display(),
+                        restored_cooldowns = summary.restored_cooldowns,
+                        expired_entries = summary.expired_entries,
+                        unknown_entries = summary.unknown_entries,
+                        restored_active_key = summary.restored_active_key.as_deref().unwrap_or(""),
+                        "runtime state loaded"
+                    );
+                }
+                StateLoadOutcome::Missing => {
+                    tracing::info!(
+                        state_file = %path.display(),
+                        "runtime state file not present; starting with empty state"
+                    );
+                }
+                StateLoadOutcome::Corrupt(reason) => {
+                    // Corrupt state is advisory only; never block startup and
+                    // never echo file contents (defense against unexpected
+                    // secret-shaped data in a damaged file).
+                    tracing::warn!(
+                        state_file = %path.display(),
+                        reason,
+                        "runtime state file was unreadable; starting with empty state"
+                    );
+                }
+            }
+        }
         let upstream = ClineUpstream::new(&config, pool)?;
         Ok(Self {
             config: Arc::new(config),
             upstream,
+            state_file,
+            persistence_healthy: Arc::new(AtomicBool::new(true)),
+            started: Instant::now(),
         })
+    }
+
+    /// One synchronous debounced-state flush. Called by the writer task and
+    /// once more during graceful shutdown. Never called on the request path.
+    pub fn flush_runtime_state(&self) {
+        let Some(path) = self.state_file.as_ref() else {
+            return;
+        };
+        let persisted = self.upstream.pool().persisted_state();
+        match state::store(path, &persisted) {
+            Ok(()) => {
+                self.persistence_healthy.store(true, Ordering::Relaxed);
+            }
+            Err(error) => {
+                self.persistence_healthy.store(false, Ordering::Relaxed);
+                tracing::error!(
+                    state_file = %path.display(),
+                    error = %error,
+                    "failed to persist runtime state; cooldowns will be lost on restart"
+                );
+            }
+        }
     }
 }
 
@@ -56,6 +119,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/messages/count_tokens", post(anthropic_count_tokens))
         .route("/v1/chat/completions", post(openai_chat))
         .route("/v1/models", get(models))
+        .route("/admin/status", get(admin_status))
         .layer(DefaultBodyLimit::max(max_request_bytes))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -79,6 +143,51 @@ async fn readyz(State(state): State<AppState>) -> Response {
         return (StatusCode::SERVICE_UNAVAILABLE, "not ready\n").into_response();
     }
     (StatusCode::OK, "ready\n").into_response()
+}
+
+/// Authenticated, read-only operational snapshot. Never returns key material,
+/// authorization values, or raw upstream error text.
+async fn admin_status(State(state): State<AppState>) -> Response {
+    let pool = state.upstream.pool();
+    let keys = pool
+        .snapshots()
+        .into_iter()
+        .map(|snapshot| {
+            json!({
+                "name": snapshot.name.as_ref(),
+                "state": snapshot.phase.as_str(),
+                "cooldown_remaining_seconds": snapshot.cooldown_remaining.map(|d| d.as_secs()),
+                "cooldown_until_unix": snapshot.cooldown_until
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_secs()),
+                "rate_limit_kind": snapshot.rate_limit_kind.map(|kind| kind.as_str()),
+                "rate_limited_model": snapshot.last_429_model.as_deref().unwrap_or(""),
+                "last_429_at_unix": snapshot.last_429_at
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_secs()),
+                "last_success_at_unix": snapshot.last_success_at
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_secs()),
+                "requests": snapshot.requests,
+                "successes": snapshot.successes,
+                "rate_limits": snapshot.rate_limits,
+            })
+        })
+        .collect::<Vec<_>>();
+    let body = json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "uptime_seconds": state.started.elapsed().as_secs(),
+        "default_model": state.config.models.default,
+        "active_key": pool.active_key_name().map(|name| name.to_string()),
+        "active_key_age_seconds": pool.active_age().as_secs(),
+        "state_persistence": {
+            "enabled": state.state_file.is_some(),
+            "healthy": state.persistence_healthy.load(Ordering::Relaxed),
+        },
+        "keys": keys,
+    });
+    let request_id = "req_admin_status";
+    json_response(StatusCode::OK, body, request_id)
 }
 
 async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -805,8 +914,25 @@ pub async fn serve(state: AppState) -> Result<()> {
         .await
         .with_context(|| format!("binding gateway to {bind}"))?;
     tracing::info!(bind, "cline-proxy listening");
+    // Debounced runtime-state writer: mutations signal the pool's Notify,
+    // this task coalesces them and performs the atomic file replacement off
+    // the request path. Healthy requests never touch the disk.
+    let writer = state.state_file.as_ref().map(|path| {
+        let state = state.clone();
+        let debounce = Duration::from_millis(defaults::STATE_DEBOUNCE_MS);
+        let path = path.clone();
+        tokio::spawn(async move {
+            loop {
+                state.upstream.pool().dirty().notified().await;
+                // Coalesce any notifications that arrived during the wait.
+                tokio::time::sleep(debounce).await;
+                state.flush_runtime_state();
+                tracing::debug!(state_file = %path.display(), "runtime state persisted");
+            }
+        })
+    });
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let app = router(state);
+    let app = router(state.clone());
     let mut task = tokio::spawn(async move {
         axum::serve(
             listener,
@@ -817,9 +943,10 @@ pub async fn serve(state: AppState) -> Result<()> {
         })
         .await
     });
-    tokio::select! {
+    let shutdown_result = tokio::select! {
         result = &mut task => {
             result.context("gateway task failed")?.context("serving HTTP")?;
+            Ok(())
         }
         signal = shutdown_signal() => {
             match &signal {
@@ -845,10 +972,17 @@ pub async fn serve(state: AppState) -> Result<()> {
                     let _ = task.await;
                 }
             }
-            signal?;
+            signal
         }
+    };
+    // Final flush happens inside the shutdown deadline; it is a small
+    // serialized snapshot and cannot meaningfully block exit.
+    if let Some(writer) = writer {
+        writer.abort();
+        let _ = writer.await;
     }
-    Ok(())
+    state.flush_runtime_state();
+    shutdown_result
 }
 
 async fn shutdown_signal() -> Result<()> {
@@ -1048,6 +1182,9 @@ mod tests {
                 enabled: true,
             })
             .collect();
+        // Tests opt in to persistence explicitly so the default working
+        // directory is never polluted by runtime-state.json.
+        config.runtime.state_file = None;
         config
     }
 
@@ -1918,5 +2055,180 @@ mod tests {
             0
         );
         task.await.unwrap();
+    }
+
+    fn unique_state_path(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "cline-proxy-server-test-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("runtime-state.json")
+    }
+
+    /// Production regression: key1–key5 confirm daily-quota 429s, key6
+    /// succeeds, state persists, and after a full process restart the next
+    /// logical request must reach key6 on the FIRST attempt with zero failed
+    /// probes.
+    #[tokio::test]
+    async fn restart_with_persisted_state_skips_known_cooling_keys() {
+        let (base, mock, task) = start_mock().await;
+        let cooldowns = ["8h 37m", "9h 42m", "10h 13m", "10h 55m", "11h 53m"];
+        for (index, cooldown) in cooldowns.iter().enumerate() {
+            mock.set(
+                &format!("cline-key-{}", index + 1),
+                vec![Spec::json(
+                    429,
+                    json!({"error":{"message":format!(
+                        "Daily free limit reached on model z-ai/glm-5.3-flash. Try again in {cooldown}"
+                    )}})
+                    .to_string(),
+                )],
+            )
+            .await;
+        }
+        mock.set(
+            "cline-key-6",
+            vec![
+                Spec::json(200, successful_json("healthy key")),
+                Spec::json(200, successful_json("healthy key after restart")),
+            ],
+        )
+        .await;
+
+        let state_path = unique_state_path("restart");
+        let mut config = test_config(base, 6);
+        config.runtime.state_file = Some(state_path.to_string_lossy().into_owned());
+
+        // First logical request: serial discovery of five exhausted keys.
+        let state = AppState::new(config.clone()).unwrap();
+        let app = router(state.clone());
+        let response = app
+            .oneshot(gateway_request("/v1/chat/completions", chat_body(false)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(mock.seen().await.len(), 6);
+        let snapshots = state.upstream.pool().snapshots();
+        assert_eq!(snapshots[5].name.as_ref(), "cline-6");
+        for snapshot in &snapshots[..5] {
+            assert_eq!(snapshot.phase, crate::pool::KeyPhase::Cooling);
+            assert_eq!(
+                snapshot.rate_limit_kind,
+                Some(crate::rate_limit::RateLimitKind::DailyQuota)
+            );
+        }
+
+        // Persist (the writer task debounces; tests flush synchronously) and
+        // simulate a full process restart with a fresh AppState.
+        state.flush_runtime_state();
+        let state_file_contents = std::fs::read_to_string(&state_path).unwrap();
+        assert!(!state_file_contents.contains("cline-key-"));
+        assert!(!state_file_contents.contains("gateway-secret"));
+        let restarted = AppState::new(config).unwrap();
+        assert_eq!(
+            restarted
+                .upstream
+                .pool()
+                .active_key_name()
+                .map(|name| name.to_string())
+                .as_deref(),
+            Some("cline-6")
+        );
+        let app = router(restarted);
+        let response = app
+            .oneshot(gateway_request("/v1/chat/completions", chat_body(false)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let seen = mock.seen().await;
+        assert_eq!(seen.len(), 7);
+        assert_eq!(seen[6].authorization, "Bearer cline-key-6");
+        std::fs::remove_dir_all(state_path.parent().unwrap()).ok();
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn corrupt_runtime_state_starts_safely_and_serves() {
+        let (base, mock, task) = start_mock().await;
+        mock.set("cline-key-1", vec![Spec::json(200, successful_json("ok"))])
+            .await;
+        let state_path = unique_state_path("corrupt");
+        std::fs::write(&state_path, b"{ definitively not json").unwrap();
+        let mut config = test_config(base, 2);
+        config.runtime.state_file = Some(state_path.to_string_lossy().into_owned());
+        let state = AppState::new(config).unwrap();
+        let app = router(state);
+        let response = app
+            .oneshot(gateway_request("/v1/chat/completions", chat_body(false)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(mock.seen().await.len(), 1);
+        std::fs::remove_dir_all(state_path.parent().unwrap()).ok();
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn admin_status_requires_auth_and_leaks_no_secrets() {
+        let (base, mock, task) = start_mock().await;
+        mock.set(
+            "cline-key-1",
+            vec![Spec::json(
+                429,
+                r#"{"error":{"message":"Daily free limit reached. Try again in 9h"}}"#,
+            )],
+        )
+        .await;
+        mock.set("cline-key-2", vec![Spec::json(200, successful_json("ok"))])
+            .await;
+        let state_path = unique_state_path("admin");
+        let mut config = test_config(base, 2);
+        config.runtime.state_file = Some(state_path.to_string_lossy().into_owned());
+        let state = AppState::new(config).unwrap();
+        let app = router(state.clone());
+        let unauthenticated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+        // Trigger a 429 so rate-limit metadata exists, then flush state.
+        let response = app
+            .clone()
+            .oneshot(gateway_request("/v1/chat/completions", chat_body(false)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let status = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/admin/status")
+                    .header(header::AUTHORIZATION, "Bearer gateway-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+        let body = response_text(status).await;
+        let value: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["keys"][0]["state"], "cooling");
+        assert_eq!(value["keys"][0]["rate_limit_kind"], "daily_quota");
+        assert_eq!(value["active_key"], "cline-2");
+        assert!(!body.contains("cline-key-1"));
+        assert!(!body.contains("cline-key-2"));
+        assert!(!body.contains("gateway-secret"));
+        assert!(!body.contains("Daily free limit"));
+        state.flush_runtime_state();
+        std::fs::remove_dir_all(state_path.parent().unwrap()).ok();
+        task.abort();
     }
 }

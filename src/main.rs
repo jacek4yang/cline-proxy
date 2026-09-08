@@ -4,6 +4,7 @@ mod pool;
 mod rate_limit;
 mod redaction;
 mod server;
+mod state;
 mod upstream;
 
 use std::path::PathBuf;

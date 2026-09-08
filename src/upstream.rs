@@ -10,8 +10,11 @@ use bytes::Bytes;
 use thiserror::Error;
 
 use crate::config::Config;
-use crate::pool::{KeyPool, SelectedKey};
-use crate::rate_limit::{classify_upstream_response, ClassifiedUpstreamResponse, RetryHintSource};
+use crate::pool::{KeyPool, ProbeLease, SelectedKey};
+use crate::rate_limit::{
+    classify_rate_limit_kind, classify_upstream_response, ClassifiedUpstreamResponse,
+    RetryHintSource,
+};
 use crate::redaction::sanitize_text;
 
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
@@ -137,6 +140,7 @@ impl ClineUpstream {
         model: &str,
     ) -> std::result::Result<UpstreamResult, UpstreamError> {
         let mut attempted = HashSet::with_capacity(self.inner.pool.len());
+        let mut failed_probes_ms = 0u128;
         loop {
             let Some(selected) = self.inner.pool.select(&attempted) else {
                 return Err(UpstreamError::AllRateLimited {
@@ -145,13 +149,33 @@ impl ClineUpstream {
             };
             attempted.insert(selected.index);
             let attempt = attempted.len();
-            let response = self
+            // Guards the HalfOpen single-flight probe. Dropping it (early
+            // return, transport error, or client cancellation) releases the
+            // lease so the key stays probe-eligible.
+            let _lease: Option<ProbeLease<'_>> = selected
+                .is_probe
+                .then(|| self.inner.pool.probe_lease(selected.index));
+            let (response, attempt_elapsed) = self
                 .send_once(&selected, body.clone(), stream, request_id, model, attempt)
                 .await
                 .map_err(UpstreamError::Transport)?;
 
             let outer_status = response.status();
             if outer_status.is_success() {
+                // A usable 2xx response proves the key's quota is available:
+                // clear cooldowns, close HalfOpen probing, count success.
+                self.inner.pool.mark_success(selected.index);
+                if attempt > 1 || failed_probes_ms > 0 {
+                    tracing::info!(
+                        request_id,
+                        successful_key = %selected.name,
+                        attempts = attempt,
+                        failovers = attempt.saturating_sub(1),
+                        failed_key_probe_ms = failed_probes_ms,
+                        successful_upstream_headers_ms = attempt_elapsed.as_millis(),
+                        "logical request completed after failover"
+                    );
+                }
                 return Ok(UpstreamResult {
                     response: UpstreamResponse::Success(response),
                     selected,
@@ -180,6 +204,7 @@ impl ClineUpstream {
                     failover_count: attempt.saturating_sub(1),
                 });
             }
+            failed_probes_ms = failed_probes_ms.saturating_add(attempt_elapsed.as_millis());
             let Some(hint) = classification.retry_hint.as_ref() else {
                 // A rate-limited classification always carries a retry hint.
                 // If that internal invariant changes, fail closed without
@@ -204,9 +229,13 @@ impl ClineUpstream {
                 .model
                 .as_deref()
                 .map(|model| sanitize_text(model, &secret_refs));
+            // Kind classification happens only here, after the effective 429
+            // is already confirmed. It never widens failover conditions.
+            let kind = classify_rate_limit_kind(safe_message.as_deref(), hint.duration);
             let update = self.inner.pool.mark_http_429(
                 selected.index,
                 hint.duration,
+                kind,
                 safe_message.clone(),
                 safe_model.clone(),
             );
@@ -218,6 +247,7 @@ impl ClineUpstream {
                 outer_status = classification.outer_status.as_u16(),
                 effective_status = classification.effective_status.as_u16(),
                 error_class = classification.disposition.error_class(),
+                rate_limit_kind = kind.as_str(),
                 attempt,
                 failover_count = attempt,
                 failover = will_failover,
@@ -248,7 +278,7 @@ impl ClineUpstream {
         request_id: &str,
         model: &str,
         attempt: usize,
-    ) -> std::result::Result<reqwest::Response, reqwest::Error> {
+    ) -> std::result::Result<(reqwest::Response, Duration), reqwest::Error> {
         let started = Instant::now();
         let mut headers = self.inner.headers.clone();
         headers.insert(
@@ -276,7 +306,8 @@ impl ClineUpstream {
                     .post(self.inner.chat_url.clone())
                     .header(header::AUTHORIZATION, "\n")
                     .send()
-                    .await;
+                    .await
+                    .map(|response| (response, started.elapsed()));
             }
         }
         if let Ok(value) = HeaderValue::try_from(request_id) {
@@ -290,6 +321,7 @@ impl ClineUpstream {
             .body(body)
             .send()
             .await;
+        let elapsed = started.elapsed();
         match &result {
             Ok(response) => tracing::info!(
                 request_id,
@@ -298,7 +330,7 @@ impl ClineUpstream {
                 selected_key_index = selected.configured_index,
                 attempt,
                 outer_status = response.status().as_u16(),
-                duration_ms = started.elapsed().as_millis(),
+                duration_ms = elapsed.as_millis(),
                 stream,
                 "Cline upstream response"
             ),
@@ -308,13 +340,13 @@ impl ClineUpstream {
                 selected_key_name = %selected.name,
                 selected_key_index = selected.configured_index,
                 attempt,
-                duration_ms = started.elapsed().as_millis(),
+                duration_ms = elapsed.as_millis(),
                 stream,
                 error_class = transport_error_class(error),
                 "Cline upstream request failed without failover"
             ),
         }
-        result
+        result.map(|response| (response, elapsed))
     }
 }
 

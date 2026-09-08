@@ -18,6 +18,11 @@ pub mod defaults {
     pub const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
     pub const STREAM_PROGRESS_SECS: u64 = 30;
     pub const SHUTDOWN_TIMEOUT_SECS: u64 = 30;
+    pub const STATE_FILE: &str = "runtime-state.json";
+    /// Coalesce window for the debounced runtime-state writer. Short enough
+    /// that a confirmed quota 429 reaches disk quickly, long enough to turn
+    /// a multi-key 429 burst into one write.
+    pub const STATE_DEBOUNCE_MS: u64 = 150;
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -144,6 +149,11 @@ pub struct RuntimeConfig {
     pub log_format: LogFormat,
     pub stream_progress_secs: u64,
     pub shutdown_timeout_secs: u64,
+    /// Path of the persisted key runtime state file (relative paths resolve
+    /// against the working directory). `null` or an empty string disables
+    /// persistence. The file never contains key material; see
+    /// `docs/adr/0001-persistent-key-runtime-state-and-stickiness.md`.
+    pub state_file: Option<String>,
 }
 
 impl Default for RuntimeConfig {
@@ -154,6 +164,7 @@ impl Default for RuntimeConfig {
             log_format: LogFormat::Pretty,
             stream_progress_secs: defaults::STREAM_PROGRESS_SECS,
             shutdown_timeout_secs: defaults::SHUTDOWN_TIMEOUT_SECS,
+            state_file: Some(defaults::STATE_FILE.into()),
         }
     }
 }
@@ -257,6 +268,16 @@ impl Config {
         models.sort();
         models.dedup();
         models
+    }
+
+    /// Resolved runtime-state path, or `None` when persistence is disabled.
+    pub fn state_file_path(&self) -> Option<PathBuf> {
+        self.runtime
+            .state_file
+            .as_ref()
+            .map(|path| path.trim())
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
     }
 }
 
@@ -413,6 +434,10 @@ mod tests {
         assert_eq!(
             config.runtime.shutdown_timeout_secs,
             defaults::SHUTDOWN_TIMEOUT_SECS
+        );
+        assert_eq!(
+            config.runtime.state_file.as_deref(),
+            Some(defaults::STATE_FILE)
         );
         assert!(config.cline_api_keys.is_empty());
     }

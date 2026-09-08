@@ -1,0 +1,112 @@
+# Development State
+
+> Agent recovery file. If context is compacted or a session ends, read this
+> file and continue from "Next task".
+
+## Current target
+
+Landed (pending PR merge): persistent key runtime state. Next P0: exact
+GLM-5.3-Flash tokenizer for `/v1/messages/count_tokens`, then reasoning
+parity, tool semantics, and large-context low-copy optimization.
+
+## Repository facts
+
+- Repo: https://github.com/jacek4yang/cline-proxy
+- Baseline commit audited: `a73fd75` (main) — 58 tests green, fmt/clippy clean
+- MSRV 1.88, edition 2021, release binary ~7.9 MB (thin LTO, opt-level 3, strip)
+- CI: fmt / check / test / clippy -D warnings (ubuntu, `.github/workflows/ci.yml`)
+- Open PRs (dependabot, untouched): #1 actions/checkout 4→7, #2 axum 0.7.9→0.8.9
+  (axum 0.8 is an API-breaking bump; do NOT merge without a migration pass)
+- Open issues: #3 = umbrella roadmap issue
+- Production observation (9 keys, ~155 KB requests): restart caused
+  key0→key4 serial 429 probes ≈ 3747 ms wasted ≈ 42% of ~9 s TTFT.
+
+## Completed work
+
+- Full baseline audit (all 8 source files), quality gates green.
+- GLM-5.3-Flash official asset provenance confirmed:
+  - Source: https://huggingface.co/zai-org/GLM-5.3-Flash
+  - Revision SHA: `eb9eb208eb0d988989d07a6a12d0fdeb5f52574a`
+  - Last modified: 2026-09-07; License: MIT
+  - Files present: `tokenizer.json`, `tokenizer_config.json`,
+    `chat_template.jinja`, `config.json`, `generation_config.json`,
+    `processor_config.json`
+  - Local cache of the API metadata: `tools/glm_reference/assets/model_api.json`
+  - Tokenizer asset download + fixture generation NOT yet done.
+- P0 persistent key runtime state IMPLEMENTED on `feat/persistent-key-state`:
+  - `src/state.rs`: versioned schema v1, atomic tmp+rename IO, corrupt-tolerant load
+  - `src/pool.rs`: Healthy/Cooling/HalfOpen/Probing state machine, single-flight
+    HalfOpen probe with drop-safe lease, per-key counters, name-keyed restore,
+    strict sticky select, KeySwitchReason logging
+  - `src/rate_limit.rs`: `RateLimitKind` (DailyQuota/Transient/Unknown), classified
+    only after effective-429 confirmation
+  - `src/upstream.rs`: mark_success on 2xx, probe lease integration, failover
+    latency decomposition (`failed_key_probe_ms`, `successful_upstream_headers_ms`)
+  - `src/server.rs`: authenticated `GET /admin/status`, startup restore in
+    `AppState::new`, debounced writer task in `serve()`, final flush on shutdown
+  - `src/config.rs`: `runtime.state_file` (default `runtime-state.json`, null/"" disables)
+  - Tests: 79 total. Production regression:
+    `restart_with_persisted_state_skips_known_cooling_keys`
+    (5×429 → key6 → persist → restart → attempts=1, failed_probes=0).
+  - Docs: ADR `docs/adr/0001-persistent-key-runtime-state-and-stickiness.md`,
+    README sections "Key stickiness and persisted quota state" + `/admin/status`.
+
+## Current branch
+
+`feat/persistent-key-state` — implementation complete, PR opened. Merge, then
+start the GLM tokenizer work on a fresh branch.
+
+## Architecture decisions (enforced invariants)
+
+- Only effective upstream HTTP 429 (direct, or high-confidence proxy-wrapped)
+  triggers key failover. `src/rate_limit.rs` classification is the sole gate.
+- No committed-stream replay, ever (`src/anthropic.rs` stream body; no retry
+  code is reachable from the body stream).
+- Strict sticky sequential routing: active key is used until it confirms an
+  effective 429; success/5xx/timeout/reset never rotate; an old key whose
+  cooldown expires must NOT steal active back from a healthy key; HalfOpen
+  probing must not preempt the healthy active key.
+- Secrets never appear in logs, Debug impls, state files, or error bodies
+  (`src/redaction.rs`, redacted Debug impls in `config.rs`/`pool.rs`).
+- No Python in the production runtime (tokenizer will be Rust in-process;
+  Python allowed only under `tools/glm_reference/` for oracle fixtures).
+
+## Key design (this branch)
+
+- Runtime state file: `runtime.state_file` in config (default
+  `./runtime-state.json`; explicit `null`/`""` disables persistence).
+- Schema version 1: `{ version, updated_at_unix_ms, active_key, keys: {
+  <key-name>: { cooldown_until_unix_ms, rate_limit_kind, model,
+  last_429_at_unix_ms, last_success_at_unix_ms } } }`. Name-keyed identity
+  (never Vec index). Wall-clock deadlines only (no `Instant` serialized).
+  No secrets, no raw 429 message text.
+- Persistence: in-memory mutation → `Notify` → debounced writer task
+  (~150 ms coalesce) → serialize → tmp file → atomic rename. Health flag
+  exposed in `/admin/status` when persistence fails.
+- Key state machine: Healthy → (effective 429) → Cooling → (deadline
+  expires) → HalfOpen → single-flight probe → success=2xx headers → Healthy
+  / 429 → Cooling / other failure → lease released, stays HalfOpen.
+- HalfOpen is single-flight; requests without alternatives may fall back to
+  a probed HalfOpen key (no worse than pre-existing behavior).
+
+## Next task
+
+1. Land the persistent-key-state PR; re-baseline on main.
+2. GLM tokenizer (P0): download `tokenizer.json` + `tokenizer_config.json` +
+   `chat_template.jinja` @ revision `eb9eb20` into `tools/glm_reference/assets/`
+   (record provenance in `docs/GLM53_FLASH.md`), write the Python oracle under
+   `tools/glm_reference/`, generate `tests/fixtures/glm53/`, implement Rust
+   in-process counting (evaluate the `tokenizers` crate for size/startup cost),
+   replace `approximate_input_tokens` in `src/anthropic.rs` and flip the
+   `x-cline-proxy-token-count` header to `exact`.
+3. Then: reasoning_effort/clear_thinking parity, tool semantics matrix,
+   tool-TTFT benchmark, large-context low-copy, metrics, hot reload.
+
+## Commands
+
+```bash
+cargo fmt --all -- --check
+cargo check --all-targets
+cargo test --all-targets
+cargo clippy --all-targets --all-features -- -D warnings
+```
