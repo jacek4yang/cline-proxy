@@ -115,6 +115,55 @@ Anthropic Messages, and token-count request accounting. For example:
 
 No live model-list request is needed for readiness or model discovery.
 
+### GLM-5.3-Flash request policy (reasoning, output, context)
+
+Requests are optimized for coding-agent workloads before they reach Cline.
+Full rationale and evidence: `docs/GLM53_FLASH.md` and
+`docs/adr/0004-glm53-bounded-reasoning-and-context-policy.md`.
+
+```json
+"glm53": {
+  "reasoning": {
+    "default_effort": "high",
+    "adaptive_effort": "high",
+    "strip_historical_thinking": true,
+    "expose_thinking": "requested_only"
+  },
+  "limits": { "max_output_tokens": 16384 },
+  "context": { "safe_compaction": true },
+  "telemetry": { "exact_input_tokens": true }
+}
+```
+
+- **Explicit reasoning effort, always.** The official GLM template coerces
+  unset effort to `max`; cline-proxy never sends unset. Without explicit
+  client controls the effort is `high` (strong analysis/planning without
+  multi-minute `max` runaways). `disabled`->`low`, `adaptive`->`high`,
+  small `budget_tokens` (<8192)->`low`, large->`high`, and only an explicit
+  `output_config.effort: "max"` produces `max`. Precedence: explicit
+  `output_config.effort` > explicit `thinking` > proxy default.
+- **Historical thinking is stripped** from assistant messages before the
+  last user/tool-result turn. Text, tool calls, call ids, and order are
+  untouched, so long sessions stop paying for replayed reasoning. This is
+  the reliable local equivalent of GLM's `clear_thinking`.
+- **Thinking exposure is `requested_only`:** upstream reasoning is surfaced
+  to the client as Anthropic thinking blocks only when the request
+  explicitly carries `thinking`. This prevents Claude Code from storing and
+  re-sending reasoning (the main multi-turn amplification source).
+- **Output is capped**: `effective_max_tokens = min(client, 16384)` by
+  default; a request without a bound gets the cap.
+- **Safe compaction only**: lossless structural normalization (single text
+  block -> string, empty blocks dropped, Anthropic-only `metadata` dropped).
+  Tool results are never truncated and tool schemas are never edited;
+  Claude Code keeps full ownership of context compaction.
+- **Telemetry**: per-request byte breakdown and policy decisions
+  (`request optimization` log), per-stream reasoning/text/tool-call byte
+  accounting with first-tool-call latency, upstream usage tokens
+  (`prompt/completion/cached/reasoning`) when provided, and an exact GLM
+  token count of the optimized request computed in a background task
+  (`exact GLM token accounting` log). Logs contain sizes/counts only,
+  never prompt content.
+
 ## Key stickiness and persisted quota state
 
 Routing is **strict sticky sequential**. The active key is used for every
@@ -191,7 +240,7 @@ must equal `server.api_key`:
 token count, computed in-process with the official tokenizer and official
 chat template (zai-org/GLM-5.3-Flash, revision pinned in
 `docs/GLM53_FLASH.md` — no Python, no network at runtime). Responses carry
-`x-cline-proxy-token-count: exact_glm53`. See
+`x-cline-proxy-token-count: exact_glm53_optimized` (counting the optimized request the gateway would actually send; the oracle-faithful count is used when the strip policy is disabled). See
 `docs/adr/0003-glm53-exact-tokenizer.md` for the parity guarantees, the
 reasoning-effort mapping, and the two documented exclusions (non-text
 documents are rejected rather than undercounted; images count as their
@@ -223,11 +272,6 @@ arguments can be split at arbitrary chunk boundaries and multiple call indexes
 can be interleaved. Malformed or truncated upstream streams produce one
 Anthropic error event and are never replayed. Dropping the downstream body
 drops the reqwest body so abandoned streaming work is cancelled upstream.
-
-`POST /v1/messages/count_tokens` is a local UTF-8/JSON byte-based estimate
-(`ceil(serialized prompt bytes / 4)`), not the exact tokenizer for the selected
-Cline model. It performs no billable upstream request and returns
-`x-cline-proxy-token-count: approximate` so this limitation is explicit.
 
 ## Manual integration tests
 

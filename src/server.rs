@@ -21,6 +21,7 @@ use serde_json::{json, Value};
 
 use crate::anthropic::{self, ProtocolError};
 use crate::config::{defaults, Config};
+use crate::optimize;
 use crate::pool::KeyPool;
 use crate::redaction::{sanitize_json, sanitize_text};
 use crate::state::{self, StateLoadOutcome};
@@ -280,6 +281,16 @@ async fn openai_chat(
     };
     let upstream_model = state.config.resolve_model(&requested_model);
     object.insert("model".into(), Value::String(upstream_model.clone()));
+    // GLM policy for OpenAI-protocol clients: explicit reasoning effort
+    // (default high, never unset), bounded output, historical-reasoning
+    // strip, safe compaction.
+    let optimization =
+        match optimize::optimize_request(&mut value, &state.config.glm53, optimize::Origin::OpenAi)
+        {
+            Ok(optimization) => optimization,
+            Err(message) => return openai_error(StatusCode::BAD_REQUEST, message, &request_id),
+        };
+    log_request_optimization(&request_id, "openai", &optimization);
     let upstream_body = match serde_json::to_vec(&value) {
         Ok(body) => Bytes::from(body),
         Err(_) => {
@@ -327,6 +338,35 @@ async fn anthropic_messages(
     let requested_model = converted.model.clone();
     let upstream_model = state.config.resolve_model(&requested_model);
     anthropic::apply_model(&mut converted, upstream_model.clone());
+    // GLM policy: explicit reasoning effort (default high, never unset),
+    // bounded output, historical-thinking strip, safe compaction, and the
+    // per-request size breakdown telemetry.
+    let optimization = match optimize::optimize_request(
+        &mut converted.body,
+        &state.config.glm53,
+        optimize::Origin::Anthropic {
+            thinking: converted.thinking.as_ref(),
+            output_effort: converted.output_effort.as_deref(),
+        },
+    ) {
+        Ok(optimization) => optimization,
+        Err(message) => {
+            return anthropic_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                message,
+                &request_id,
+            )
+        }
+    };
+    converted.expose_thinking = optimization.expose_thinking;
+    log_request_optimization(&request_id, "anthropic", &optimization);
+    spawn_exact_token_telemetry(
+        state.clone(),
+        body.clone(),
+        optimization.reasoning_effort,
+        request_id.clone(),
+    );
     let upstream_body = match serde_json::to_vec(&converted.body) {
         Ok(body) => Bytes::from(body),
         Err(_) => {
@@ -344,7 +384,8 @@ async fn anthropic_messages(
         requested_model,
         upstream_model,
         stream = converted.stream,
-        request_bytes = upstream_body.len(),
+        request_bytes = body.len(),
+        upstream_request_bytes = upstream_body.len(),
         "client request accepted"
     );
     let started = Instant::now();
@@ -390,6 +431,7 @@ async fn anthropic_messages(
                 result.selected.name.to_string(),
                 started,
                 state.config.runtime.stream_progress_secs,
+                converted.expose_thinking,
             ))
             .unwrap_or_else(|_| Response::new(Body::empty()));
         insert_request_id(response.headers_mut(), &request_id);
@@ -399,7 +441,12 @@ async fn anthropic_messages(
         Ok(value) => value,
         Err(error) => return protocol_error(error, StatusCode::BAD_GATEWAY, &request_id),
     };
-    match anthropic::convert_response(&value, &request_id, &upstream_model) {
+    match anthropic::convert_response(
+        &value,
+        &request_id,
+        &upstream_model,
+        converted.expose_thinking,
+    ) {
         Ok(value) => json_response(StatusCode::OK, value, &request_id),
         Err(error) => protocol_error(error, StatusCode::BAD_GATEWAY, &request_id),
     }
@@ -440,8 +487,47 @@ async fn anthropic_count_tokens(
     };
     let upstream_model = state.config.resolve_model(requested_model);
     let started = Instant::now();
-    let (count, count_method) = match crate::glm53::count::count_input_tokens(&value) {
-        Ok(count) => (count, "exact_glm53"),
+    // Count what the gateway would actually send: historical thinking
+    // stripped (when the policy strips) and the resolved reasoning effort
+    // applied, so Claude Code's context budgeting matches real upstream
+    // usage. Falls back to the official-oracle count when the policy is
+    // disabled.
+    let mut counted = value.clone();
+    if state.config.glm53.reasoning.strip_historical_thinking {
+        optimize::strip_anthropic_thinking(&mut counted);
+    }
+    let effort = match crate::glm53::reasoning::resolve_reasoning_policy(
+        value.get("thinking"),
+        value
+            .get("output_config")
+            .and_then(|config| config.get("effort"))
+            .and_then(Value::as_str),
+        value
+            .get("max_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(u64::MAX),
+        state.config.glm53.reasoning.default_effort,
+        state.config.glm53.reasoning.adaptive_effort,
+        state.config.glm53.reasoning.expose_thinking,
+    ) {
+        Ok(policy) => policy,
+        Err(message) => {
+            return anthropic_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                message,
+                &request_id,
+            )
+        }
+    };
+    let count_method = if state.config.glm53.reasoning.strip_historical_thinking {
+        counted["output_config"] = json!({"effort": effort.effort.as_str()});
+        "exact_glm53_optimized"
+    } else {
+        "exact_glm53"
+    };
+    let (count, count_method) = match crate::glm53::count::count_input_tokens(&counted) {
+        Ok(count) => (count, count_method),
         Err(error) => {
             return anthropic_error(
                 StatusCode::BAD_REQUEST,
@@ -462,11 +548,94 @@ async fn anthropic_count_tokens(
         "token count completed"
     );
     let mut response = json_response(StatusCode::OK, json!({"input_tokens":count}), &request_id);
-    response.headers_mut().insert(
-        "x-cline-proxy-token-count",
-        HeaderValue::from_static("exact_glm53"),
-    );
+    if let Ok(value) = HeaderValue::from_str(count_method) {
+        response
+            .headers_mut()
+            .insert("x-cline-proxy-token-count", value);
+    }
     response
+}
+
+/// One log line attributing where request bytes went and what the GLM
+/// policy decided. Sizes and counts only — never request content.
+fn log_request_optimization(
+    request_id: &str,
+    protocol: &str,
+    optimization: &optimize::RequestOptimization,
+) {
+    tracing::info!(
+        request_id,
+        protocol,
+        reasoning_effort = optimization.reasoning_effort,
+        thinking_exposure = if optimization.expose_thinking {
+            "exposed"
+        } else {
+            "suppressed"
+        },
+        client_max_tokens = optimization.client_max_tokens.unwrap_or(0),
+        effective_max_tokens = optimization.effective_max_tokens.unwrap_or(0),
+        openai_bytes_before = optimization.before_bytes,
+        openai_bytes_after = optimization.after_bytes,
+        system_bytes = optimization.system_bytes,
+        messages_bytes = optimization.messages_bytes,
+        tools_bytes = optimization.tools_bytes,
+        other_bytes = optimization.other_bytes(),
+        historical_reasoning_bytes_removed = optimization.historical_reasoning_bytes_removed,
+        empty_blocks_removed = optimization.empty_blocks_removed,
+        normalized_text_blocks = optimization.normalized_text_blocks,
+        "request optimization"
+    );
+}
+
+/// Exact GLM-5.3-Flash token accounting for the optimized request, run in a
+/// background task so the embedded-official tokenizer (hundreds of ms on
+/// megabyte-scale prompts) never adds to TTFT. Reports:
+/// - `input_tokens`: exact count of what is actually sent (historical
+///   thinking stripped, resolved effort applied)
+/// - `tokens_removed_historical_reasoning`: exact tokenization of the
+///   stripped reasoning chunks
+/// - derived before/after ratio (before = after + removed)
+fn spawn_exact_token_telemetry(
+    state: AppState,
+    request_bytes: Bytes,
+    reasoning_effort: &'static str,
+    request_id: String,
+) {
+    if !state.config.glm53.telemetry.exact_input_tokens {
+        return;
+    }
+    tokio::spawn(async move {
+        let started = Instant::now();
+        let Ok(mut request) = serde_json::from_slice::<Value>(&request_bytes) else {
+            return;
+        };
+        let removed_tokens = match optimize::removed_reasoning_tokens(&request) {
+            Ok(tokens) => tokens,
+            Err(_) => return, // uncountable content; bytes telemetry still applies
+        };
+        optimize::strip_anthropic_thinking(&mut request);
+        // Align the count with the effort actually placed on the wire.
+        request["output_config"] = json!({"effort": reasoning_effort});
+        let Ok(input_tokens) = crate::glm53::count::count_input_tokens(&request) else {
+            return;
+        };
+        let before_estimate = u64::from(input_tokens).saturating_add(removed_tokens);
+        let saved_percent = if before_estimate > 0 {
+            (removed_tokens as f64 / before_estimate as f64 * 100.0 * 10.0).round() / 10.0
+        } else {
+            0.0
+        };
+        tracing::info!(
+            request_id,
+            input_tokens,
+            estimated_input_tokens_before = before_estimate,
+            tokens_removed_historical_reasoning = removed_tokens,
+            saved_percent,
+            count_method = "exact_glm53_optimized",
+            count_duration_ms = started.elapsed().as_millis(),
+            "exact GLM token accounting for optimized request"
+        );
+    });
 }
 
 async fn openai_upstream_response(
@@ -1811,14 +1980,20 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let value: Value = serde_json::from_str(&response_text(response).await).unwrap();
-        assert_eq!(value["content"][0]["type"], "thinking");
-        assert_eq!(value["content"][2]["type"], "tool_use");
-        assert_eq!(value["content"][2]["input"]["file_path"], "/tmp/a");
+        // The request carries no `thinking`, so upstream reasoning is not
+        // exposed: the response starts with the text block, not thinking.
+        assert_eq!(value["content"][0]["type"], "text");
+        assert_eq!(value["content"][0]["text"], "calling");
+        assert_eq!(value["content"][1]["type"], "tool_use");
+        assert_eq!(value["content"][1]["input"]["file_path"], "/tmp/a");
         assert_eq!(value["stop_reason"], "tool_use");
         assert_eq!(value["usage"]["output_tokens"], 4);
         let seen = mock.seen().await;
         assert_eq!(seen[0].body["messages"][1]["role"], "tool");
         assert_eq!(seen[0].body["model"], "z-ai/glm-5.3-flash");
+        // GLM policy on the wire: explicit effort + capped output.
+        assert_eq!(seen[0].body["reasoning_effort"], "high");
+        assert_eq!(seen[0].body["max_tokens"], 128);
         task.abort();
     }
 
@@ -1854,11 +2029,61 @@ mod tests {
         assert!(body.starts_with("event: message_start"));
         assert_eq!(body.matches("\"type\":\"tool_use\"").count(), 2);
         assert!(body.contains("input_json_delta"));
-        assert!(body.contains("thinking_delta"));
-        assert!(body.contains("signature_delta"));
+        // No `thinking` in the request: reasoning is suppressed, and no
+        // thinking block (hence no signature) is ever emitted.
+        assert!(!body.contains("thinking_delta"));
+        assert!(!body.contains("signature_delta"));
         assert!(body.contains("\"stop_reason\":\"tool_use\""));
         assert!(body.ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_exposes_thinking_only_when_requested() {
+        let (base, mock, task) = start_mock().await;
+        let sse = format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            json!({"id":"chat","model":"z-ai/glm-5.3-flash","choices":[{"delta":{"reasoning":"visible think"}}]}),
+            json!({"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":3,"completion_tokens":2,
+                    "completion_tokens_details":{"reasoning_tokens":1}}})
+        );
+        mock.set("cline-key-1", vec![Spec::sse(sse.clone())]).await;
+        let app = router(AppState::new(test_config(base, 1)).unwrap());
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(header::AUTHORIZATION, "Bearer gateway-secret")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "model":"claude-sonnet-4-6","max_tokens":128,
+                    "stream":true,
+                    "thinking":{"type":"adaptive"},
+                    "messages":[{"role":"user","content":"hello"}]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        *request.uri_mut() = "/v1/messages".parse().unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let body = response_text(response).await;
+        assert!(body.contains("thinking_delta"));
+        assert!(body.contains("visible think"));
+        assert!(body.contains("signature_delta"));
+        // And when thinking is NOT requested, the same reasoning is suppressed.
+        let (base2, mock2, task2) = start_mock().await;
+        mock2.set("cline-key-1", vec![Spec::sse(sse.clone())]).await;
+        let app2 = router(AppState::new(test_config(base2, 1)).unwrap());
+        let response2 = app2
+            .oneshot(gateway_request("/v1/messages", anthropic_body(true)))
+            .await
+            .unwrap();
+        let body2 = response_text(response2).await;
+        assert!(!body2.contains("visible think"));
+        assert!(!body2.contains("thinking_delta"));
+        task.abort();
+        task2.abort();
     }
 
     #[tokio::test]
@@ -1901,7 +2126,10 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(count.headers()["x-cline-proxy-token-count"], "exact_glm53");
+        assert_eq!(
+            count.headers()["x-cline-proxy-token-count"],
+            "exact_glm53_optimized"
+        );
         let count_value: Value = serde_json::from_str(&response_text(count).await).unwrap();
         assert!(count_value["input_tokens"].as_u64().unwrap() > 0);
         assert!(mock.seen().await.is_empty());

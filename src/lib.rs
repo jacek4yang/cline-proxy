@@ -4,6 +4,7 @@
 pub mod anthropic;
 pub mod config;
 pub mod glm53;
+pub mod optimize;
 pub mod pool;
 pub mod rate_limit;
 pub mod redaction;

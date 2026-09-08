@@ -52,6 +52,10 @@ proptest = "1"
 name = "count_tokens"
 harness = false
 
+[[bench]]
+name = "request_optimization"
+harness = false
+
 [profile.release]
 lto = "thin"
 opt-level = 3

@@ -112,14 +112,48 @@ After merge, re-baseline and pick the next P1 from "Next task".
 - HalfOpen is single-flight; requests without alternatives may fall back to
   a probed HalfOpen key (no worse than pre-existing behavior).
 
+## Completed (perf/glm53-efficient-reasoning, issue #6)
+
+- Root causes confirmed on main: (a) unset `thinking` -> no
+  `reasoning_effort` -> official template coerces unset to `max` (the
+  multi-minute runaway); (b) historical `thinking` re-emitted as
+  `reasoning_content` + unconditional thinking exposure ->
+  per-turn context snowball; (c) unbounded `max_tokens`; (d) Windows CRLF
+  checkout of `chat_template.jinja` broke exact-count fixture parity (+5
+  tokens).
+- `src/glm53/reasoning.rs`: `resolve_reasoning_policy` = single source of
+  truth (effort + `ThinkingExposure`). Precedence fixed+tested:
+  output_config.effort > thinking > default (`high`; `max` rejected as a
+  configured default at startup).
+- `src/optimize.rs` (new): per-request policy — explicit effort, output cap
+  (`min(client, glm53.limits.max_output_tokens)`, default 16384),
+  historical-reasoning strip before last user/tool turn (tool-call chain
+  preserved), safe compaction (single text block -> string, empty blocks
+  dropped, Anthropic `metadata` dropped). Byte-breakdown telemetry.
+- `src/anthropic.rs`: exposure gate on stream + nonstream; stream
+  telemetry (reasoning/text/tool bytes+events, first_*_ms, upstream usage
+  tokens incl. cached/reasoning when present).
+- `src/server.rs`: policy wired into both protocols; background exact
+  token accounting of the optimized request (never on TTFT path);
+  `count_tokens` counts the optimized request
+  (`x-cline-proxy-token-count: exact_glm53_optimized`).
+- Config: `glm53.{reasoning,limits,context,telemetry}` (serde defaults,
+  deny_unknown_fields, startup validation). `.gitattributes` + CRLF
+  normalization in `template.rs`. ADR 0004; README + docs/GLM53_FLASH.md
+  updated; `tests/glm53_policy.rs` (Case A/B/C + escape hatch);
+  `benches/request_optimization.rs` (convert+optimize+serialize ~ms-scale
+  at 1 MB; exact count ~350 ms background).
+
 ## Next task
 
-1. Land the glm53-tokenizer PR; re-baseline on main.
-2. P1 queue (spec §47 order): reasoning/clear_thinking E2E verification
-   against real Cline; Claude Code tool semantics matrix
-   (`docs/ANTHROPIC_COMPATIBILITY.md`); tool-TTFT benchmark through Cline;
-   large-context low-copy OpenAI fast path; Prometheus metrics + latency
-   decomposition; SSE fuzzing; hot reload.
+1. Land the glm53-efficient-reasoning PR; re-baseline on main.
+2. Real E2E before/after against live Cline + Claude Code (TTFT, input/
+   output/reasoning tokens, first-tool-call latency, task success) using
+   the new telemetry fields; record numbers in issue #6.
+3. P1 queue: Claude Code tool semantics matrix
+   (`docs/ANTHROPIC_COMPATIBILITY.md`); large-context low-copy OpenAI fast
+   path; Prometheus metrics + latency decomposition; SSE fuzzing; hot
+   reload; optional request-gzip compatibility probe (low priority).
 
 ## Commands
 
