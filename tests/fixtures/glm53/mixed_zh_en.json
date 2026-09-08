@@ -1,0 +1,59 @@
+{
+ "name": "mixed_zh_en",
+ "anthropic_request": {
+  "model": "z-ai/glm-5.3-flash",
+  "max_tokens": 256,
+  "messages": [
+   {
+    "role": "user",
+    "content": "请解释 Rust 的 lifetime（生命周期）机制，并用一个 borrow checker 会拒绝的例子说明。"
+   }
+  ]
+ },
+ "glm_messages": [
+  {
+   "role": "user",
+   "content": "请解释 Rust 的 lifetime（生命周期）机制，并用一个 borrow checker 会拒绝的例子说明。"
+  }
+ ],
+ "glm_tools": [],
+ "reasoning_effort": null,
+ "clear_thinking": false,
+ "add_generation_prompt": true,
+ "rendered_prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>请解释 Rust 的 lifetime（生命周期）机制，并用一个 borrow checker 会拒绝的例子说明。<|assistant|><think>",
+ "token_ids": [
+  154822,
+  154824,
+  154826,
+  25062,
+  287,
+  29905,
+  371,
+  25,
+  7487,
+  154827,
+  98964,
+  100774,
+  33627,
+  100694,
+  18996,
+  9904,
+  121106,
+  7552,
+  100194,
+  3837,
+  116032,
+  98444,
+  17173,
+  40688,
+  109597,
+  102239,
+  98314,
+  104626,
+  100205,
+  1773,
+  154828,
+  154841
+ ],
+ "token_count": 32
+}

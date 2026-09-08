@@ -145,46 +145,6 @@ pub fn apply_model(converted: &mut ConvertedRequest, model: String) {
     converted.body["model"] = Value::String(model);
 }
 
-pub fn approximate_input_tokens(bytes: &[u8]) -> Result<usize, ProtocolError> {
-    let input: Value = serde_json::from_slice(bytes)
-        .map_err(|error| ProtocolError::invalid(format!("invalid JSON: {error}")))?;
-    let object = input
-        .as_object()
-        .ok_or_else(|| ProtocolError::invalid("request body must be a JSON object"))?;
-    required_string(object, "model")?;
-    if !object.get("messages").is_some_and(Value::is_array) {
-        return Err(ProtocolError::invalid("messages must be an array"));
-    }
-    let mut bytes = estimated_json_bytes(object.get("messages").unwrap_or(&Value::Null));
-    for field in ["system", "tools", "tool_choice", "output_format"] {
-        if let Some(value) = object.get(field) {
-            bytes = bytes.saturating_add(estimated_json_bytes(value));
-        }
-    }
-    Ok(bytes.div_ceil(4))
-}
-
-fn estimated_json_bytes(value: &Value) -> usize {
-    match value {
-        Value::Null => 4,
-        Value::Bool(true) => 4,
-        Value::Bool(false) => 5,
-        Value::Number(number) => number.to_string().len(),
-        Value::String(text) => text.len().saturating_add(2),
-        Value::Array(values) => values.iter().fold(2usize, |total, value| {
-            total
-                .saturating_add(1)
-                .saturating_add(estimated_json_bytes(value))
-        }),
-        Value::Object(object) => object.iter().fold(2usize, |total, (name, value)| {
-            total
-                .saturating_add(name.len())
-                .saturating_add(3)
-                .saturating_add(estimated_json_bytes(value))
-        }),
-    }
-}
-
 fn convert_system(value: &Value) -> Result<Value, ProtocolError> {
     if value.is_string() {
         return Ok(value.clone());
@@ -488,8 +448,12 @@ fn convert_thinking(value: &Value, max_tokens: u64) -> Result<Option<&'static st
         .as_object()
         .ok_or_else(|| ProtocolError::invalid("thinking must be an object"))?;
     match required_string(object, "type")? {
-        "disabled" => Ok(None),
-        "adaptive" => Ok(Some("high")),
+        "disabled" => Ok(Some(
+            crate::glm53::reasoning::GlmReasoningEffort::Low.as_str(),
+        )),
+        "adaptive" => Ok(Some(
+            crate::glm53::reasoning::GlmReasoningEffort::High.as_str(),
+        )),
         "enabled" => {
             let budget = object
                 .get("budget_tokens")
@@ -501,13 +465,14 @@ fn convert_thinking(value: &Value, max_tokens: u64) -> Result<Option<&'static st
                     "thinking budget_tokens must be less than max_tokens",
                 ));
             }
-            Ok(Some(if budget < 4_096 {
-                "low"
-            } else if budget < 16_384 {
-                "medium"
+            // GLM-5.3-Flash has no `medium`; the official template coerced
+            // it to `max`. See src/glm53/reasoning.rs and docs/GLM53_FLASH.md.
+            let effort = if budget < crate::glm53::reasoning::LOW_BUDGET_LIMIT {
+                crate::glm53::reasoning::GlmReasoningEffort::Low
             } else {
-                "high"
-            }))
+                crate::glm53::reasoning::GlmReasoningEffort::High
+            };
+            Ok(Some(effort.as_str()))
         }
         kind => Err(ProtocolError::invalid(format!(
             "unsupported thinking type {kind:?}"
@@ -527,8 +492,9 @@ fn convert_output_config(
             .as_str()
             .ok_or_else(|| ProtocolError::invalid("output_config.effort must be a string"))?;
         let effort = match effort {
-            "low" | "medium" | "high" => effort,
-            "xhigh" | "max" => "high",
+            "low" => "low",
+            "medium" | "high" | "xhigh" => "high",
+            "max" => "max",
             _ => return Err(ProtocolError::invalid("unsupported output_config.effort")),
         };
         output.insert("reasoning_effort".into(), Value::String(effort.into()));
@@ -1560,15 +1526,5 @@ mod tests {
         let frames = truncated.handle(r#"{"choices":[{"delta":{"content":"partial"}}]}"#);
         assert!(!frames.is_empty());
         assert!(truncated.finish_reason.is_none());
-    }
-
-    #[test]
-    fn token_count_is_explicitly_byte_based_and_robust() {
-        let count = approximate_input_tokens(
-            br#"{"model":"x","messages":[{"role":"user","content":"hello"}]}"#,
-        )
-        .unwrap();
-        assert!(count > 0);
-        assert!(approximate_input_tokens(b"not json").is_err());
     }
 }

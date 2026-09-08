@@ -1,0 +1,115 @@
+{
+ "name": "thinking_history_kept",
+ "anthropic_request": {
+  "model": "z-ai/glm-5.3-flash",
+  "max_tokens": 8192,
+  "thinking": {
+   "type": "enabled",
+   "budget_tokens": 4096
+  },
+  "messages": [
+   {
+    "role": "user",
+    "content": "Is 97 prime?"
+   },
+   {
+    "role": "assistant",
+    "content": [
+     {
+      "type": "thinking",
+      "thinking": "Check divisibility up to sqrt(97)≈9.8: not 2,3,5,7. Yes, prime.",
+      "signature": "sig"
+     },
+     {
+      "type": "text",
+      "text": "97 is prime."
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": "And 91?"
+   }
+  ]
+ },
+ "glm_messages": [
+  {
+   "role": "user",
+   "content": "Is 97 prime?"
+  },
+  {
+   "role": "assistant",
+   "content": "97 is prime.",
+   "reasoning_content": "Check divisibility up to sqrt(97)≈9.8: not 2,3,5,7. Yes, prime."
+  },
+  {
+   "role": "user",
+   "content": "And 91?"
+  }
+ ],
+ "glm_tools": [],
+ "reasoning_effort": "low",
+ "clear_thinking": false,
+ "add_generation_prompt": true,
+ "rendered_prompt": "[gMASK]<sop><|system|>Reasoning Effort: Low<|user|>Is 97 prime?<|assistant|><think>Check divisibility up to sqrt(97)≈9.8: not 2,3,5,7. Yes, prime.</think>97 is prime.<|user|>And 91?<|assistant|><think>",
+ "token_ids": [
+  154822,
+  154824,
+  154826,
+  25062,
+  287,
+  29905,
+  371,
+  25,
+  12035,
+  154827,
+  3872,
+  220,
+  103205,
+  10245,
+  30,
+  154828,
+  154841,
+  3973,
+  49051,
+  3147,
+  705,
+  311,
+  17919,
+  7,
+  103205,
+  8,
+  153445,
+  24,
+  13,
+  23,
+  25,
+  537,
+  220,
+  17,
+  11,
+  18,
+  11,
+  20,
+  11,
+  22,
+  13,
+  7414,
+  11,
+  10245,
+  13,
+  154842,
+  103205,
+  374,
+  10245,
+  13,
+  154827,
+  3036,
+  220,
+  104327,
+  30,
+  154828,
+  154841
+ ],
+ "token_count": 57
+}

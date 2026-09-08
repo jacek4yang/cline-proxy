@@ -1,0 +1,44 @@
+{
+ "name": "en_simple",
+ "anthropic_request": {
+  "model": "claude-sonnet-4-6",
+  "max_tokens": 128,
+  "messages": [
+   {
+    "role": "user",
+    "content": "Reply with exactly: OK"
+   }
+  ]
+ },
+ "glm_messages": [
+  {
+   "role": "user",
+   "content": "Reply with exactly: OK"
+  }
+ ],
+ "glm_tools": [],
+ "reasoning_effort": null,
+ "clear_thinking": false,
+ "add_generation_prompt": true,
+ "rendered_prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Reply with exactly: OK<|assistant|><think>",
+ "token_ids": [
+  154822,
+  154824,
+  154826,
+  25062,
+  287,
+  29905,
+  371,
+  25,
+  7487,
+  154827,
+  20795,
+  448,
+  6896,
+  25,
+  10397,
+  154828,
+  154841
+ ],
+ "token_count": 17
+}

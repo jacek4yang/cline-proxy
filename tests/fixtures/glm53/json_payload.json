@@ -1,0 +1,80 @@
+{
+ "name": "json_payload",
+ "anthropic_request": {
+  "model": "z-ai/glm-5.3-flash",
+  "max_tokens": 256,
+  "messages": [
+   {
+    "role": "user",
+    "content": "Summarize this JSON: {\"name\":\"cline-proxy\",\"keys\":9,\"models\":[\"z-ai/glm-5.3-flash\"],\"limits\":{\"max_request_bytes\":33554432}}"
+   }
+  ]
+ },
+ "glm_messages": [
+  {
+   "role": "user",
+   "content": "Summarize this JSON: {\"name\":\"cline-proxy\",\"keys\":9,\"models\":[\"z-ai/glm-5.3-flash\"],\"limits\":{\"max_request_bytes\":33554432}}"
+  }
+ ],
+ "glm_tools": [],
+ "reasoning_effort": null,
+ "clear_thinking": false,
+ "add_generation_prompt": true,
+ "rendered_prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Summarize this JSON: {\"name\":\"cline-proxy\",\"keys\":9,\"models\":[\"z-ai/glm-5.3-flash\"],\"limits\":{\"max_request_bytes\":33554432}}<|assistant|><think>",
+ "token_ids": [
+  154822,
+  154824,
+  154826,
+  25062,
+  287,
+  29905,
+  371,
+  25,
+  7487,
+  154827,
+  9187,
+  5612,
+  551,
+  419,
+  4718,
+  25,
+  5212,
+  606,
+  3252,
+  87206,
+  83011,
+  2198,
+  10558,
+  788,
+  24,
+  1335,
+  6507,
+  36608,
+  89,
+  12,
+  2143,
+  4846,
+  17745,
+  12,
+  20,
+  13,
+  18,
+  92100,
+  68379,
+  40848,
+  22260,
+  2810,
+  7893,
+  12518,
+  788,
+  18,
+  100235,
+  20,
+  101723,
+  101175,
+  3417,
+  154828,
+  154841
+ ],
+ "token_count": 53
+}

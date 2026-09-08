@@ -1,0 +1,47 @@
+{
+ "name": "adaptive_thinking_high",
+ "anthropic_request": {
+  "model": "z-ai/glm-5.3-flash",
+  "max_tokens": 512,
+  "thinking": {
+   "type": "adaptive"
+  },
+  "messages": [
+   {
+    "role": "user",
+    "content": "Plan a release checklist."
+   }
+  ]
+ },
+ "glm_messages": [
+  {
+   "role": "user",
+   "content": "Plan a release checklist."
+  }
+ ],
+ "glm_tools": [],
+ "reasoning_effort": "high",
+ "clear_thinking": false,
+ "add_generation_prompt": true,
+ "rendered_prompt": "[gMASK]<sop><|system|>Reasoning Effort: High<|user|>Plan a release checklist.<|assistant|><think>",
+ "token_ids": [
+  154822,
+  154824,
+  154826,
+  25062,
+  287,
+  29905,
+  371,
+  25,
+  5124,
+  154827,
+  20442,
+  264,
+  4879,
+  52227,
+  13,
+  154828,
+  154841
+ ],
+ "token_count": 17
+}
