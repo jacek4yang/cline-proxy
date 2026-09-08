@@ -43,6 +43,7 @@
     "log_level": "info",
     "log_format": "pretty",
     "stream_progress_secs": 30,
-    "shutdown_timeout_secs": 30
+    "shutdown_timeout_secs": 30,
+    "state_file": "runtime-state.json"
   }
 }

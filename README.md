@@ -18,15 +18,20 @@ The binary contains five intentionally small subsystems:
   `/v1/chat/completions`, `/v1/models`, `/healthz`, and `/readyz`.
 - One long-lived rustls `reqwest::Client` provides HTTP/2, gzip, pooling,
   keep-alive, connect timeout, and read-inactivity timeout behavior.
-- A concurrency-safe pool holds the sticky active key and per-key effective-429
-  cooldown metadata. No lock is held over a network await.
+- A concurrency-safe pool holds the sticky active key, per-key effective-429
+  cooldown metadata (Healthy → Cooling → HalfOpen with single-flight
+  probing), and runtime counters. No lock is held over a network await.
+- A debounced writer persists key cooldowns and the active key to a local
+  JSON state file (name-keyed, wall-clock deadlines, atomic rename) so
+  restarts never re-probe keys with known quota cooldowns.
 - The Anthropic adapter converts structured messages, images, tool use/results,
   reasoning, usage, stop reasons, and stateful OpenAI SSE into Anthropic SSE.
 - Central error and redaction paths remove configured secrets, Bearer values,
   API-key fields, cookies, and JWT-like values.
 
-There is no OAuth, credential refresh, database, Redis, web UI, balance poller,
-or admin API. Configuration is read once from JSON at startup.
+There is no OAuth, credential refresh, database, Redis, web UI, or balance
+poller. Configuration is read once from JSON at startup; `/admin/status` is a
+read-only, authenticated operational snapshot.
 
 ## Build and install
 
@@ -110,6 +115,38 @@ Anthropic Messages, and token-count request accounting. For example:
 
 No live model-list request is needed for readiness or model discovery.
 
+## Key stickiness and persisted quota state
+
+Routing is **strict sticky sequential**. The active key is used for every
+request until it confirms an effective upstream HTTP 429; then it enters
+cooldown and the next configured key becomes active until *its* quota is
+exhausted. Successes, 5xx, timeouts, connection resets, TLS/DNS errors, and
+stream interruptions never rotate the key, and a recovered key whose cooldown
+expired never steals the active role back from a healthy key.
+
+Key cooldowns and the active selection survive process restarts:
+
+- `runtime.state_file` (default `./runtime-state.json`; set to `null` or `""`
+  to disable) stores one versioned JSON snapshot.
+- The file is keyed by configured key **name** (never by position), so
+  reordering the key list cannot cool the wrong key.
+- Deadlines are wall-clock Unix milliseconds; nothing secret is ever written:
+  no API keys, no authorization values, no raw upstream error text.
+- Writes are atomic (temp file + rename) and debounced off the request path;
+  healthy requests never touch the disk. A final flush runs during graceful
+  shutdown.
+- A missing, truncated, or unreadable state file is **non-fatal**: the gateway
+  logs a sanitized warning and starts with empty state. Persistence health is
+  visible in `/admin/status`.
+- On startup, expired cooldowns are restored as probe-eligible (never as
+  active cooldowns), and the persisted active key is restored if it still
+  exists and is enabled — so a restart no longer re-probes keys that are
+  hours away from quota recovery.
+
+A confirmed effective 429 is further classified as `daily_quota`, `transient`,
+or `unknown` (`rate_limit_kind` in `/admin/status`). Classification happens
+only *after* the 429 is confirmed and never widens failover conditions.
+
 ## Run
 
 ```bash
@@ -135,6 +172,12 @@ x-api-key: <gateway key>
 
 Health endpoints are intentionally unauthenticated. The gateway key is never
 forwarded. The Cline keys are never returned to clients.
+
+`GET /admin/status` (same gateway authentication) returns a read-only
+operational snapshot: version, uptime, the active key and its age, and per-key
+state (`healthy` / `cooling` / `half_open` / `probing`), cooldown deadlines,
+rate-limit kind, model scope, and request counters. It never returns key
+material or raw upstream error text.
 
 ## Claude Code
 
