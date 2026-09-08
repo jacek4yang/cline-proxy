@@ -439,9 +439,17 @@ async fn anthropic_count_tokens(
         );
     };
     let upstream_model = state.config.resolve_model(requested_model);
-    let count = match anthropic::approximate_input_tokens(&body) {
-        Ok(count) => count,
-        Err(error) => return protocol_error(error, StatusCode::BAD_REQUEST, &request_id),
+    let started = Instant::now();
+    let (count, count_method) = match crate::glm53::count::count_input_tokens(&value) {
+        Ok(count) => (count, "exact_glm53"),
+        Err(error) => {
+            return anthropic_error(
+                StatusCode::BAD_REQUEST,
+                error.error_type,
+                error.message,
+                &request_id,
+            )
+        }
     };
     tracing::info!(
         request_id,
@@ -449,13 +457,14 @@ async fn anthropic_count_tokens(
         requested_model,
         upstream_model,
         input_tokens = count,
-        token_count = "local_approximation",
+        token_count = count_method,
+        count_micros = started.elapsed().as_micros(),
         "token count completed"
     );
     let mut response = json_response(StatusCode::OK, json!({"input_tokens":count}), &request_id);
     response.headers_mut().insert(
         "x-cline-proxy-token-count",
-        HeaderValue::from_static("approximate"),
+        HeaderValue::from_static("exact_glm53"),
     );
     response
 }
@@ -1892,7 +1901,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(count.headers()["x-cline-proxy-token-count"], "approximate");
+        assert_eq!(count.headers()["x-cline-proxy-token-count"], "exact_glm53");
         let count_value: Value = serde_json::from_str(&response_text(count).await).unwrap();
         assert!(count_value["input_tokens"].as_u64().unwrap() > 0);
         assert!(mock.seen().await.is_empty());

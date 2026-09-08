@@ -1,0 +1,66 @@
+{
+ "name": "system_prompt",
+ "anthropic_request": {
+  "model": "z-ai/glm-5.3-flash",
+  "max_tokens": 256,
+  "system": "You are a meticulous Rust engineer. Answer with code first, prose second.",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a deterministic token counter."
+   }
+  ]
+ },
+ "glm_messages": [
+  {
+   "role": "system",
+   "content": "You are a meticulous Rust engineer. Answer with code first, prose second."
+  },
+  {
+   "role": "user",
+   "content": "Write a deterministic token counter."
+  }
+ ],
+ "glm_tools": [],
+ "reasoning_effort": null,
+ "clear_thinking": false,
+ "add_generation_prompt": true,
+ "rendered_prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>You are a meticulous Rust engineer. Answer with code first, prose second.<|user|>Write a deterministic token counter.<|assistant|><think>",
+ "token_ids": [
+  154822,
+  154824,
+  154826,
+  25062,
+  287,
+  29905,
+  371,
+  25,
+  7487,
+  154826,
+  2610,
+  525,
+  264,
+  94380,
+  33627,
+  23511,
+  13,
+  21754,
+  448,
+  2038,
+  1156,
+  11,
+  60276,
+  2086,
+  13,
+  154827,
+  7984,
+  264,
+  71794,
+  3950,
+  5546,
+  13,
+  154828,
+  154841
+ ],
+ "token_count": 34
+}

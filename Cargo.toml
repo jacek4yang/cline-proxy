@@ -13,12 +13,32 @@ async-stream = "0.3"
 axum = { version = "0.7", features = ["macros"] }
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 futures-util = "0.3"
 httpdate = "1"
+# preserve_order: the official GLM template iterates tool schema keys and
+# serializes them with Python's insertion-ordered dicts; minijinja sorts map
+# keys unless this feature is enabled, which would change the exact prompt
+# bytes (and therefore the exact token count) relative to the reference.
+minijinja = { version = "2", default-features = false, features = ["builtins", "macros", "serde", "loop_controls", "json", "preserve_order"] }
+# pycompat: the official GLM chat template uses Python-style methods
+# (dict.items(), str.strip(), str.split()); pycompat supplies them without
+# modifying the official template file.
+minijinja-contrib = { version = "2", default-features = false, features = ["pycompat"] }
 reqwest = { version = "0.12", default-features = false, features = ["gzip", "http2", "json", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# preserve_order: GLM-5.3-Flash's official chat template serializes tool
+# schemas with insertion-ordered JSON; sorted keys would change the exact
+# prompt bytes (and therefore the exact token count) relative to the
+# reference clients. It also keeps passthrough bytes stable for cache
+# locality (docs/GLM53_FLASH.md).
+serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
+# Exact in-process GLM-5.3-Flash token counting: the official tokenizer.json
+# is HF `tokenizers` format. fancy-regex keeps the build pure-Rust (no ONIG
+# C library); progressbar/http features are not needed. See
+# docs/GLM53_FLASH.md and ADR 0003.
+tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
 tokio = { version = "1", features = ["full"] }
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
@@ -27,6 +47,10 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 proptest = "1"
+
+[[bench]]
+name = "count_tokens"
+harness = false
 
 [profile.release]
 lto = "thin"

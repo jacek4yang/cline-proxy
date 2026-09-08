@@ -1,19 +1,10 @@
-mod anthropic;
-mod config;
-mod pool;
-mod rate_limit;
-mod redaction;
-mod server;
-mod state;
-mod upstream;
-
 use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
 
-use crate::config::{default_config_path, Config, LogFormat};
-use crate::server::AppState;
+use cline_proxy::config::{default_config_path, Config, LogFormat};
+use cline_proxy::server;
 
 #[derive(Parser)]
 #[command(
@@ -45,7 +36,7 @@ async fn main() -> Result<()> {
         enabled_keys,
         "configuration loaded"
     );
-    server::serve(AppState::new(config)?).await
+    server::serve(server::AppState::new(config)?).await
 }
 
 fn init_tracing(config: &Config) {

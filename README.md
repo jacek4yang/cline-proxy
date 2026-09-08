@@ -185,6 +185,18 @@ Point Claude Code's Anthropic base URL at the local gateway. Provide
 `CLINE_PROXY_GATEWAY_KEY` through your normal secret-management mechanism; it
 must equal `server.api_key`:
 
+### Exact token counting
+
+`POST /v1/messages/count_tokens` returns the **exact** GLM-5.3-Flash prompt
+token count, computed in-process with the official tokenizer and official
+chat template (zai-org/GLM-5.3-Flash, revision pinned in
+`docs/GLM53_FLASH.md` — no Python, no network at runtime). Responses carry
+`x-cline-proxy-token-count: exact_glm53`. See
+`docs/adr/0003-glm53-exact-tokenizer.md` for the parity guarantees, the
+reasoning-effort mapping, and the two documented exclusions (non-text
+documents are rejected rather than undercounted; images count as their
+template placeholder).
+
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8788
 export ANTHROPIC_AUTH_TOKEN="${CLINE_PROXY_GATEWAY_KEY:?set CLINE_PROXY_GATEWAY_KEY}"

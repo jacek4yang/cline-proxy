@@ -1,0 +1,138 @@
+{
+ "name": "multi_turn",
+ "anthropic_request": {
+  "model": "z-ai/glm-5.3-flash",
+  "max_tokens": 256,
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is a BPE tokenizer?"
+   },
+   {
+    "role": "assistant",
+    "content": "A byte-pair-encoding tokenizer merges frequent byte pairs into tokens iteratively."
+   },
+   {
+    "role": "user",
+    "content": "How does that differ from Unigram?"
+   },
+   {
+    "role": "assistant",
+    "content": "Unigram starts from a large inventory and prunes tokens by likelihood; BPE grows merges bottom-up."
+   },
+   {
+    "role": "user",
+    "content": "Which one does GLM use?"
+   }
+  ]
+ },
+ "glm_messages": [
+  {
+   "role": "user",
+   "content": "What is a BPE tokenizer?"
+  },
+  {
+   "role": "assistant",
+   "content": "A byte-pair-encoding tokenizer merges frequent byte pairs into tokens iteratively."
+  },
+  {
+   "role": "user",
+   "content": "How does that differ from Unigram?"
+  },
+  {
+   "role": "assistant",
+   "content": "Unigram starts from a large inventory and prunes tokens by likelihood; BPE grows merges bottom-up."
+  },
+  {
+   "role": "user",
+   "content": "Which one does GLM use?"
+  }
+ ],
+ "glm_tools": [],
+ "reasoning_effort": null,
+ "clear_thinking": false,
+ "add_generation_prompt": true,
+ "rendered_prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>What is a BPE tokenizer?<|assistant|><think></think>A byte-pair-encoding tokenizer merges frequent byte pairs into tokens iteratively.<|user|>How does that differ from Unigram?<|assistant|><think></think>Unigram starts from a large inventory and prunes tokens by likelihood; BPE grows merges bottom-up.<|user|>Which one does GLM use?<|assistant|><think>",
+ "token_ids": [
+  154822,
+  154824,
+  154826,
+  25062,
+  287,
+  29905,
+  371,
+  25,
+  7487,
+  154827,
+  3838,
+  374,
+  264,
+  425,
+  1740,
+  45681,
+  30,
+  154828,
+  154841,
+  154842,
+  32,
+  4922,
+  2268,
+  1310,
+  12,
+  17140,
+  45681,
+  80296,
+  20711,
+  4922,
+  13521,
+  1119,
+  11206,
+  5367,
+  7887,
+  13,
+  154827,
+  4340,
+  1558,
+  429,
+  1745,
+  504,
+  1230,
+  48813,
+  30,
+  154828,
+  154841,
+  154842,
+  1806,
+  48813,
+  8470,
+  504,
+  264,
+  3460,
+  15432,
+  323,
+  548,
+  8530,
+  11206,
+  553,
+  28535,
+  26,
+  425,
+  1740,
+  27622,
+  80296,
+  5622,
+  5239,
+  13,
+  154827,
+  23022,
+  825,
+  1558,
+  5588,
+  44,
+  990,
+  30,
+  154828,
+  154841
+ ],
+ "token_count": 79
+}

@@ -1,0 +1,44 @@
+{
+ "name": "zh_simple",
+ "anthropic_request": {
+  "model": "z-ai/glm-5.3-flash",
+  "max_tokens": 128,
+  "messages": [
+   {
+    "role": "user",
+    "content": "用一句话介绍你自己。"
+   }
+  ]
+ },
+ "glm_messages": [
+  {
+   "role": "user",
+   "content": "用一句话介绍你自己。"
+  }
+ ],
+ "glm_tools": [],
+ "reasoning_effort": null,
+ "clear_thinking": false,
+ "add_generation_prompt": true,
+ "rendered_prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>用一句话介绍你自己。<|assistant|><think>",
+ "token_ids": [
+  154822,
+  154824,
+  154826,
+  25062,
+  287,
+  29905,
+  371,
+  25,
+  7487,
+  154827,
+  98340,
+  106673,
+  99756,
+  108286,
+  1773,
+  154828,
+  154841
+ ],
+ "token_count": 17
+}
