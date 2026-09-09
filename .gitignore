@@ -3,3 +3,4 @@ target/
 *.log
 # Regenerated from tokenizer.json.gz or HuggingFace (20 MB, not committed)
 /tools/glm_reference/assets/tokenizer.json
+runtime-state.json
