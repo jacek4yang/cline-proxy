@@ -213,11 +213,12 @@ addresses the drift sources it can (issue #8, ADR 0005):
   logged (`session=...`). Raw ids are never logged; without identity the
   field is `unstable` and no session-scoped behavior is attempted.
 - **Cache ratios**: `cache_hit_ratio` and `reasoning_ratio` are logged
-  from upstream usage when the upstream reports the underlying tokens.
-  Whether Cline's upstream exposes cache data is workload-dependent and
-  currently unverified; no improvement is claimed until a real A/B run
-  measures it. `prompt_cache_key` is *not* sent upstream — support is
-  unprobed and unknown parameters risk rejection.
+  from upstream usage. Verified against live traffic: Cline reports
+  `cached_tokens` (subset of `prompt_tokens`), and a real ~300 K-token
+  Claude Code session sustained **99.8-100.0% cache hit ratios** across
+  consecutive turns with these stability mechanisms enabled
+  (`docs/DEVELOPMENT_STATE.md`). `prompt_cache_key` is *not* sent —
+  high cache hits are achieved without it.
 
 ## Key stickiness and persisted quota state
 

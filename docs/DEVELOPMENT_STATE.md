@@ -144,6 +144,46 @@ After merge, re-baseline and pick the next P1 from "Next task".
   `benches/request_optimization.rs` (convert+optimize+serialize ~ms-scale
   at 1 MB; exact count ~350 ms background).
 
+## Real E2E baseline (2026-09-09, live Cline + Claude Code)
+
+Observed on the production proxy running the merged main build
+(`954c59a`), serving a real Claude Code session with ~300 K-token
+context. Upstream **does** report usage with `cached_tokens` — the
+capability previously marked unverified in ADR 0005 is now confirmed;
+semantics confirmed as `cached_tokens ⊆ prompt_tokens` (subset), so
+`cache_hit_ratio = cached_tokens / prompt_tokens` is correct as
+implemented.
+
+| turn | prompt_tokens | cached_tokens | cache_hit_ratio | duration_ms | first_tool_call_ms | reasoning_tokens |
+|------|--------------:|--------------:|----------------:|------------:|-------------------:|-----------------:|
+| 1 (cold) | 307,678 | 0 | 0.0% | 92,376 | 88,789 | 114 |
+| 2 | 308,067 | 307,648 | 99.9% | 19,042 | 19,036 | 255 |
+| 3 | 308,470 | 308,032 | 99.9% | 12,167 | 12,167 | 0 |
+| 4 | 308,751 | 308,416 | 99.9% | 31,075 | 31,075 | 436 |
+| 5 | 309,463 | 308,736 | 99.8% | 9,973 | 9,973 | 0 |
+| 6 | 309,587 | 309,440 | 100.0% | 10,312 | 10,312 | 0 |
+
+Findings:
+
+- **Prefix stability works at production scale**: after the cold turn,
+  consecutive 300 K-token turns hit 99.8–100.0% upstream cache. The
+  small per-turn delta (~400–900 tokens) matches actual new context.
+- TTFT ≈ first_tool_call_ms on tool turns (tool calls come first);
+  cold-start prefill of 307 K tokens took ~89 s upstream — cache hits
+  cut turns 5–6 to ~10 s total, an ~9× improvement vs. the cold turn.
+- reasoning_tokens stay bounded (0–436 per turn) under `high` effort —
+  no runaway.
+- Non-stream upstream quirk **[observed]**: Cline returned 200 with a
+  non-choices body on a non-stream probe (and proxy-wrapped 429s on
+  exhausted keys). Claude Code always streams; non-stream clients may
+  see "upstream response did not contain a choice" when the upstream
+  declines. Streaming E2E fully verified (SSE lifecycle, usage,
+  suppression of unrequested thinking).
+- `prompt_cache_key`: NOT needed for high cache hits — the stable
+  prefix + sticky keys achieve 99.8–100% without it. The probe is
+  unnecessary; the parameter stays unsent (capability marked
+  supported-but-unneeded in practice).
+
 ## Current branch (turn-scoped reasoning + shadow store, issue #10)
 
 `perf/turn-scoped-reasoning` — implemented:

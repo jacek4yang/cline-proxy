@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "updated_at_unix_ms": 1788947810270,
+  "active_key": "cline-github-zeroregex",
+  "keys": {
+    "cline-github-1993616178": {},
+    "cline-github-aromacode": {
+      "cooldown_until_unix_ms": 1789026271038,
+      "rate_limit_kind": "daily_quota",
+      "model": "z-ai/glm-5.3-flash",
+      "last_429_at_unix_ms": 1788947251038
+    },
+    "cline-github-brewlogic": {
+      "cooldown_until_unix_ms": 1789029331927,
+      "rate_limit_kind": "daily_quota",
+      "model": "z-ai/glm-5.3-flash",
+      "last_429_at_unix_ms": 1788947251927
+    },
+    "cline-github-jacek4yang": {
+      "cooldown_until_unix_ms": 1788969089264,
+      "rate_limit_kind": "daily_quota",
+      "model": "z-ai/glm-5.3-flash",
+      "last_429_at_unix_ms": 1788947249264
+    },
+    "cline-github-jacekSmile": {
+      "cooldown_until_unix_ms": 1789022370152,
+      "rate_limit_kind": "daily_quota",
+      "model": "z-ai/glm-5.3-flash",
+      "last_429_at_unix_ms": 1788947250152
+    },
+    "cline-github-leafcache": {
+      "cooldown_until_unix_ms": 1789031476261,
+      "rate_limit_kind": "daily_quota",
+      "model": "z-ai/glm-5.3-flash",
+      "last_429_at_unix_ms": 1788947356261,
+      "last_success_at_unix_ms": 1788947350929
+    },
+    "cline-github-zeroregex": {
+      "last_success_at_unix_ms": 1788947810112
+    },
+    "cline-google-jacek2yang": {
+      "cooldown_until_unix_ms": 1788959847459,
+      "rate_limit_kind": "daily_quota",
+      "model": "z-ai/glm-5.3-flash",
+      "last_429_at_unix_ms": 1788947247459
+    },
+    "cline-google-jacek42yang": {
+      "cooldown_until_unix_ms": 1788967168362,
+      "rate_limit_kind": "daily_quota",
+      "model": "z-ai/glm-5.3-flash",
+      "last_429_at_unix_ms": 1788947248362
+    }
+  }
+}

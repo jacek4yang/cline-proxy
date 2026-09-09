@@ -179,10 +179,14 @@ adding a new policy branch, not widening a global one.
 - Tools in the request increase GLM TTFT by seconds — third-party reports
   exist **[report]**; cline-proxy measures and logs TTFT per request
   **[bench]** but takes no correctness-risking countermeasures.
-- Prompt-cache behavior across Cline credentials is **unverified**; strict
-  key stickiness preserves locality without asserting cache semantics.
-  Upstream `cached_tokens` are logged per stream when present so cache
-  behavior can be evaluated from real data **[observed]**.
+- Prompt-cache behavior: **verified against live traffic (2026-09-09)**.
+  Cline upstream reports `cached_tokens` (a subset of `prompt_tokens`).
+  A real ~300 K-token Claude Code session recorded 99.8-100.0% cache hit
+  ratios on consecutive turns after one cold turn (see
+  docs/DEVELOPMENT_STATE.md for the full table). The volatile
+  billing-header strip, canonical tool JSON, and sticky keys are the
+  prefix-stability mechanisms behind it. `prompt_cache_key` is not sent:
+  high cache hits are achieved without it.
 - Request-body gzip (`Content-Encoding: gzip`) is **not** implemented: it
   would reduce network upload bytes only, not model input tokens, and Cline
   endpoint compatibility is unverified. Priority stays below historical
