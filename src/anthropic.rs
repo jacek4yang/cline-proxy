@@ -9,6 +9,7 @@ use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
+use axum::http::header;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::{json, Map, Value};
@@ -779,6 +780,269 @@ pub fn error_envelope(error_type: &str, message: impl Into<String>, request_id: 
 pub struct StreamShadowContext {
     pub store: std::sync::Arc<crate::reasoning_shadow::ReasoningShadowStore>,
     pub session_fingerprint: String,
+}
+
+// --- Upstream stream aggregation for non-stream clients (issue #14) ---
+//
+// Cline streaming is the verified-canonical upstream transport; native
+// non-stream bodies are not (production: 200s whose bodies lacked
+// `choices` after 34-73 s generations). For a downstream non-stream
+// request the proxy therefore sends ONE upstream streaming request and
+// aggregates it locally into a standard OpenAI response body, which then
+// flows through the SAME `convert_response` semantics (thinking exposure,
+// tool_use, stop-reason mapping, usage, reasoning shadow) as every other
+// path. The decision happens before the upstream request is sent — a
+// response-shape mismatch must never be recovered by paying for a second
+// generation.
+//
+// The accumulator holds only the semantic response (text, reasoning,
+// tool-call fragments, usage) — never raw SSE history.
+
+const MAX_AGGREGATED_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+/// One upstream tool call being assembled from delta fragments. Arguments
+/// are appended byte-exactly with `push_str` (never trimmed, reordered, or
+/// reformatted — the JSON must be exactly what the model generated).
+#[derive(Default)]
+struct ToolAccumulator {
+    id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+}
+
+#[derive(Default)]
+struct NonStreamAccumulator {
+    id: Option<String>,
+    model: Option<String>,
+    reasoning: String,
+    text: String,
+    tools: HashMap<u64, ToolAccumulator>,
+    /// Tool-call indices in first-seen (model generation) order.
+    tool_order: Vec<u64>,
+    finish_reason: Option<String>,
+    usage: Value,
+    aggregated_bytes: usize,
+    saw_event: bool,
+    first_event_ms: Option<u128>,
+    first_tool_call_ms: Option<u128>,
+    started: Option<Instant>,
+}
+
+impl NonStreamAccumulator {
+    fn new() -> Self {
+        Self {
+            usage: json!({}),
+            started: Some(Instant::now()),
+            ..Self::default()
+        }
+    }
+
+    fn elapsed_ms(&self) -> u128 {
+        self.started
+            .map(|started| started.elapsed().as_millis())
+            .unwrap_or(0)
+    }
+
+    /// Handle one SSE `data:` payload from the upstream OpenAI-shaped
+    /// stream. Usage-only chunks (empty/absent choices + usage) update the
+    /// usage and continue — they are not protocol errors (§13/§89).
+    fn handle(&mut self, data: &str) -> Result<(), ProtocolError> {
+        if data.trim() == "[DONE]" {
+            return Ok(());
+        }
+        let value: Value = serde_json::from_str(data)
+            .map_err(|_| ProtocolError::upstream("upstream sent invalid SSE JSON"))?;
+        if value.get("error").is_some() {
+            return Err(ProtocolError::upstream("upstream stream error"));
+        }
+        self.saw_event = true;
+        if self.first_event_ms.is_none() {
+            self.first_event_ms = Some(self.elapsed_ms());
+        }
+        if let Some(id) = value.get("id").and_then(Value::as_str) {
+            self.id.get_or_insert_with(|| id.to_owned());
+        }
+        if let Some(model) = value.get("model").and_then(Value::as_str) {
+            self.model.get_or_insert_with(|| model.to_owned());
+        }
+        if let Some(usage) = value.get("usage") {
+            if usage.is_object() && !usage.as_object().is_some_and(Map::is_empty) {
+                // Last complete usage wins (upstream sends one final
+                // cumulative usage; never double-count partials).
+                self.usage = usage.clone();
+            }
+        }
+        let Some(choice) = value
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+        else {
+            // Usage-only or empty-choices chunk: not an error mid-stream.
+            return Ok(());
+        };
+        if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+            self.finish_reason = Some(reason.to_owned());
+        }
+        let Some(delta) = choice.get("delta").and_then(Value::as_object) else {
+            return Ok(());
+        };
+        if let Some(reasoning) = reasoning_delta(delta).filter(|text| !text.is_empty()) {
+            self.reasoning.push_str(reasoning);
+        }
+        if let Some(text) = delta
+            .get("content")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+        {
+            self.text.push_str(text);
+        }
+        if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
+            if self.first_tool_call_ms.is_none() {
+                self.first_tool_call_ms = Some(self.elapsed_ms());
+            }
+            for call in calls {
+                let index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
+                let tool = self.tools.entry(index).or_default();
+                if !self.tool_order.contains(&index) {
+                    self.tool_order.push(index);
+                }
+                if let Some(id) = call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                {
+                    tool.id.get_or_insert_with(|| id.to_owned());
+                }
+                if let Some(function) = call.get("function").and_then(Value::as_object) {
+                    if let Some(name) = function
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .filter(|name| !name.is_empty())
+                    {
+                        tool.name.get_or_insert_with(|| name.to_owned());
+                    }
+                    if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+                        tool.arguments.push_str(arguments);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Assemble the standard OpenAI non-stream response body. Malformed
+    /// tool arguments are left exactly as received — the downstream
+    /// conversion (`convert_response`) applies the existing safe-error
+    /// semantics; the aggregator never "repairs" model output.
+    fn into_response(self, request_id: &str) -> Result<Value, ProtocolError> {
+        if !self.saw_event
+            || (self.text.is_empty()
+                && self.reasoning.is_empty()
+                && self.tools.is_empty()
+                && self.finish_reason.is_none())
+        {
+            return Err(ProtocolError::upstream(
+                "upstream stream ended without any response content",
+            ));
+        }
+        let tool_calls: Vec<Value> = self
+            .tool_order
+            .iter()
+            .filter_map(|index| {
+                let tool = self.tools.get(index)?;
+                if tool.name.is_none() && tool.arguments.is_empty() {
+                    return None; // never received a usable fragment
+                }
+                Some(json!({
+                    "id": tool.id.clone().unwrap_or_else(|| format!("toolu_{index}")),
+                    "type": "function",
+                    "function": {
+                        "name": tool.name.clone().unwrap_or_else(|| "unknown".into()),
+                        "arguments": tool.arguments,
+                    }
+                }))
+            })
+            .collect();
+        let mut message = Map::new();
+        message.insert("role".into(), Value::String("assistant".into()));
+        message.insert("content".into(), Value::String(self.text));
+        if !self.reasoning.is_empty() {
+            message.insert("reasoning_content".into(), Value::String(self.reasoning));
+        }
+        if !tool_calls.is_empty() {
+            message.insert("tool_calls".into(), Value::Array(tool_calls));
+        }
+        Ok(json!({
+            "id": self.id.unwrap_or_else(|| request_id.to_owned()),
+            "model": self.model.unwrap_or_default(),
+            "choices":[{
+                "index": 0,
+                "message": Value::Object(message),
+                "finish_reason": self.finish_reason.unwrap_or_else(|| "stop".into()),
+            }],
+            "usage": self.usage,
+        }))
+    }
+}
+
+/// Consume one upstream streaming response and aggregate it into a final
+/// standard OpenAI response body. If the upstream replied with plain JSON
+/// despite a stream request (defensive), the body is normalized through
+/// the strict envelope layer instead. Returns the body plus upstream-side
+/// timings (`first_event_ms`, `duration_ms`) — never client-facing TTFT.
+pub async fn aggregate_stream_response(
+    response: reqwest::Response,
+    request_id: &str,
+) -> Result<(Value, UpstreamBodyShape, Option<u128>, u128), ProtocolError> {
+    let started = Instant::now();
+    let is_json = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("application/json"));
+    if is_json {
+        // Defensive: upstream answered a stream request with a complete
+        // JSON body. Normalize the known envelopes strictly.
+        let value = parse_json_response(response).await?;
+        let (normalized, shape) = normalize_nonstream_body(value)?;
+        return Ok((normalized, shape, None, started.elapsed().as_millis()));
+    }
+    let mut upstream = response.bytes_stream();
+    let mut decoder = SseDecoder::default();
+    let mut accumulator = NonStreamAccumulator::new();
+    loop {
+        let Some(chunk) = upstream.next().await else {
+            break;
+        };
+        let chunk =
+            chunk.map_err(|_| ProtocolError::upstream("upstream stream was interrupted"))?;
+        accumulator.aggregated_bytes = accumulator.aggregated_bytes.saturating_add(chunk.len());
+        if accumulator.aggregated_bytes > MAX_AGGREGATED_RESPONSE_BYTES {
+            return Err(ProtocolError::upstream(
+                "upstream response exceeded the safe aggregation limit",
+            ));
+        }
+        let events = decoder.push(&chunk).map_err(|_| {
+            ProtocolError::upstream("upstream SSE event exceeded the gateway limit")
+        })?;
+        for event in events {
+            accumulator.handle(&event.data)?;
+        }
+    }
+    for event in decoder
+        .finish()
+        .map_err(|_| ProtocolError::upstream("upstream SSE event exceeded the gateway limit"))?
+    {
+        accumulator.handle(&event.data)?;
+    }
+    let timings = (accumulator.first_event_ms, started.elapsed().as_millis());
+    let body = accumulator.into_response(request_id)?;
+    Ok((
+        body,
+        UpstreamBodyShape::StandardOpenAi,
+        timings.0,
+        timings.1,
+    ))
 }
 
 /// Options for [`stream_body`] beyond the response itself.
@@ -1674,6 +1938,112 @@ pub async fn parse_json_response(response: reqwest::Response) -> Result<Value, P
         .map_err(|_| ProtocolError::upstream("upstream returned invalid JSON"))
 }
 
+// --- Upstream response envelope normalization (issue #14) ---
+//
+// HTTP 200 is transport success, not semantic completion success. Cline's
+// native non-stream body shape is not reliably standard OpenAI (production
+// evidence: 34-73 s generations returned 200 with a body missing top-level
+// `choices`, which the proxy then discarded as a 502). This layer classifies
+// a 2xx JSON body strictly and normalizes the one KNOWN non-standard
+// envelope. There is deliberately no recursive `choices` search: only
+// `root.choices` or `success == true && data.choices` (one level) are
+// recognized — anything else is a distinct protocol error, never a guess.
+
+/// Classification of a non-stream upstream JSON body. Logged as shape
+/// metadata only (never the body itself — it may contain model output).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamBodyShape {
+    /// Standard OpenAI Chat Completions response: root `choices` non-empty.
+    StandardOpenAi,
+    /// Known Cline envelope: `success: true` with the OpenAI payload under
+    /// `data` (one level; strict).
+    ClineDataEnvelope,
+    /// `success: false` — upstream application error, never a completion.
+    ApplicationError,
+    /// No `choices` field and no known envelope markers.
+    MissingChoices,
+    /// `choices` exists but is empty in a FINAL non-stream response.
+    EmptyChoices,
+    /// `success: true` but the `data` payload is not a usable OpenAI body.
+    UnrecognizedEnvelope,
+}
+
+impl UpstreamBodyShape {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::StandardOpenAi => "openai",
+            Self::ClineDataEnvelope => "cline_data_envelope",
+            Self::ApplicationError => "upstream_application_error",
+            Self::MissingChoices => "missing_choices",
+            Self::EmptyChoices => "empty_choices",
+            Self::UnrecognizedEnvelope => "unrecognized_envelope",
+        }
+    }
+}
+
+fn choices_usable(object: &Map<String, Value>) -> bool {
+    object
+        .get("choices")
+        .and_then(Value::as_array)
+        .is_some_and(|choices| !choices.is_empty())
+}
+
+pub fn classify_nonstream_body(value: &Value) -> UpstreamBodyShape {
+    let Some(object) = value.as_object() else {
+        return UpstreamBodyShape::MissingChoices;
+    };
+    if object.contains_key("choices") {
+        return if choices_usable(object) {
+            UpstreamBodyShape::StandardOpenAi
+        } else {
+            UpstreamBodyShape::EmptyChoices
+        };
+    }
+    match object.get("success").and_then(Value::as_bool) {
+        Some(true) => {
+            if object
+                .get("data")
+                .and_then(Value::as_object)
+                .is_some_and(choices_usable)
+            {
+                UpstreamBodyShape::ClineDataEnvelope
+            } else {
+                UpstreamBodyShape::UnrecognizedEnvelope
+            }
+        }
+        Some(false) => UpstreamBodyShape::ApplicationError,
+        // `success` absent or non-boolean: not a known envelope marker.
+        None => UpstreamBodyShape::MissingChoices,
+    }
+}
+
+/// Normalize a 2xx non-stream JSON body into a standard OpenAI payload.
+/// Returns the payload plus the observed shape (for telemetry). Fails with
+/// a distinct, content-free protocol error for every non-usable shape.
+pub fn normalize_nonstream_body(value: Value) -> Result<(Value, UpstreamBodyShape), ProtocolError> {
+    let shape = classify_nonstream_body(&value);
+    match shape {
+        UpstreamBodyShape::StandardOpenAi => Ok((value, shape)),
+        UpstreamBodyShape::ClineDataEnvelope => {
+            // Strict one-level unwrap; `data` was verified above.
+            let data = value.get("data").cloned().unwrap_or(Value::Null);
+            Ok((data, shape))
+        }
+        UpstreamBodyShape::ApplicationError => Err(ProtocolError::upstream(
+            "upstream reported an application error for this request",
+        )),
+        UpstreamBodyShape::MissingChoices => Err(ProtocolError::upstream(
+            "upstream response did not contain the choices field",
+        )),
+        UpstreamBodyShape::EmptyChoices => Err(ProtocolError::upstream(
+            "upstream response contained an empty choices array",
+        )),
+        UpstreamBodyShape::UnrecognizedEnvelope => Err(ProtocolError::upstream(
+            "upstream response envelope was not recognized",
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1872,6 +2242,259 @@ mod tests {
             true,
         );
         assert!(result.is_err());
+    }
+
+    // --- envelope normalization (issue #14, fixtures §78-85) ---
+
+    fn standard_body() -> Value {
+        json!({
+            "id": "chatcmpl-1", "model": "m",
+            "choices":[{"index":0, "message":{"role":"assistant","content":"hello"},
+                        "finish_reason":"stop"}],
+            "usage":{"prompt_tokens":10,"completion_tokens":2}
+        })
+    }
+
+    #[test]
+    fn normalize_accepts_standard_openai_body() {
+        let (normalized, shape) = normalize_nonstream_body(standard_body()).unwrap();
+        assert_eq!(shape, UpstreamBodyShape::StandardOpenAi);
+        assert_eq!(normalized["choices"][0]["message"]["content"], "hello");
+    }
+
+    #[test]
+    fn normalize_unwraps_known_cline_data_envelope_strictly() {
+        let wrapped = json!({"success": true, "data": standard_body()});
+        let (normalized, shape) = normalize_nonstream_body(wrapped).unwrap();
+        assert_eq!(shape, UpstreamBodyShape::ClineDataEnvelope);
+        assert_eq!(normalized["choices"][0]["message"]["content"], "hello");
+    }
+
+    #[test]
+    fn normalize_wrapped_tool_call_body_yields_openai_shape() {
+        let wrapped = json!({
+            "success": true,
+            "data": {
+                "id":"chat", "choices":[{"message":{
+                    "content":"", "tool_calls":[{"id":"call_9","type":"function",
+                    "function":{"name":"Edit","arguments":"{\"path\":\"a\"}"}}]
+                },"finish_reason":"tool_calls"}],
+                "usage":{"prompt_tokens":3,"completion_tokens":1}
+            }
+        });
+        let (normalized, _) = normalize_nonstream_body(wrapped).unwrap();
+        assert_eq!(
+            normalized["choices"][0]["message"]["tool_calls"][0]["id"],
+            "call_9"
+        );
+        // The unwrapped body must flow through the SAME convert path.
+        let anthropic = convert_response(&normalized, "req", "model", false).unwrap();
+        assert_eq!(anthropic["stop_reason"], "tool_use");
+        assert_eq!(anthropic["content"][0]["type"], "tool_use");
+    }
+
+    #[test]
+    fn normalize_wrapped_reasoning_respects_exposure_downstream() {
+        let wrapped = json!({
+            "success": true,
+            "data": {"choices":[{"message":{"reasoning_content":"secret thoughts",
+                "content":"answer"},"finish_reason":"stop"}]}
+        });
+        let (normalized, _) = normalize_nonstream_body(wrapped).unwrap();
+        let unexposed = convert_response(&normalized, "req", "model", false).unwrap();
+        assert!(unexposed["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|b| b["type"] != "thinking"));
+        let exposed = convert_response(&normalized, "req", "model", true).unwrap();
+        assert_eq!(exposed["content"][0]["type"], "thinking");
+    }
+
+    #[test]
+    fn normalize_success_false_is_an_application_error_not_missing_choices() {
+        let error = normalize_nonstream_body(json!({"success": false, "data": null})).unwrap_err();
+        assert!(error.message.contains("application error"));
+    }
+
+    #[test]
+    fn normalize_missing_choices_is_a_distinct_error() {
+        let error = normalize_nonstream_body(json!({"id":"x","usage":{}})).unwrap_err();
+        assert!(error.message.contains("did not contain the choices field"));
+    }
+
+    #[test]
+    fn normalize_empty_choices_is_a_distinct_error() {
+        let error = normalize_nonstream_body(json!({"choices":[],"usage":{}})).unwrap_err();
+        assert!(error.message.contains("empty choices array"));
+    }
+
+    #[test]
+    fn normalize_never_searches_nested_unrelated_choices() {
+        // `choices` buried under an unrelated key must NOT be unwrapped.
+        let error = normalize_nonstream_body(json!({"foo":{"choices":[
+            {"message":{"content":"x"}}]}}))
+        .unwrap_err();
+        assert!(error.message.contains("did not contain the choices field"));
+    }
+
+    #[test]
+    fn normalize_success_true_without_usable_data_is_unrecognized() {
+        let error =
+            normalize_nonstream_body(json!({"success": true, "data": {"id": "x"}})).unwrap_err();
+        assert!(error.message.contains("envelope was not recognized"));
+    }
+
+    // --- non-stream accumulator (issue #14) ---
+
+    fn sse_data(value: &Value) -> String {
+        format!("data: {value}\n\n")
+    }
+
+    fn feed(accumulator: &mut NonStreamAccumulator, sse: &str) {
+        let mut decoder = SseDecoder::default();
+        for event in decoder.push(sse.as_bytes()).unwrap() {
+            accumulator.handle(&event.data).unwrap();
+        }
+        for event in decoder.finish().unwrap() {
+            accumulator.handle(&event.data).unwrap();
+        }
+    }
+
+    #[test]
+    fn accumulator_aggregates_text_in_order_without_trimming() {
+        let mut accumulator = NonStreamAccumulator::new();
+        feed(
+            &mut accumulator,
+            &format!(
+                "{}{}{}",
+                sse_data(&json!({"id":"c1","choices":[{"delta":{"content":"Hello  "}}]})),
+                sse_data(&json!({"choices":[{"delta":{"content":"wo rld\n"}}]})),
+                sse_data(&json!({"choices":[{"delta":{},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":10,"completion_tokens":3}})),
+            ),
+        );
+        let body = accumulator.into_response("req").unwrap();
+        assert_eq!(body["choices"][0]["message"]["content"], "Hello  wo rld\n");
+        assert_eq!(body["choices"][0]["finish_reason"], "stop");
+        assert_eq!(body["usage"]["completion_tokens"], 3);
+    }
+
+    #[test]
+    fn accumulator_handles_fragmented_parallel_tool_calls_in_generation_order() {
+        let mut accumulator = NonStreamAccumulator::new();
+        feed(
+            &mut accumulator,
+            &format!(
+                "{}{}{}{}",
+                sse_data(&json!({"choices":[{"delta":{"tool_calls":[
+                    {"index":0,"id":"call_a","function":{"name":"Read","arguments":"{\"pa"}},
+                    {"index":1,"id":"call_b","function":{"name":"Write","arguments":"{\"tx"}}
+                ]}}]})),
+                sse_data(&json!({"choices":[{"delta":{"tool_calls":[
+                    {"index":1,"function":{"arguments":"\":\"é\"}"}},
+                    {"index":0,"function":{"arguments":"th\":\"a.rs\"}"}}
+                ]}}]})),
+                sse_data(&json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})),
+                sse_data(&json!({"choices":[],"usage":{"prompt_tokens":8,"completion_tokens":5}})),
+            ),
+        );
+        let body = accumulator.into_response("req").unwrap();
+        let calls = body["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap();
+        assert_eq!(calls.len(), 2);
+        // Generation order (index 0 first), byte-exact fragmented arguments.
+        assert_eq!(calls[0]["id"], "call_a");
+        assert_eq!(calls[0]["function"]["arguments"], "{\"path\":\"a.rs\"}");
+        assert_eq!(calls[1]["id"], "call_b");
+        assert_eq!(calls[1]["function"]["arguments"], "{\"tx\":\"é\"}");
+        // The usage-only empty-choices chunk fed usage without erroring.
+        assert_eq!(body["usage"]["completion_tokens"], 5);
+    }
+
+    #[test]
+    fn accumulator_usage_last_write_wins_never_double_counts() {
+        let mut accumulator = NonStreamAccumulator::new();
+        feed(
+            &mut accumulator,
+            &format!(
+                "{}{}",
+                sse_data(&json!({"choices":[{"delta":{"content":"a"}}],
+                    "usage":{"prompt_tokens":5,"completion_tokens":1}})),
+                sse_data(&json!({"choices":[{"delta":{},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":9,"completion_tokens":2}})),
+            ),
+        );
+        let body = accumulator.into_response("req").unwrap();
+        assert_eq!(body["usage"]["prompt_tokens"], 9);
+        assert_eq!(body["usage"]["completion_tokens"], 2);
+    }
+
+    #[test]
+    fn accumulator_empty_stream_is_a_protocol_error() {
+        let mut accumulator = NonStreamAccumulator::new();
+        feed(&mut accumulator, "data: [DONE]\n\n");
+        let error = accumulator.into_response("req").unwrap_err();
+        assert!(error.message.contains("without any response content"));
+    }
+
+    #[test]
+    fn accumulator_reasoning_is_kept_in_order_for_downstream_exposure_gate() {
+        let mut accumulator = NonStreamAccumulator::new();
+        feed(
+            &mut accumulator,
+            &format!(
+                "{}{}",
+                sse_data(&json!({"choices":[{"delta":{"reasoning_content":"think "}}]})),
+                sse_data(
+                    &json!({"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}]})
+                ),
+            ),
+        );
+        let body = accumulator.into_response("req").unwrap();
+        assert_eq!(body["choices"][0]["message"]["reasoning_content"], "think ");
+        // Same convert semantics as every other path: exposure decides.
+        let unexposed = convert_response(&body, "req", "m", false).unwrap();
+        assert!(unexposed["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|b| b["type"] != "thinking"));
+    }
+
+    #[test]
+    fn accumulator_large_tool_arguments_stay_byte_exact() {
+        let large_value = "x".repeat(100_000);
+        let arguments = json!({ "text": large_value }).to_string();
+        let mut accumulator = NonStreamAccumulator::new();
+        // Feed in 8 KB fragments to exercise repeated appends.
+        let mut start = 0;
+        let mut first = true;
+        while start < arguments.len() {
+            let end = (start + 8192).min(arguments.len());
+            let fragment = &arguments[start..end];
+            let chunk = if first {
+                json!({"choices":[{"delta":{"tool_calls":[
+                    {"index":0,"id":"call_big","function":{"name":"Write","arguments":fragment}}]}}]})
+            } else {
+                json!({"choices":[{"delta":{"tool_calls":[
+                    {"index":0,"function":{"arguments":fragment}}]}}]})
+            };
+            feed(&mut accumulator, &sse_data(&chunk));
+            first = false;
+            start = end;
+        }
+        feed(
+            &mut accumulator,
+            &sse_data(&json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})),
+        );
+        let body = accumulator.into_response("req").unwrap();
+        let wire_arguments = body["choices"][0]["message"]["tool_calls"][0]["function"]
+            ["arguments"]
+            .as_str()
+            .unwrap();
+        assert_eq!(wire_arguments, arguments);
     }
 
     #[test]

@@ -173,7 +173,10 @@ impl ClineUpstream {
                         failovers = attempt.saturating_sub(1),
                         failed_key_probe_ms = failed_probes_ms,
                         successful_upstream_headers_ms = attempt_elapsed.as_millis(),
-                        "logical request completed after failover"
+                        // Transport success only: the body may still fail
+                        // protocol validation downstream (issue #14). The
+                        // logical completion is logged by the protocol layer.
+                        "upstream HTTP response selected after failover"
                     );
                 }
                 return Ok(UpstreamResult {

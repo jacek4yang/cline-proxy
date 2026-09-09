@@ -1,0 +1,86 @@
+{
+  "server": {
+    "bind": "127.0.0.1:18788",
+    "api_key": "fuckyou"
+  },
+  "upstream": {
+    "base_url": "https://api.cline.bot/api/v1",
+    "chat_path": "/chat/completions",
+    "timeout_secs": 600,
+    "connect_timeout_secs": 20,
+    "fallback_429_cooldown_secs": 3600,
+    "headers": {
+      "http-referer": "https://cline.bot",
+      "user-agent": "Cline/4.1.16",
+      "x-client-type": "cline-vscode",
+      "x-client-version": "4.1.16",
+      "x-core-version": "4.1.16",
+      "x-platform": "vscode",
+      "x-platform-version": "1.106.0",
+      "x-title": "Cline"
+    }
+  },
+  "cline_api_keys": [
+    {
+      "name": "cline-google-jacek2yang",
+      "api_key": "sk_7d653806f3bcd88749c353a461c91da71d5dcb619cf52a9aa48de80400b811b7",
+      "enabled": true
+    },
+    {
+      "name": "cline-google-jacek42yang",
+      "api_key": "sk_3beb90c10a03f2ee400f39c51acbdf69ca5f01b29abd2ec9a0c701b6a5d16af7",
+      "enabled": true
+    },
+    {
+      "name": "cline-github-jacek4yang",
+      "api_key": "sk_8c22e0dc9d259bd14fda08b33d5e23dd3fc2d0dbb13c13b34316985316fa81d1",
+      "enabled": true
+    },
+    {
+      "name": "cline-github-jacekSmile",
+      "api_key": "sk_b38ee53a3f896c6d377b388c1e9cba7a762b2b1ea3e023e724f5b3f7dc96181c",
+      "enabled": true
+    },
+    {
+      "name": "cline-github-aromacode",
+      "api_key": "sk_2fff7643b0caec1be8c8dace2de428a95cbdf32532476b78bf0f45ae65bd1be6",
+      "enabled": true
+    },
+    {
+      "name": "cline-github-brewlogic",
+      "api_key": "sk_939ed3234df7ba2d08b46c1d377a6a7479247982a885ee0d01732299549b1221",
+      "enabled": true
+    },
+    {
+      "name": "cline-github-leafcache",
+      "api_key": "sk_c7fcd649cf37ff06fe5e6589222ed3a8272071dff757c12d7ee9ff38e33caa4d",
+      "enabled": true
+    },
+    {
+      "name": "cline-github-zeroregex",
+      "api_key": "sk_434c5af9e37b649e3d9d549449f3d56c4814f7a5fb09ea24949fff6df99ce851",
+      "enabled": true
+    },
+    {
+      "name": "cline-github-1993616178",
+      "api_key": "sk_68fb261cadd5bd1da43b0ccd73d8231a16977138f3203b5af4ea35cbf502a36e",
+      "enabled": true
+    }
+  ],
+  "models": {
+    "default": "z-ai/glm-5.3-flash",
+    "aliases": {
+      "claude-sonnet-4-6": "z-ai/glm-5.3-flash",
+      "claude-opus-4-1": "z-ai/glm-5.3-flash",
+      "claude-haiku-4-5": "z-ai/glm-5.3-flash"
+    }
+  },
+  "runtime": {
+    "max_request_bytes": 33554432,
+    "log_level": "info",
+    "log_format": "pretty",
+    "stream_progress_secs": 30,
+    "shutdown_timeout_secs": 30,
+    "state_file": null
+  }
+}

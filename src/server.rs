@@ -480,6 +480,20 @@ async fn anthropic_messages(
             request_id.clone(),
         );
     }
+    // Cline upstream strategy (issue #14): streaming is the verified
+    // canonical upstream transport. A downstream non-stream request is
+    // served by ONE upstream streaming request aggregated locally — the
+    // decision is made BEFORE the request is sent, so a response-shape
+    // mismatch can never be recovered by paying for a second generation.
+    // Only the transport flags change; every cache-relevant field
+    // (system, tools, messages, effort, max_tokens) is untouched.
+    let upstream_stream = true;
+    if !converted.stream {
+        if let Some(object) = converted.body.as_object_mut() {
+            object.insert("stream".into(), Value::Bool(true));
+            object.insert("stream_options".into(), json!({"include_usage":true}));
+        }
+    }
     let upstream_body = match serde_json::to_vec(&converted.body) {
         Ok(body) => Bytes::from(body),
         Err(_) => {
@@ -496,7 +510,13 @@ async fn anthropic_messages(
         protocol = "anthropic",
         requested_model,
         upstream_model,
-        stream = converted.stream,
+        downstream_stream = converted.stream,
+        upstream_stream,
+        upstream_strategy = if converted.stream {
+            "native_streaming"
+        } else {
+            "stream_and_aggregate"
+        },
         request_bytes = body.len(),
         upstream_request_bytes = upstream_body.len(),
         "client request accepted"
@@ -504,12 +524,7 @@ async fn anthropic_messages(
     let started = Instant::now();
     let result = match state
         .upstream
-        .send_chat(
-            upstream_body,
-            converted.stream,
-            &request_id,
-            &upstream_model,
-        )
+        .send_chat(upstream_body, upstream_stream, &request_id, &upstream_model)
         .await
     {
         Ok(result) => result,
@@ -564,10 +579,26 @@ async fn anthropic_messages(
         insert_request_id(response.headers_mut(), &request_id);
         return response;
     }
-    let value = match anthropic::parse_json_response(response).await {
-        Ok(value) => value,
-        Err(error) => return protocol_error(error, StatusCode::BAD_GATEWAY, &request_id),
-    };
+    // Downstream non-stream: aggregate the upstream stream (issue #14).
+    let (value, response_shape, first_event_ms, upstream_duration_ms) =
+        match anthropic::aggregate_stream_response(response, &request_id).await {
+            Ok(parts) => parts,
+            Err(error) => {
+                // A malformed or unusable 2xx body is a provider protocol
+                // error, never a key-quota signal: 502 without rotation.
+                return protocol_error(error, StatusCode::BAD_GATEWAY, &request_id);
+            }
+        };
+    tracing::info!(
+        request_id,
+        downstream_stream = false,
+        upstream_strategy = "stream_and_aggregate",
+        response_shape = response_shape.as_str(),
+        upstream_first_event_ms = first_event_ms.unwrap_or(0),
+        upstream_duration_ms,
+        aggregate_ms = started.elapsed().as_millis(),
+        "upstream stream aggregated for non-stream client"
+    );
     // Reasoning shadow store (issue #10): remember in-turn reasoning that
     // issued tool calls so the next request in this epoch can restore it.
     store_reasoning_shadow(
@@ -936,15 +967,45 @@ async fn openai_upstream_response(
         Ok(bytes) => bytes,
         Err(message) => return openai_error(StatusCode::BAD_GATEWAY, message, request_id),
     };
-    if serde_json::from_slice::<Value>(&bytes).is_err() {
-        return openai_error(
-            StatusCode::BAD_GATEWAY,
-            "upstream returned invalid JSON",
-            request_id,
-        );
-    }
-    let mut response =
-        (status, [(header::CONTENT_TYPE, "application/json")], bytes).into_response();
+    let value: Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(_) => {
+            return openai_error(
+                StatusCode::BAD_GATEWAY,
+                "upstream returned invalid JSON",
+                request_id,
+            )
+        }
+    };
+    // Normalize the known upstream envelopes strictly (issue #14): a 2xx
+    // body the OpenAI client cannot use is a provider protocol error
+    // (502, no key rotation), never a passthrough of unknown shapes.
+    let observed_shape = anthropic::classify_nonstream_body(&value);
+    let (normalized, response_shape) = match anthropic::normalize_nonstream_body(value) {
+        Ok(parts) => parts,
+        Err(error) => {
+            tracing::info!(
+                request_id,
+                response_shape = observed_shape.as_str(),
+                error = %error,
+                "upstream non-stream body was not usable"
+            );
+            return openai_error(StatusCode::BAD_GATEWAY, error.message, request_id);
+        }
+    };
+    tracing::debug!(
+        request_id,
+        response_shape = response_shape.as_str(),
+        body_bytes = bytes.len(),
+        "upstream non-stream envelope normalized"
+    );
+    let out_bytes = serde_json::to_vec(&normalized).unwrap_or_else(|_| bytes.to_vec());
+    let mut response = (
+        status,
+        [(header::CONTENT_TYPE, "application/json")],
+        out_bytes,
+    )
+        .into_response();
     insert_request_id(response.headers_mut(), request_id);
     response
 }
@@ -2249,6 +2310,376 @@ mod tests {
         // GLM policy on the wire: explicit effort + capped output.
         assert_eq!(seen[0].body["reasoning_effort"], "high");
         assert_eq!(seen[0].body["max_tokens"], 128);
+        task.abort();
+    }
+
+    // --- non-stream aggregation (issue #14) ---
+
+    fn sse_chunk(value: &Value) -> String {
+        format!("data: {value}\n\ndata: [DONE]\n\n")
+    }
+
+    /// A downstream `stream=false` request reaches the upstream as ONE
+    /// streaming request and returns a single Anthropic JSON response.
+    #[tokio::test]
+    async fn anthropic_nonstream_aggregates_upstream_streaming_text() {
+        let (base, mock, task) = start_mock().await;
+        mock.set(
+            "cline-key-1",
+            vec![Spec::sse(sse_chunk(&json!({
+                "id":"chat","model":"z-ai/glm-5.3-flash",
+                "choices":[{"delta":{"content":"Hello from streaming"}},
+                    {"delta":{},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":10,"completion_tokens":4,
+                    "prompt_tokens_details":{"cached_tokens":7}}
+            })))],
+        )
+        .await;
+        let app = router(AppState::new(test_config(base, 1)).unwrap());
+        let response = app
+            .oneshot(gateway_request(
+                "/v1/messages",
+                json!({
+                    "model":"claude-sonnet-4-6","max_tokens":128,"stream":false,
+                    "messages":[{"role":"user","content":"hi"}]
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+        let value: Value = serde_json::from_str(&response_text(response).await).unwrap();
+        assert_eq!(value["content"][0]["type"], "text");
+        assert_eq!(value["content"][0]["text"], "Hello from streaming");
+        assert_eq!(value["stop_reason"], "end_turn");
+        // Cache metrics survive aggregation (§43).
+        assert_eq!(value["usage"]["cache_read_input_tokens"], 7);
+        assert_eq!(value["usage"]["output_tokens"], 4);
+        // The upstream request was switched to streaming before send (§14).
+        let seen = mock.seen().await;
+        assert_eq!(seen[0].body["stream"], true);
+        assert_eq!(seen[0].body["stream_options"]["include_usage"], true);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn anthropic_nonstream_aggregates_parallel_tool_calls_and_suppresses_reasoning() {
+        let (base, mock, task) = start_mock().await;
+        let sse = format!(
+            "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            json!({"id":"chat","choices":[{"delta":{"reasoning_content":"INTERNAL THINKING"}}]}),
+            json!({"choices":[{"delta":{"tool_calls":[
+                {"index":0,"id":"call_a","function":{"name":"Read","arguments":"{\"pa"}},
+                {"index":1,"id":"call_b","function":{"name":"Edit","arguments":"{\"li"}}
+            ]}}]}),
+            json!({"choices":[{"delta":{"tool_calls":[
+                {"index":1,"function":{"arguments":"ne\":2}"}},
+                {"index":0,"function":{"arguments":"th\":\"a.rs\"}"}}
+            ]}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}],
+            "usage":{"prompt_tokens":9,"completion_tokens":5}}),
+        );
+        mock.set("cline-key-1", vec![Spec::sse(sse)]).await;
+        let app = router(AppState::new(test_config(base, 1)).unwrap());
+        let response = app
+            .oneshot(gateway_request(
+                "/v1/messages",
+                json!({
+                    "model":"claude-sonnet-4-6","max_tokens":128,"stream":false,
+                    "messages":[{"role":"user","content":"edit the file"}]
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: Value = serde_json::from_str(&response_text(response).await).unwrap();
+        // Unrequested thinking is suppressed even on the aggregate path (§90).
+        assert!(value["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|b| b["type"] != "thinking"));
+        let tool_uses: Vec<&Value> = value["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|b| b["type"] == "tool_use")
+            .collect();
+        assert_eq!(tool_uses.len(), 2);
+        assert_eq!(tool_uses[0]["id"], "call_a");
+        assert_eq!(tool_uses[0]["input"]["path"], "a.rs");
+        assert_eq!(tool_uses[1]["id"], "call_b");
+        assert_eq!(tool_uses[1]["input"]["line"], 2);
+        assert_eq!(value["stop_reason"], "tool_use");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn anthropic_nonstream_aggregation_commits_reasoning_shadow() {
+        let (base, mock, task) = start_mock().await;
+        let tool_response = json!({
+            "id":"chat","choices":[{"delta":{
+                "reasoning_content":"EPHEMERAL LOOP REASONING",
+                "tool_calls":[{"index":0,"id":"call_1",
+                    "function":{"name":"Bash","arguments":"{\"command\":\"cargo test\"}"}}]},
+                "finish_reason":"tool_calls"}],
+            "usage":{"prompt_tokens":9,"completion_tokens":6}
+        });
+        mock.set(
+            "cline-key-1",
+            vec![
+                Spec::sse(sse_chunk(&tool_response)),
+                Spec::sse(sse_chunk(&json!({
+                    "id":"chat2","choices":[{"delta":{"content":"done"},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":9,"completion_tokens":2}
+                }))),
+            ],
+        )
+        .await;
+        let app = router(AppState::new(test_config(base, 1)).unwrap());
+        // Turn 1: tool call with unexposed reasoning → shadow committed.
+        let response = app
+            .clone()
+            .oneshot(gateway_request(
+                "/v1/messages",
+                json!({
+                    "model":"claude-sonnet-4-6","max_tokens":128,"stream":false,
+                    "metadata":{"user_id":"shadow_session_1"},
+                    "messages":[{"role":"user","content":"run tests"}]
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // Turn 2: tool result → the wire must carry the restored reasoning.
+        let response = app
+            .oneshot(gateway_request(
+                "/v1/messages",
+                json!({
+                    "model":"claude-sonnet-4-6","max_tokens":128,"stream":false,
+                    "metadata":{"user_id":"shadow_session_1"},
+                    "messages":[
+                        {"role":"user","content":"run tests"},
+                        {"role":"assistant","content":[{"type":"tool_use","id":"call_1",
+                            "name":"Bash","input":{"command":"cargo test"}}]},
+                        {"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1",
+                            "content":"ok"}]}
+                    ]
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let seen = mock.seen().await;
+        let assistant = seen[1].body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .unwrap();
+        assert_eq!(
+            assistant["reasoning_content"].as_str().unwrap_or(""),
+            "EPHEMERAL LOOP REASONING",
+            "shadow continuity must survive the aggregate path (§92)"
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn anthropic_nonstream_aggregation_exposes_requested_thinking() {
+        let (base, mock, task) = start_mock().await;
+        mock.set(
+            "cline-key-1",
+            vec![Spec::sse(format!(
+                "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                json!({"id":"chat","choices":[{"delta":{"reasoning_content":"VISIBLE THINKING"}}]}),
+                json!({"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":5,"completion_tokens":3}})
+            ))],
+        )
+        .await;
+        let app = router(AppState::new(test_config(base, 1)).unwrap());
+        let response = app
+            .oneshot(gateway_request(
+                "/v1/messages",
+                json!({
+                    "model":"claude-sonnet-4-6","max_tokens":128,"stream":false,
+                    "thinking":{"type":"adaptive"},
+                    "messages":[{"role":"user","content":"hi"}]
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(&response_text(response).await).unwrap();
+        assert_eq!(value["content"][0]["type"], "thinking");
+        assert_eq!(value["content"][0]["thinking"], "VISIBLE THINKING");
+        assert_eq!(value["content"][1]["type"], "text");
+        task.abort();
+    }
+
+    /// A 200 whose body is unusable (empty stream / missing choices) is a
+    /// provider protocol error: 502 WITHOUT key rotation (§21/§50/§94).
+    #[tokio::test]
+    async fn anthropic_nonstream_protocol_errors_never_rotate_keys() {
+        let (base, mock, task) = start_mock().await;
+        mock.set(
+            "cline-key-1",
+            vec![
+                Spec::sse("data: [DONE]\n\n"),
+                Spec::sse("data: {\"choices\":[],\"usage\":{}}\n\ndata: [DONE]\n\n"),
+            ],
+        )
+        .await;
+        let state = AppState::new(test_config(base, 2)).unwrap();
+        let app = router(state.clone());
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(gateway_request(
+                    "/v1/messages",
+                    json!({
+                        "model":"claude-sonnet-4-6","max_tokens":128,"stream":false,
+                        "messages":[{"role":"user","content":"hi"}]
+                    })
+                    .to_string(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        }
+        // Both calls stayed on key 1: no failover for a 200 body problem.
+        let seen = mock.seen().await;
+        assert_eq!(seen.len(), 2);
+        assert!(seen
+            .iter()
+            .all(|request| request.authorization == "Bearer cline-key-1"));
+        assert_eq!(
+            state.upstream.pool().select(&HashSet::new()).unwrap().index,
+            0
+        );
+        task.abort();
+    }
+
+    /// Defensive fallback: upstream answered a stream request with a
+    /// complete JSON body in the known Cline envelope → normalized and
+    /// converted, not discarded.
+    #[tokio::test]
+    async fn anthropic_nonstream_json_fallback_normalizes_cline_envelope() {
+        let (base, mock, task) = start_mock().await;
+        mock.set(
+            "cline-key-1",
+            vec![Spec::json(
+                200,
+                json!({
+                    "success": true,
+                    "data": {
+                        "id":"chat","model":"z-ai/glm-5.3-flash",
+                        "choices":[{"message":{"content":"wrapped hello"},
+                            "finish_reason":"stop"}],
+                        "usage":{"prompt_tokens":6,"completion_tokens":2}
+                    }
+                })
+                .to_string(),
+            )],
+        )
+        .await;
+        let app = router(AppState::new(test_config(base, 1)).unwrap());
+        let response = app
+            .oneshot(gateway_request(
+                "/v1/messages",
+                json!({
+                    "model":"claude-sonnet-4-6","max_tokens":128,"stream":false,
+                    "messages":[{"role":"user","content":"hi"}]
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: Value = serde_json::from_str(&response_text(response).await).unwrap();
+        assert_eq!(value["content"][0]["text"], "wrapped hello");
+        task.abort();
+    }
+
+    /// 429 before any stream content: the existing sticky failover must
+    /// work unchanged for the aggregate strategy (§93).
+    #[tokio::test]
+    async fn anthropic_nonstream_429_fails_over_then_aggregates() {
+        let (base, mock, task) = start_mock().await;
+        mock.set("cline-key-1", vec![Spec::json(429, "Retry after 30m")])
+            .await;
+        mock.set(
+            "cline-key-2",
+            vec![Spec::sse(sse_chunk(&json!({
+                "id":"chat","choices":[{"delta":{"content":"after failover"},
+                    "finish_reason":"stop"}],
+                "usage":{"prompt_tokens":5,"completion_tokens":3}
+            })))],
+        )
+        .await;
+        let app = router(AppState::new(test_config(base, 2)).unwrap());
+        let response = app
+            .oneshot(gateway_request(
+                "/v1/messages",
+                json!({
+                    "model":"claude-sonnet-4-6","max_tokens":128,"stream":false,
+                    "messages":[{"role":"user","content":"hi"}]
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: Value = serde_json::from_str(&response_text(response).await).unwrap();
+        assert_eq!(value["content"][0]["text"], "after failover");
+        let seen = mock.seen().await;
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].authorization, "Bearer cline-key-1");
+        assert_eq!(seen[1].authorization, "Bearer cline-key-2");
+        task.abort();
+    }
+
+    /// OpenAI-protocol non-stream clients get the same envelope
+    /// normalization (wrapped Cline body → standard OpenAI response).
+    #[tokio::test]
+    async fn openai_nonstream_wrapped_envelope_is_normalized() {
+        let (base, mock, task) = start_mock().await;
+        mock.set(
+            "cline-key-1",
+            vec![Spec::json(
+                200,
+                json!({
+                    "success": true,
+                    "data": {
+                        "id":"chat","model":"z-ai/glm-5.3-flash",
+                        "choices":[{"message":{"content":"normalized"},"finish_reason":"stop"}],
+                        "usage":{"prompt_tokens":5,"completion_tokens":1}
+                    }
+                })
+                .to_string(),
+            )],
+        )
+        .await;
+        let app = router(AppState::new(test_config(base, 1)).unwrap());
+        let response = app
+            .oneshot(gateway_request(
+                "/v1/chat/completions",
+                json!({
+                    "model":"claude-sonnet-4-6",
+                    "messages":[{"role":"user","content":"hi"}]
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: Value = serde_json::from_str(&response_text(response).await).unwrap();
+        assert_eq!(value["choices"][0]["message"]["content"], "normalized");
         task.abort();
     }
 
