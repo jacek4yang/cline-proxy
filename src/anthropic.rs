@@ -1054,6 +1054,9 @@ pub struct StreamOptions {
     pub progress_secs: u64,
     pub expose_thinking: bool,
     pub shadow: Option<StreamShadowContext>,
+    /// Adaptive observability (issue #16): static summary context; the
+    /// stream emits the single RequestSummary at close.
+    pub summary: Option<crate::obs::StreamSummary>,
 }
 
 pub fn stream_body(response: reqwest::Response, options: StreamOptions) -> Body {
@@ -1065,6 +1068,7 @@ pub fn stream_body(response: reqwest::Response, options: StreamOptions) -> Body 
         progress_secs,
         expose_thinking,
         shadow,
+        summary,
     } = options;
     let output = async_stream::stream! {
         let mut upstream = response.bytes_stream();
@@ -1077,8 +1081,9 @@ pub fn stream_body(response: reqwest::Response, options: StreamOptions) -> Body 
         let mut state = StreamState::new(request_id, fallback_model, expose_thinking, request_started);
         let mut telemetry = StreamTelemetry::new(
             state.request_id.clone(),
-            key_name,
+            key_name.clone(),
             request_started,
+            summary,
         );
         loop {
             tokio::select! {
@@ -1194,6 +1199,9 @@ struct StreamTelemetry {
     request_id: String,
     key_name: String,
     started: Instant,
+    /// Adaptive observability (issue #16): emits the single RequestSummary
+    /// at close. `None` (tests) falls back to the debug lifecycle line.
+    summary: Option<crate::obs::StreamSummary>,
     upstream_chunks: u64,
     upstream_bytes: u64,
     upstream_events: u64,
@@ -1202,6 +1210,8 @@ struct StreamTelemetry {
     committed_to_client: bool,
     saw_first_event: bool,
     finished: bool,
+    /// TTFT: first upstream event (issue #16 summary field).
+    first_event_ms: Option<u128>,
     /// Output composition accounting, absorbed from the stream state at
     /// completion. Bytes are SSE delta payload sizes, not tokens.
     reasoning_bytes: u64,
@@ -1217,11 +1227,17 @@ struct StreamTelemetry {
 }
 
 impl StreamTelemetry {
-    fn new(request_id: String, key_name: String, started: Instant) -> Self {
+    fn new(
+        request_id: String,
+        key_name: String,
+        started: Instant,
+        summary: Option<crate::obs::StreamSummary>,
+    ) -> Self {
         Self {
             request_id,
             key_name,
             started,
+            summary,
             upstream_chunks: 0,
             upstream_bytes: 0,
             upstream_events: 0,
@@ -1230,6 +1246,7 @@ impl StreamTelemetry {
             committed_to_client: false,
             saw_first_event: false,
             finished: false,
+            first_event_ms: None,
             reasoning_bytes: 0,
             text_bytes: 0,
             tool_call_bytes: 0,
@@ -1264,12 +1281,7 @@ impl StreamTelemetry {
             return;
         }
         self.saw_first_event = true;
-        tracing::info!(
-            request_id = %self.request_id,
-            selected_key_name = %self.key_name,
-            time_to_first_event_ms = self.started.elapsed().as_millis(),
-            "Anthropic stream received first upstream event"
-        );
+        self.first_event_ms = Some(self.started.elapsed().as_millis());
     }
 
     fn commit(&mut self, bytes: usize) {
@@ -1281,7 +1293,7 @@ impl StreamTelemetry {
     }
 
     fn log_progress(&self) {
-        tracing::info!(
+        tracing::debug!(
             request_id = %self.request_id,
             selected_key_name = %self.key_name,
             elapsed_ms = self.started.elapsed().as_millis(),
@@ -1337,7 +1349,24 @@ impl StreamTelemetry {
             }
             _ => None,
         };
-        tracing::info!(
+        // Adaptive observability (issue #16): the summary is the single
+        // per-request record (console line + JSONL); the wide lifecycle
+        // line stays available at debug level.
+        if let Some(stream_summary) = self.summary.take() {
+            stream_summary.finish(
+                crate::obs::StreamSnap {
+                    request_id: &self.request_id,
+                    key_name: &self.key_name,
+                    ttft_ms: self.first_event_ms,
+                    first_reasoning_ms: self.first_reasoning_ms,
+                    first_text_ms: self.first_text_ms,
+                    first_tool_call_ms: self.first_tool_call_ms,
+                    usage,
+                },
+                outcome,
+            );
+        }
+        tracing::debug!(
             request_id = %self.request_id,
             selected_key_name = %self.key_name,
             outcome,

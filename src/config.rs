@@ -28,6 +28,15 @@ pub mod defaults {
     /// Default upstream output ceiling. 8K is tight for complex coding
     /// turns; 32K+ invites runaway generation (issue #6). Overridable.
     pub const MAX_OUTPUT_TOKENS: u32 = 16_384;
+    // Adaptive file logging defaults (issue #16): sized for a low-resource
+    // host while bounding disk at ~1 GB.
+    pub const LOG_DIRECTORY: &str = "logs";
+    pub const LOG_MAX_FILE_MB: u64 = 64;
+    pub const LOG_MAX_TOTAL_MB: u64 = 1024;
+    pub const LOG_CLEANUP_TARGET_PERCENT: u64 = 85;
+    pub const LOG_FLUSH_INTERVAL_MS: u64 = 1000;
+    pub const LOG_SLOW_TTFT_MS: u64 = 15_000;
+    pub const LOG_SLOW_DURATION_MS: u64 = 60_000;
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -38,6 +47,7 @@ pub struct Config {
     pub cline_api_keys: Vec<ClineKeyConfig>,
     pub models: ModelsConfig,
     pub runtime: RuntimeConfig,
+    pub logging: LoggingConfig,
     pub glm53: Glm53Config,
 }
 
@@ -310,6 +320,62 @@ impl Default for RuntimeConfig {
     }
 }
 
+/// Bounded adaptive file logging (issue #16): one JSONL record per request
+/// through a dedicated writer thread with a hard directory quota. All
+/// fields have production-safe defaults suitable for a 2C2G host.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LoggingConfig {
+    /// Rolling JSONL request summaries under this directory. `null`/empty
+    /// disables file logging entirely (console still works).
+    pub directory: Option<String>,
+    /// Rotation size per segment.
+    pub max_file_size_mb: u64,
+    /// HARD bound on total managed log bytes; oldest segments are deleted
+    /// past this until `cleanup_target_percent` of the quota remains.
+    pub max_total_size_mb: u64,
+    pub cleanup_target_percent: u64,
+    /// Writer flush cadence (also its queue-wait slice). Data since the
+    /// last flush may be lost on a crash — observability is not a
+    /// transaction; no fsync is ever performed.
+    pub flush_interval_ms: u64,
+    /// Anomaly thresholds: requests slower than these attach their flight
+    /// trace to the summary. Errors/429/transport failures always do.
+    pub slow_ttft_ms: u64,
+    pub slow_duration_ms: u64,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            directory: Some(defaults::LOG_DIRECTORY.into()),
+            max_file_size_mb: defaults::LOG_MAX_FILE_MB,
+            max_total_size_mb: defaults::LOG_MAX_TOTAL_MB,
+            cleanup_target_percent: defaults::LOG_CLEANUP_TARGET_PERCENT,
+            flush_interval_ms: defaults::LOG_FLUSH_INTERVAL_MS,
+            slow_ttft_ms: defaults::LOG_SLOW_TTFT_MS,
+            slow_duration_ms: defaults::LOG_SLOW_DURATION_MS,
+        }
+    }
+}
+
+impl LoggingConfig {
+    pub fn enabled(&self) -> bool {
+        self.directory
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|path| !path.is_empty())
+    }
+
+    pub fn directory_path(&self) -> Option<PathBuf> {
+        self.directory
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+    }
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let bytes = std::fs::read(path)
@@ -391,6 +457,25 @@ impl Config {
         tracing_subscriber::EnvFilter::try_new(&self.runtime.log_level)
             .context("runtime.log_level must be a valid tracing filter")?;
 
+        if self.logging.enabled() {
+            if self.logging.max_file_size_mb == 0 {
+                bail!("logging.max_file_size_mb must be greater than zero");
+            }
+            if self.logging.max_total_size_mb < self.logging.max_file_size_mb {
+                bail!(
+                    "logging.max_total_size_mb ({}) must be >= max_file_size_mb ({})",
+                    self.logging.max_total_size_mb,
+                    self.logging.max_file_size_mb
+                );
+            }
+            if self.logging.cleanup_target_percent == 0 || self.logging.cleanup_target_percent > 100
+            {
+                bail!("logging.cleanup_target_percent must be 1..=100");
+            }
+            if self.logging.flush_interval_ms < 50 || self.logging.flush_interval_ms > 60_000 {
+                bail!("logging.flush_interval_ms must be 50..60000");
+            }
+        }
         if !(1024..=131_072).contains(&self.glm53.limits.max_output_tokens) {
             bail!(
                 "glm53.limits.max_output_tokens must be between 1024 and 131072 (got {})",

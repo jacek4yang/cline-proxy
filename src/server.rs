@@ -47,10 +47,19 @@ pub struct AppState {
     /// Bounded memory-only shadow store for in-turn tool-loop reasoning
     /// (`glm53.reasoning.shadow_current_turn`). `None` disables restore.
     pub reasoning_shadow: Option<Arc<crate::reasoning_shadow::ReasoningShadowStore>>,
+    /// Bounded non-blocking JSONL log queue (issue #16). `None` disables
+    /// file logging; console summary logging always works.
+    pub log_sink: Option<crate::obs::LogSink>,
 }
 
 impl AppState {
     pub fn new(config: Config) -> Result<Self> {
+        Self::with_log_sink(config, None)
+    }
+
+    /// Production constructor also wires the adaptive JSONL log sink
+    /// (issue #16); tests construct without it.
+    pub fn with_log_sink(config: Config, log_sink: Option<crate::obs::LogSink>) -> Result<Self> {
         config.validate()?;
         let pool = KeyPool::new(&config.cline_api_keys);
         if pool.is_empty() {
@@ -113,6 +122,7 @@ impl AppState {
             started: Instant::now(),
             token_count_permits,
             reasoning_shadow,
+            log_sink,
         })
     }
 
@@ -505,7 +515,8 @@ async fn anthropic_messages(
             )
         }
     };
-    tracing::info!(
+    let upstream_request_bytes = upstream_body.len();
+    tracing::debug!(
         request_id,
         protocol = "anthropic",
         requested_model,
@@ -522,16 +533,99 @@ async fn anthropic_messages(
         "client request accepted"
     );
     let started = Instant::now();
+    // Adaptive observability (issue #16): ONE summary per request. For
+    // streams the static context moves into the stream and emits at close;
+    // for non-stream the handler emits directly after conversion.
+    let stream_summary = crate::obs::StreamSummary {
+        sink: state.log_sink.clone(),
+        session: session_fp.clone(),
+        requested_model: requested_model.clone(),
+        upstream_model: upstream_model.clone(),
+        model_family: if optimize::ModelFamily::from_upstream_model(&upstream_model)
+            == optimize::ModelFamily::Glm53
+        {
+            "glm53"
+        } else {
+            "generic_openai"
+        },
+        downstream_stream: converted.stream,
+        upstream_strategy: if converted.stream {
+            "native_streaming"
+        } else {
+            "stream_and_aggregate"
+        },
+        started,
+        slow_ttft_ms: state.config.logging.slow_ttft_ms,
+        slow_duration_ms: state.config.logging.slow_duration_ms,
+        reasoning_effort: optimization.reasoning_effort,
+        expose_thinking: optimization.expose_thinking,
+        client_max_tokens: optimization.client_max_tokens,
+        effective_max_tokens: optimization.effective_max_tokens,
+        request_bytes: body.len(),
+        upstream_request_bytes,
+        system_bytes: optimization.system_bytes,
+        messages_bytes: optimization.messages_bytes,
+        tools_bytes: optimization.tools_bytes,
+        historical_reasoning_bytes_removed: optimization.historical_reasoning_bytes_removed,
+        billing_header_bytes_removed,
+        canonicalized_arguments: canonicalized,
+    };
     let result = match state
         .upstream
         .send_chat(upstream_body, upstream_stream, &request_id, &upstream_model)
         .await
     {
         Ok(result) => result,
-        Err(error) => return upstream_failure(&state, error, true, &request_id),
+        Err(error) => {
+            // Transport failure: emit an anomalous summary (no key selected).
+            let mut builder = crate::obs::SummaryBuilder::new(
+                &request_id,
+                "anthropic",
+                requested_model.clone(),
+                upstream_model.clone(),
+                stream_summary.model_family,
+                session_fp.clone(),
+                converted.stream,
+                stream_summary.upstream_strategy,
+                started,
+                state.config.logging.slow_ttft_ms,
+                state.config.logging.slow_duration_ms,
+            );
+            builder.record(crate::obs::FlightEventKind::UpstreamInterrupted);
+            builder.mark_anomalous("transport_error");
+            builder.emit(
+                state.log_sink.as_ref(),
+                "(no key)",
+                0,
+                0,
+                optimization.reasoning_effort,
+                optimization.expose_thinking,
+                optimization.client_max_tokens,
+                optimization.effective_max_tokens,
+                body.len(),
+                0,
+                optimization.system_bytes,
+                optimization.messages_bytes,
+                optimization.tools_bytes,
+                optimization.historical_reasoning_bytes_removed,
+                billing_header_bytes_removed,
+                canonicalized,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                "upstream_error",
+            );
+            return upstream_failure(&state, error, true, &request_id);
+        }
     };
     let status = result.response.status();
-    tracing::info!(
+    tracing::debug!(
         request_id,
         selected_key_name = %result.selected.name,
         selected_key_index = result.selected.configured_index,
@@ -573,6 +667,7 @@ async fn anthropic_messages(
                     progress_secs: state.config.runtime.stream_progress_secs,
                     expose_thinking: converted.expose_thinking,
                     shadow: shadow_context,
+                    summary: Some(stream_summary.clone()),
                 },
             ))
             .unwrap_or_else(|_| Response::new(Body::empty()));
@@ -586,14 +681,63 @@ async fn anthropic_messages(
             Err(error) => {
                 // A malformed or unusable 2xx body is a provider protocol
                 // error, never a key-quota signal: 502 without rotation.
+                let mut builder = crate::obs::SummaryBuilder::new(
+                    &request_id,
+                    "anthropic",
+                    requested_model.clone(),
+                    upstream_model.clone(),
+                    stream_summary.model_family,
+                    session_fp.clone(),
+                    false,
+                    "stream_and_aggregate",
+                    started,
+                    state.config.logging.slow_ttft_ms,
+                    state.config.logging.slow_duration_ms,
+                );
+                builder.record(crate::obs::FlightEventKind::ProtocolError);
+                builder.mark_anomalous("protocol_error");
+                builder.emit(
+                    state.log_sink.as_ref(),
+                    &result.selected.name,
+                    result.attempt as u64,
+                    result.failover_count as u64,
+                    optimization.reasoning_effort,
+                    optimization.expose_thinking,
+                    optimization.client_max_tokens,
+                    optimization.effective_max_tokens,
+                    body.len(),
+                    upstream_request_bytes,
+                    optimization.system_bytes,
+                    optimization.messages_bytes,
+                    optimization.tools_bytes,
+                    optimization.historical_reasoning_bytes_removed,
+                    billing_header_bytes_removed,
+                    canonicalized,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    "protocol_error",
+                );
                 return protocol_error(error, StatusCode::BAD_GATEWAY, &request_id);
             }
         };
-    tracing::info!(
+    let aggregation_timings = (
+        first_event_ms,
+        response_shape,
+        None::<u128>,
+        upstream_duration_ms,
+    );
+    tracing::debug!(
         request_id,
         downstream_stream = false,
         upstream_strategy = "stream_and_aggregate",
-        response_shape = response_shape.as_str(),
+        response_shape = aggregation_timings.1.as_str(),
         upstream_first_event_ms = first_event_ms.unwrap_or(0),
         upstream_duration_ms,
         aggregate_ms = started.elapsed().as_millis(),
@@ -607,14 +751,109 @@ async fn anthropic_messages(
         session_fp.as_deref(),
         &request_id,
     );
+    let convert_started = std::time::Instant::now();
     match anthropic::convert_response(
         &value,
         &request_id,
         &upstream_model,
         converted.expose_thinking,
     ) {
-        Ok(value) => json_response(StatusCode::OK, value, &request_id),
-        Err(error) => protocol_error(error, StatusCode::BAD_GATEWAY, &request_id),
+        Ok(value) => {
+            // Adaptive observability (issue #16): single summary emission
+            // for the non-stream path.
+            let mut builder = crate::obs::SummaryBuilder::new(
+                &request_id,
+                "anthropic",
+                requested_model.clone(),
+                upstream_model.clone(),
+                stream_summary.model_family,
+                session_fp.clone(),
+                false,
+                "stream_and_aggregate",
+                started,
+                state.config.logging.slow_ttft_ms,
+                state.config.logging.slow_duration_ms,
+            );
+            if aggregation_timings.0.is_some() {
+                builder.record(crate::obs::FlightEventKind::FirstUpstreamEvent);
+            }
+            builder.emit(
+                state.log_sink.as_ref(),
+                &result.selected.name,
+                result.attempt as u64,
+                result.failover_count as u64,
+                optimization.reasoning_effort,
+                optimization.expose_thinking,
+                optimization.client_max_tokens,
+                optimization.effective_max_tokens,
+                body.len(),
+                upstream_request_bytes,
+                optimization.system_bytes,
+                optimization.messages_bytes,
+                optimization.tools_bytes,
+                optimization.historical_reasoning_bytes_removed,
+                billing_header_bytes_removed,
+                canonicalized,
+                value.get("usage"),
+                aggregation_timings.0,
+                None,
+                None,
+                aggregation_timings.2,
+                aggregation_timings.0,
+                Some(aggregation_timings.3),
+                Some(aggregation_timings.1.as_str()),
+                Some(200),
+                "complete",
+            );
+            let _ = convert_started;
+            json_response(StatusCode::OK, value, &request_id)
+        }
+        Err(error) => {
+            let mut builder = crate::obs::SummaryBuilder::new(
+                &request_id,
+                "anthropic",
+                requested_model.clone(),
+                upstream_model.clone(),
+                stream_summary.model_family,
+                session_fp.clone(),
+                false,
+                "stream_and_aggregate",
+                started,
+                state.config.logging.slow_ttft_ms,
+                state.config.logging.slow_duration_ms,
+            );
+            builder.record(crate::obs::FlightEventKind::ProtocolError);
+            builder.mark_anomalous("protocol_error");
+            builder.emit(
+                state.log_sink.as_ref(),
+                &result.selected.name,
+                result.attempt as u64,
+                result.failover_count as u64,
+                optimization.reasoning_effort,
+                optimization.expose_thinking,
+                optimization.client_max_tokens,
+                optimization.effective_max_tokens,
+                body.len(),
+                upstream_request_bytes,
+                optimization.system_bytes,
+                optimization.messages_bytes,
+                optimization.tools_bytes,
+                optimization.historical_reasoning_bytes_removed,
+                billing_header_bytes_removed,
+                canonicalized,
+                None,
+                aggregation_timings.0,
+                None,
+                None,
+                aggregation_timings.2,
+                aggregation_timings.0,
+                Some(aggregation_timings.3),
+                Some(aggregation_timings.1.as_str()),
+                Some(200),
+                "protocol_error",
+            );
+            protocol_error(error, StatusCode::BAD_GATEWAY, &request_id)
+        }
     }
 }
 
@@ -821,7 +1060,9 @@ fn log_request_optimization(
     canonicalized_arguments: usize,
     prefix_telemetry: &(String, usize),
 ) {
-    tracing::info!(
+    // Detail remains available at debug level; the per-request console
+    // surface is the single summary line (issue #16).
+    tracing::debug!(
         request_id,
         protocol,
         model_family = match optimization.model_family {
@@ -1315,7 +1556,7 @@ async fn response_log_middleware(request: Request<Body>, next: Next) -> Response
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.contains("text/event-stream"));
-    tracing::info!(
+    tracing::debug!(
         request_id,
         protocol,
         method = %method,
