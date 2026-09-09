@@ -144,7 +144,45 @@ After merge, re-baseline and pick the next P1 from "Next task".
   `benches/request_optimization.rs` (convert+optimize+serialize ~ms-scale
   at 1 MB; exact count ~350 ms background).
 
-## Current branch (cache locality, issue #8)
+## Current branch (turn-scoped reasoning + shadow store, issue #10)
+
+`perf/turn-scoped-reasoning` — implemented:
+
+- `optimize.rs`: reasoning-epoch boundary = newest HUMAN user message
+  (Anthropic: user msg with non-tool_result content; OpenAI: newest
+  plain `user` msg). Assistant reasoning before the boundary stripped;
+  current-epoch reasoning preserved (in-epoch tool-loop continuity).
+  `strip_anthropic_thinking`, `collect_anthropic_thinking`,
+  `optimize_messages` all share the boundary.
+- `src/reasoning_shadow.rs`: bounded memory-only shadow store
+  (HMAC-fingerprint + tool-call-id keyed; 256 sessions / 64 MiB total /
+  1 MiB per entry / 10 min TTL; oversized skipped never truncated;
+  no session identity → disabled, no fallback; Arc<str> shared across
+  call groups; LRU + byte eviction; lazy TTL). `restore_into` attaches
+  shadow reasoning to assistant messages after the epoch boundary that
+  carry tool_calls and lack reasoning_content.
+- `server.rs`: AppState.reasoning_shadow; restore before the GLM
+  policy strip (restored reasoning is current-epoch); new-human-turn
+  requests clear the session shadow; non-stream store via
+  `store_reasoning_shadow` (final answer = no tool calls = clear);
+  stream store via `StreamShadowContext` + unexposed reasoning
+  accumulation in StreamState + `commit_shadow` at completion.
+- `anthropic.rs`: `reasoning_text_from_message` (shared extraction);
+  `StreamOptions` bundles stream params; StreamState.shadow_reasoning
+  accumulates when thinking NOT exposed.
+- Config: `glm53.reasoning.shadow_current_turn` (default true).
+- Tests: 9 unit (roundtrip, isolation, clear, oversized, byte/session
+  limits, TTL, stress 300 sessions) + 4 e2e (restore within epoch,
+  multi-agent isolation + clear-on-final, no-identity fail-safe,
+  new-epoch clear) + integration cases A/B/C rewritten for epoch
+  semantics (case C: previous-epoch reasoning contributes exactly 0
+  tokens across 24 human turns).
+- ADR 0006.
+
+Pending: real E2E validation with live Claude Code; cache A/B (issue #8
+follow-up); prompt_cache_key probe.
+
+## Current branch (cache locality, issue #8) — MERGED via PR #9
 
 `perf/claude-code-cache-locality` — implemented so far:
 

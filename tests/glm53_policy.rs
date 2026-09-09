@@ -152,9 +152,11 @@ fn tool_result_body(turn: usize) -> String {
     .repeat(10)
 }
 
-/// Case A: read file → edit file → run tests.
+/// Case A: read file → edit file → run tests, THEN a second human turn
+/// starts a new reasoning epoch. Epoch-1 thinking must be stripped; the
+/// current epoch keeps its reasoning continuity (issue #10).
 #[test]
-fn case_a_simple_edit_loop_keeps_chain_and_drops_history_reasoning() {
+fn case_a_new_human_turn_strips_previous_epoch_reasoning() {
     let history = vec![
         user_turn("Fix the off-by-one in src/counter.rs, then run the tests."),
         assistant_turn(
@@ -163,6 +165,8 @@ fn case_a_simple_edit_loop_keeps_chain_and_drops_history_reasoning() {
             vec![(0, "toolu_a1", "Read", json!({"file_path":"src/counter.rs"}))],
         ),
         tool_result_turn("toolu_a1", "fn counter(n: u32) -> u32 { n + 1 }"),
+        // New human turn = new reasoning epoch.
+        user_turn("Now make the counter thread-safe."),
         assistant_turn(
             &big_thinking(2),
             "",
@@ -183,21 +187,30 @@ fn case_a_simple_edit_loop_keeps_chain_and_drops_history_reasoning() {
         tool_result_turn("toolu_a3", "test result: ok. 3 passed"),
     ];
     let (body, optimization) = pipeline(&build_request(&history, None));
-    // Unrequested thinking never crosses the wire as reasoning_content.
-    let reasoning_left: usize = body["messages"]
-        .as_array()
-        .unwrap()
+    let messages = body["messages"].as_array().unwrap();
+    // Epoch-1 assistant reasoning (before the second human turn) stripped;
+    // current-epoch reasoning preserved for tool-loop continuity.
+    let stripped = messages
         .iter()
+        .take(3)
         .filter(|m| m.get("reasoning_content").is_some())
         .count();
-    assert_eq!(reasoning_left, 0);
+    assert_eq!(stripped, 0, "epoch-1 reasoning must be gone");
+    let kept = messages
+        .iter()
+        .skip(3)
+        .filter(|m| m.get("reasoning_content").is_some())
+        .count();
+    assert_eq!(kept, 2, "current-epoch reasoning is preserved");
     assert_eq!(optimization.reasoning_effort, "high");
     assert_eq!(optimization.effective_max_tokens, Some(16_384));
     assert!(optimization.historical_reasoning_bytes_removed > 3_000);
     assert_tool_chain_intact(&body);
 }
 
-/// Case B: compile-error debugging loop with cargo check diagnostics.
+/// Case B: compile-error debugging loop with cargo check diagnostics, all
+/// within one reasoning epoch (single human turn). In-epoch reasoning is
+/// preserved (continuity), and diagnostics are never truncated.
 #[test]
 fn case_b_debug_loop_preserves_diagnostics_and_effort_precedence() {
     let history = vec![
@@ -240,8 +253,9 @@ fn case_b_debug_loop_preserves_diagnostics_and_effort_precedence() {
     ));
     assert_eq!(optimization.reasoning_effort, "high");
     assert!(optimization.expose_thinking);
-    // Even though the client replays its stored thinking blocks, the wire
-    // carries none of them.
+    // One reasoning epoch, no second human turn: nothing is stripped —
+    // the wire keeps in-epoch reasoning continuity (issue #10).
+    assert_eq!(optimization.historical_reasoning_bytes_removed, 0);
     assert_eq!(
         body["messages"]
             .as_array()
@@ -249,7 +263,7 @@ fn case_b_debug_loop_preserves_diagnostics_and_effort_precedence() {
             .iter()
             .filter(|m| m.get("reasoning_content").is_some())
             .count(),
-        0
+        4
     );
     // Diagnostics are never truncated: tool results keep their full text.
     let diagnostics = body["messages"]
@@ -265,21 +279,31 @@ fn case_b_debug_loop_preserves_diagnostics_and_effort_precedence() {
     assert_tool_chain_intact(&body);
 }
 
-/// Case C: a 24-turn session. Historical thinking must contribute ~0 tokens
-/// to every request: doubling the per-turn reasoning blob must leave the
-/// exact input token count unchanged, and tokens must grow sub-linearly
-/// instead of snowballing.
+/// Case C: a long session of 24 human turns (each followed by a tool
+/// loop). Reasoning from *previous* epochs must contribute zero tokens:
+/// the count of a session whose history carries big reasoning blobs in
+/// every epoch must equal the count of a session carrying the blobs ONLY
+/// in the current epoch — and doubling current-epoch blob size must be the
+/// only growth. Sub-linear snowballing is the acceptance bar.
 #[test]
-fn case_c_long_session_historical_reasoning_contribution_is_zero() {
-    let count_tokens = |thinking_scale: usize| -> Vec<u64> {
-        let mut counts = Vec::new();
-        let mut history = vec![user_turn("Work through the 24-step refactoring plan.")];
-        for turn in 1..=24u64 {
-            let thinking = if thinking_scale == 0 {
+fn case_c_long_session_previous_epoch_reasoning_contribution_is_zero() {
+    // count_at(turn, historical_scale, current_scale): all 1..=turn
+    // human+tool-loop steps; steps 1..=turn-1 carry `historical_scale`
+    // blobs, the final step carries `current_scale` blobs.
+    let count_at = |turn: usize, historical_scale: usize, current_scale: usize| -> u64 {
+        let mut history: Vec<Value> = Vec::new();
+        for step in 1..=turn {
+            let scale = if step == turn {
+                current_scale
+            } else {
+                historical_scale
+            };
+            let thinking = if scale == 0 {
                 String::new()
             } else {
-                big_thinking(turn as usize).repeat(thinking_scale)
+                big_thinking(step).repeat(scale)
             };
+            history.push(user_turn(&format!("Step {step} of the refactoring plan.")));
             history.push(assistant_turn(
                 &thinking,
                 "",
@@ -287,53 +311,41 @@ fn case_c_long_session_historical_reasoning_contribution_is_zero() {
                     0,
                     "toolu_c",
                     "Bash",
-                    json!({"command":format!("cargo test step_{turn}")}),
+                    json!({"command":format!("cargo test step_{step}")}),
                 )],
             ));
-            history.push(tool_result_turn(
-                "toolu_c",
-                &tool_result_body(turn as usize),
-            ));
-            let bytes = build_request(&history, None);
-            let (body, _) = pipeline(&bytes);
-            // Exact token count of what would actually be sent.
-            counts.push(
-                cline_proxy::glm53::count::count_input_tokens(
-                    // count pipeline consumes Anthropic shape; rebuild it
-                    // with thinking stripped, effort aligned, like the
-                    // background telemetry does.
-                    &{
-                        let mut request: Value = serde_json::from_slice(&bytes).unwrap();
-                        cline_proxy::optimize::strip_anthropic_thinking(&mut request);
-                        request["output_config"] = json!({"effort":"high"});
-                        request
-                    },
-                )
-                .unwrap() as u64,
-            );
-            let _ = body;
+            history.push(tool_result_turn("toolu_c", &tool_result_body(step)));
         }
-        counts
+        cline_proxy::glm53::count::count_input_tokens(&{
+            let mut request: Value = json!({
+                "model": "z-ai/glm-5.3-flash",
+                "max_tokens": 32_000,
+                "messages": history,
+            });
+            cline_proxy::optimize::strip_anthropic_thinking(&mut request);
+            request["output_config"] = json!({"effort":"high"});
+            request
+        })
+        .unwrap() as u64
     };
-    let no_thinking = count_tokens(0);
-    let baseline = count_tokens(1);
-    let doubled = count_tokens(2);
-    // Every turn: historical thinking contributes exactly zero tokens —
-    // a session whose turns carry 40x reasoning blobs counts the same as
-    // one whose turns carry none.
-    for turn in 0..24 {
+    for turn in [4usize, 12, 24] {
+        // Historical epochs: scale-0 vs scale-2 blobs must count the same
+        // after the strip — previous-epoch reasoning contributes 0 tokens.
+        // Both carry the SAME current-epoch blob (scale 1).
+        let no_history = count_at(turn, 0, 1);
+        let heavy_history = count_at(turn, 2, 1);
         assert_eq!(
-            no_thinking[turn], baseline[turn],
-            "turn {turn}: thinking presence must not affect input tokens"
+            no_history, heavy_history,
+            "turn {turn}: previous-epoch reasoning must contribute zero tokens"
         );
-        assert_eq!(
-            baseline[turn], doubled[turn],
-            "turn {turn}: doubling thinking must not affect input tokens"
+        // The current epoch's reasoning is preserved (one blob): growing it
+        // grows the count, proving the equality above is not vacuous.
+        let bigger_current = count_at(turn, 0, 3);
+        assert!(
+            bigger_current > no_history,
+            "turn {turn}: current-epoch reasoning is retained"
         );
     }
-    // Real content (tool results) still accumulates — sanity-check the
-    // fixture actually grows, so the equality above is not vacuous.
-    assert!(baseline[23] > baseline[0]);
 }
 
 /// Disabling the policy restores passthrough behavior (escape hatch).
