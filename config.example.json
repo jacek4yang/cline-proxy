@@ -45,5 +45,23 @@
     "stream_progress_secs": 30,
     "shutdown_timeout_secs": 30,
     "state_file": "runtime-state.json"
+  },
+  "glm53": {
+    "reasoning": {
+      "default_effort": "high",
+      "adaptive_effort": "high",
+      "strip_historical_thinking": true,
+      "expose_thinking": "requested_only"
+    },
+    "limits": {
+      "max_output_tokens": 16384
+    },
+    "context": {
+      "safe_compaction": true
+    },
+    "telemetry": {
+      "exact_input_tokens": true,
+      "max_concurrent_token_counts": 1
+    }
   }
 }

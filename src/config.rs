@@ -8,6 +8,8 @@ use anyhow::{bail, Context, Result};
 use axum::http::{HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 
+use crate::glm53::reasoning::ThinkingExposure;
+
 pub mod defaults {
     pub const BIND: &str = "127.0.0.1:8788";
     pub const BASE_URL: &str = "https://api.cline.bot/api/v1";
@@ -23,6 +25,9 @@ pub mod defaults {
     /// that a confirmed quota 429 reaches disk quickly, long enough to turn
     /// a multi-key 429 burst into one write.
     pub const STATE_DEBOUNCE_MS: u64 = 150;
+    /// Default upstream output ceiling. 8K is tight for complex coding
+    /// turns; 32K+ invites runaway generation (issue #6). Overridable.
+    pub const MAX_OUTPUT_TOKENS: u32 = 16_384;
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -33,6 +38,7 @@ pub struct Config {
     pub cline_api_keys: Vec<ClineKeyConfig>,
     pub models: ModelsConfig,
     pub runtime: RuntimeConfig,
+    pub glm53: Glm53Config,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -140,6 +146,109 @@ pub enum LogFormat {
     Pretty,
     Json,
 }
+
+/// GLM-5.3-Flash request policy (issue #6): bounded reasoning, zero
+/// historical-thinking amplification, capped output. All fields documented
+/// in docs/GLM53_FLASH.md; defaults are the production recommendations.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Glm53Config {
+    pub reasoning: Glm53ReasoningConfig,
+    pub limits: Glm53LimitsConfig,
+    pub context: Glm53ContextConfig,
+    pub telemetry: Glm53TelemetryConfig,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Glm53ReasoningConfig {
+    /// Effort used when the request carries no explicit reasoning control.
+    /// `high` keeps strong coding analysis without the `max` runaway the
+    /// official template would otherwise select for unset efforts.
+    pub default_effort: Glm53Effort,
+    /// Effort used for `thinking: {type: "adaptive"}`.
+    pub adaptive_effort: Glm53Effort,
+    /// Strip `thinking`/`reasoning_content` from historical assistant
+    /// messages (before the last user/tool-result turn) on the upstream
+    /// wire. Text, tool_calls, ids, and order are never touched.
+    pub strip_historical_thinking: bool,
+    /// When upstream reasoning may be surfaced to the client.
+    pub expose_thinking: ThinkingExposure,
+}
+
+impl Default for Glm53ReasoningConfig {
+    fn default() -> Self {
+        Self {
+            default_effort: Glm53Effort::High,
+            adaptive_effort: Glm53Effort::High,
+            strip_historical_thinking: true,
+            expose_thinking: ThinkingExposure::default(),
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Glm53LimitsConfig {
+    /// Upstream output ceiling: `effective_max_tokens = min(client, this)`.
+    pub max_output_tokens: u32,
+}
+
+impl Default for Glm53LimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_output_tokens: defaults::MAX_OUTPUT_TOKENS,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Glm53ContextConfig {
+    /// Lossless structural normalization only: single-text-block content
+    /// arrays become strings, empty text blocks are dropped, Anthropic-only
+    /// `metadata` is not forwarded. Never truncates tool results or edits
+    /// tool schemas.
+    pub safe_compaction: bool,
+}
+
+impl Default for Glm53ContextConfig {
+    fn default() -> Self {
+        Self {
+            safe_compaction: true,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Glm53TelemetryConfig {
+    /// Exact GLM token accounting per request via the embedded official
+    /// tokenizer. Runs in a bounded `spawn_blocking` task after the upstream
+    /// request is dispatched, so it never adds to TTFT and never occupies
+    /// more than `max_concurrent_token_counts` CPU slots at once. When the
+    /// slot is busy the count is skipped (logged), never queued.
+    pub exact_input_tokens: bool,
+    /// Concurrent CPU slots for exact token counts. 1 suits most hosts;
+    /// raise on high-core machines, set `exact_input_tokens: false` (or 0)
+    /// to disable.
+    pub max_concurrent_token_counts: u32,
+}
+
+impl Default for Glm53TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            exact_input_tokens: true,
+            max_concurrent_token_counts: 1,
+        }
+    }
+}
+
+/// Config-facing effort level. Reuses the GLM effort vocabulary; `max` is
+/// valid as an explicit client-driven outcome but rejected as a proxy
+/// default (startup validation), because a default of `max` recreates the
+/// runaway this configuration exists to prevent.
+pub type Glm53Effort = crate::glm53::reasoning::GlmReasoningEffort;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -249,6 +358,27 @@ impl Config {
         }
         tracing_subscriber::EnvFilter::try_new(&self.runtime.log_level)
             .context("runtime.log_level must be a valid tracing filter")?;
+
+        if !(1024..=131_072).contains(&self.glm53.limits.max_output_tokens) {
+            bail!(
+                "glm53.limits.max_output_tokens must be between 1024 and 131072 (got {})",
+                self.glm53.limits.max_output_tokens
+            );
+        }
+        for (field, effort) in [
+            (
+                "glm53.reasoning.default_effort",
+                self.glm53.reasoning.default_effort,
+            ),
+            (
+                "glm53.reasoning.adaptive_effort",
+                self.glm53.reasoning.adaptive_effort,
+            ),
+        ] {
+            if effort == crate::glm53::reasoning::GlmReasoningEffort::Max {
+                bail!("{field} must not be `max`; explicit max stays available via output_config.effort");
+            }
+        }
         Ok(())
     }
 
@@ -448,5 +578,57 @@ mod tests {
         let config = Config::load(path).expect("example configuration must remain valid");
         assert_eq!(config.cline_api_keys.len(), 2);
         assert_eq!(config.upstream.headers, default_cline_headers());
+        assert_eq!(
+            config.glm53.reasoning.default_effort,
+            crate::glm53::reasoning::GlmReasoningEffort::High
+        );
+        assert_eq!(
+            config.glm53.limits.max_output_tokens,
+            defaults::MAX_OUTPUT_TOKENS
+        );
+        assert!(config.glm53.reasoning.strip_historical_thinking);
+        assert!(config.glm53.context.safe_compaction);
+    }
+
+    #[test]
+    fn glm53_policy_defaults_are_production_safe() {
+        let config = Config::default();
+        assert_eq!(
+            config.glm53.reasoning.default_effort,
+            crate::glm53::reasoning::GlmReasoningEffort::High
+        );
+        assert_eq!(
+            config.glm53.reasoning.expose_thinking,
+            crate::glm53::reasoning::ThinkingExposure::RequestedOnly
+        );
+        assert_eq!(
+            config.glm53.limits.max_output_tokens,
+            defaults::MAX_OUTPUT_TOKENS
+        );
+        assert!(config.glm53.reasoning.strip_historical_thinking);
+        assert!(config.glm53.telemetry.exact_input_tokens);
+    }
+
+    #[test]
+    fn glm53_policy_rejects_default_max_and_out_of_range_caps() {
+        let mut config = valid_config();
+        config.glm53.reasoning.default_effort = crate::glm53::reasoning::GlmReasoningEffort::Max;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("default_effort"), "{error}");
+
+        let mut config = valid_config();
+        config.glm53.limits.max_output_tokens = 100;
+        assert!(config.validate().is_err());
+        let mut config = valid_config();
+        config.glm53.limits.max_output_tokens = 1_000_000;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn glm53_policy_rejects_unknown_fields() {
+        let config = valid_config();
+        let mut json = serde_json::to_value(&config).unwrap();
+        json["glm53"]["reasoning"]["strip_history"] = serde_json::Value::Bool(true);
+        assert!(serde_json::from_value::<Config>(json).is_err());
     }
 }

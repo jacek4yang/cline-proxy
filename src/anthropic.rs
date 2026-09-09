@@ -55,6 +55,14 @@ pub struct ConvertedRequest {
     pub body: Value,
     pub model: String,
     pub stream: bool,
+    /// Explicit Anthropic reasoning controls, preserved for
+    /// `crate::optimize::optimize_request` (the single resolution point).
+    /// Never forwarded to the OpenAI wire.
+    pub thinking: Option<Value>,
+    pub output_effort: Option<String>,
+    /// Whether upstream reasoning may be surfaced as Anthropic thinking
+    /// blocks. Set by the GLM policy step; false until then.
+    pub expose_thinking: bool,
 }
 
 pub fn convert_request(bytes: &[u8]) -> Result<ConvertedRequest, ProtocolError> {
@@ -70,6 +78,12 @@ pub fn convert_request(bytes: &[u8]) -> Result<ConvertedRequest, ProtocolError> 
         .filter(|value| *value > 0)
         .ok_or_else(|| ProtocolError::invalid("max_tokens must be a positive integer"))?;
     let stream = optional_bool(object, "stream")?.unwrap_or(false);
+    let thinking = object.get("thinking").cloned();
+    let output_effort = object
+        .get("output_config")
+        .and_then(|config| config.get("effort"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
 
     let mut output = Map::new();
     output.insert("model".into(), Value::String(model.clone()));
@@ -119,13 +133,17 @@ pub fn convert_request(bytes: &[u8]) -> Result<ConvertedRequest, ProtocolError> 
             output.insert("parallel_tool_calls".into(), Value::Bool(parallel));
         }
     }
-    if let Some(thinking) = object.get("thinking") {
-        if let Some(effort) = convert_thinking(thinking, max_tokens)? {
-            output.insert("reasoning_effort".into(), Value::String(effort.into()));
-        }
-    }
+    // `thinking` and `output_config.effort` are resolved by
+    // `crate::optimize::optimize_request` against the GLM policy config, so
+    // there is exactly one mapping and every request leaves with an explicit
+    // `reasoning_effort` (unset would coerce to `max` upstream).
     if let Some(config) = object.get("output_config") {
-        convert_output_config(config, &mut output)?;
+        if !config.is_object() {
+            return Err(ProtocolError::invalid("output_config must be an object"));
+        }
+        if let Some(format) = config.get("format") {
+            output.insert("response_format".into(), convert_output_format(format)?);
+        }
     }
     if let Some(format) = object.get("output_format") {
         output.insert("response_format".into(), convert_output_format(format)?);
@@ -137,6 +155,9 @@ pub fn convert_request(bytes: &[u8]) -> Result<ConvertedRequest, ProtocolError> 
         body: Value::Object(output),
         model,
         stream,
+        thinking,
+        output_effort,
+        expose_thinking: false,
     })
 }
 
@@ -443,68 +464,6 @@ fn convert_tool_choice(value: &Value) -> Result<(Value, Option<bool>), ProtocolE
     Ok((choice, parallel))
 }
 
-fn convert_thinking(value: &Value, max_tokens: u64) -> Result<Option<&'static str>, ProtocolError> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| ProtocolError::invalid("thinking must be an object"))?;
-    match required_string(object, "type")? {
-        "disabled" => Ok(Some(
-            crate::glm53::reasoning::GlmReasoningEffort::Low.as_str(),
-        )),
-        "adaptive" => Ok(Some(
-            crate::glm53::reasoning::GlmReasoningEffort::High.as_str(),
-        )),
-        "enabled" => {
-            let budget = object
-                .get("budget_tokens")
-                .and_then(Value::as_u64)
-                .filter(|value| *value > 0)
-                .ok_or_else(|| ProtocolError::invalid("thinking budget_tokens must be positive"))?;
-            if budget >= max_tokens {
-                return Err(ProtocolError::invalid(
-                    "thinking budget_tokens must be less than max_tokens",
-                ));
-            }
-            // GLM-5.3-Flash has no `medium`; the official template coerced
-            // it to `max`. See src/glm53/reasoning.rs and docs/GLM53_FLASH.md.
-            let effort = if budget < crate::glm53::reasoning::LOW_BUDGET_LIMIT {
-                crate::glm53::reasoning::GlmReasoningEffort::Low
-            } else {
-                crate::glm53::reasoning::GlmReasoningEffort::High
-            };
-            Ok(Some(effort.as_str()))
-        }
-        kind => Err(ProtocolError::invalid(format!(
-            "unsupported thinking type {kind:?}"
-        ))),
-    }
-}
-
-fn convert_output_config(
-    value: &Value,
-    output: &mut Map<String, Value>,
-) -> Result<(), ProtocolError> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| ProtocolError::invalid("output_config must be an object"))?;
-    if let Some(effort) = object.get("effort") {
-        let effort = effort
-            .as_str()
-            .ok_or_else(|| ProtocolError::invalid("output_config.effort must be a string"))?;
-        let effort = match effort {
-            "low" => "low",
-            "medium" | "high" | "xhigh" => "high",
-            "max" => "max",
-            _ => return Err(ProtocolError::invalid("unsupported output_config.effort")),
-        };
-        output.insert("reasoning_effort".into(), Value::String(effort.into()));
-    }
-    if let Some(format) = object.get("format") {
-        output.insert("response_format".into(), convert_output_format(format)?);
-    }
-    Ok(())
-}
-
 fn convert_output_format(value: &Value) -> Result<Value, ProtocolError> {
     let object = value
         .as_object()
@@ -584,6 +543,7 @@ pub fn convert_response(
     upstream: &Value,
     request_id: &str,
     fallback_model: &str,
+    expose_thinking: bool,
 ) -> Result<Value, ProtocolError> {
     let choice = upstream
         .get("choices")
@@ -595,7 +555,15 @@ pub fn convert_response(
         .and_then(Value::as_object)
         .ok_or_else(|| ProtocolError::upstream("upstream choice did not contain a message"))?;
     let mut content = Vec::new();
-    let reasoning = reasoning_text(message);
+    // Anti-amplification gate: reasoning reaches the client only when the
+    // request explicitly asked for thinking. Unexposed reasoning still cost
+    // this turn's output tokens, but it can never be stored, replayed, and
+    // re-counted by Claude Code on later turns.
+    let reasoning = if expose_thinking {
+        reasoning_text(message)
+    } else {
+        String::new()
+    };
     if !reasoning.is_empty() {
         content.push(json!({
             "type":"thinking",
@@ -764,6 +732,7 @@ pub fn stream_body(
     key_name: String,
     request_started: Instant,
     progress_secs: u64,
+    expose_thinking: bool,
 ) -> Body {
     let output = async_stream::stream! {
         let mut upstream = response.bytes_stream();
@@ -773,7 +742,7 @@ pub fn stream_body(
         let progress = tokio::time::sleep(progress_interval);
         tokio::pin!(progress);
         let mut decoder = SseDecoder::default();
-        let mut state = StreamState::new(request_id, fallback_model);
+        let mut state = StreamState::new(request_id, fallback_model, expose_thinking, request_started);
         let mut telemetry = StreamTelemetry::new(
             state.request_id.clone(),
             key_name,
@@ -794,6 +763,7 @@ pub fn stream_body(
                                 ));
                                 telemetry.commit(frame.len());
                                 yield Ok::<Bytes, std::io::Error>(frame);
+                                telemetry.absorb(&state);
                                 telemetry.finish("decode_error");
                                 return;
                             }
@@ -807,6 +777,7 @@ pub fn stream_body(
                                 yield Ok::<Bytes, std::io::Error>(frame);
                             }
                             if state.terminal {
+                                telemetry.absorb(&state);
                                 telemetry.finish(if state.finish_reason.is_some() { "complete" } else { "protocol_error" });
                                 return;
                             }
@@ -824,6 +795,7 @@ pub fn stream_body(
                         ));
                         telemetry.commit(frame.len());
                         yield Ok(frame);
+                        telemetry.absorb(&state);
                         telemetry.finish("upstream_error");
                         return;
                     }
@@ -849,6 +821,7 @@ pub fn stream_body(
                 ));
                 telemetry.commit(frame.len());
                 yield Ok(frame);
+                telemetry.absorb(&state);
                 telemetry.finish("decode_error");
                 return;
             }
@@ -867,6 +840,7 @@ pub fn stream_body(
                     telemetry.commit(frame.len());
                     yield Ok(frame);
                 }
+                telemetry.absorb(&state);
                 telemetry.finish("complete");
             } else {
                 let frame = sse_frame("error", error_envelope(
@@ -874,6 +848,7 @@ pub fn stream_body(
                 ));
                 telemetry.commit(frame.len());
                 yield Ok(frame);
+                telemetry.absorb(&state);
                 telemetry.finish("unexpected_eof");
             }
         }
@@ -893,6 +868,18 @@ struct StreamTelemetry {
     committed_to_client: bool,
     saw_first_event: bool,
     finished: bool,
+    /// Output composition accounting, absorbed from the stream state at
+    /// completion. Bytes are SSE delta payload sizes, not tokens.
+    reasoning_bytes: u64,
+    text_bytes: u64,
+    tool_call_bytes: u64,
+    reasoning_events: u64,
+    text_events: u64,
+    tool_call_events: u64,
+    first_reasoning_ms: Option<u128>,
+    first_text_ms: Option<u128>,
+    first_tool_call_ms: Option<u128>,
+    usage: Option<Value>,
 }
 
 impl StreamTelemetry {
@@ -909,6 +896,32 @@ impl StreamTelemetry {
             committed_to_client: false,
             saw_first_event: false,
             finished: false,
+            reasoning_bytes: 0,
+            text_bytes: 0,
+            tool_call_bytes: 0,
+            reasoning_events: 0,
+            text_events: 0,
+            tool_call_events: 0,
+            first_reasoning_ms: None,
+            first_text_ms: None,
+            first_tool_call_ms: None,
+            usage: None,
+        }
+    }
+
+    /// Copy the output-composition counters the stream state collected.
+    fn absorb(&mut self, state: &StreamState) {
+        self.reasoning_bytes = state.reasoning_bytes;
+        self.text_bytes = state.text_bytes;
+        self.tool_call_bytes = state.tool_call_bytes;
+        self.reasoning_events = state.reasoning_events;
+        self.text_events = state.text_events;
+        self.tool_call_events = state.tool_call_events;
+        self.first_reasoning_ms = state.first_reasoning;
+        self.first_text_ms = state.first_text;
+        self.first_tool_call_ms = state.first_tool_call;
+        if state.usage.is_object() && !state.usage.as_object().is_some_and(Map::is_empty) {
+            self.usage = Some(state.usage.clone());
         }
     }
 
@@ -944,6 +957,9 @@ impl StreamTelemetry {
             downstream_frames = self.downstream_frames,
             downstream_bytes = self.downstream_bytes,
             committed_to_client = self.committed_to_client,
+            reasoning_bytes = self.reasoning_bytes,
+            text_bytes = self.text_bytes,
+            tool_call_bytes = self.tool_call_bytes,
             "Anthropic stream still active"
         );
     }
@@ -953,6 +969,23 @@ impl StreamTelemetry {
             return;
         }
         self.finished = true;
+        let usage = self.usage.as_ref();
+        // Only report token figures the upstream actually provided; byte
+        // counters above are always real measurements and never converted.
+        let prompt_tokens = usage
+            .and_then(|usage| usage.get("prompt_tokens"))
+            .and_then(Value::as_u64);
+        let completion_tokens = usage
+            .and_then(|usage| usage.get("completion_tokens"))
+            .and_then(Value::as_u64);
+        let cached_tokens = usage
+            .and_then(|usage| usage.get("prompt_tokens_details"))
+            .and_then(|details| details.get("cached_tokens"))
+            .and_then(Value::as_u64);
+        let reasoning_tokens = usage
+            .and_then(|usage| usage.get("completion_tokens_details"))
+            .and_then(|details| details.get("reasoning_tokens"))
+            .and_then(Value::as_u64);
         tracing::info!(
             request_id = %self.request_id,
             selected_key_name = %self.key_name,
@@ -962,6 +995,20 @@ impl StreamTelemetry {
             upstream_events = self.upstream_events,
             downstream_frames = self.downstream_frames,
             committed_to_client = self.committed_to_client,
+            reasoning_bytes = self.reasoning_bytes,
+            text_bytes = self.text_bytes,
+            tool_call_bytes = self.tool_call_bytes,
+            reasoning_events = self.reasoning_events,
+            text_events = self.text_events,
+            tool_call_events = self.tool_call_events,
+            first_reasoning_ms = self.first_reasoning_ms.unwrap_or(0),
+            first_text_ms = self.first_text_ms.unwrap_or(0),
+            first_tool_call_ms = self.first_tool_call_ms.unwrap_or(0),
+            prompt_tokens = prompt_tokens.unwrap_or(0),
+            completion_tokens = completion_tokens.unwrap_or(0),
+            cached_tokens = cached_tokens.unwrap_or(0),
+            reasoning_tokens = reasoning_tokens.unwrap_or(0),
+            usage_present = usage.is_some(),
             "Anthropic stream closed"
         );
     }
@@ -1067,6 +1114,9 @@ struct StreamState {
     fallback_model: String,
     started: bool,
     terminal: bool,
+    /// Anti-amplification gate: when false, upstream reasoning is counted
+    /// but never emitted as Anthropic thinking blocks.
+    expose_thinking: bool,
     blocks: Vec<BlockKind>,
     text_index: Option<usize>,
     thinking_index: Option<usize>,
@@ -1074,6 +1124,18 @@ struct StreamState {
     finish_reason: Option<String>,
     stop_sequence: Value,
     usage: Value,
+    /// Output-composition accounting (SSE delta payload bytes; never
+    /// converted to tokens — upstream usage supplies tokens when present).
+    reasoning_bytes: u64,
+    text_bytes: u64,
+    tool_call_bytes: u64,
+    reasoning_events: u64,
+    text_events: u64,
+    tool_call_events: u64,
+    first_reasoning: Option<u128>,
+    first_text: Option<u128>,
+    first_tool_call: Option<u128>,
+    request_started: Instant,
 }
 
 #[derive(Clone, Copy)]
@@ -1092,12 +1154,18 @@ struct ToolStream {
 }
 
 impl StreamState {
-    fn new(request_id: String, fallback_model: String) -> Self {
+    fn new(
+        request_id: String,
+        fallback_model: String,
+        expose_thinking: bool,
+        request_started: Instant,
+    ) -> Self {
         Self {
             request_id,
             fallback_model,
             started: false,
             terminal: false,
+            expose_thinking,
             blocks: Vec::new(),
             text_index: None,
             thinking_index: None,
@@ -1105,6 +1173,22 @@ impl StreamState {
             finish_reason: None,
             stop_sequence: Value::Null,
             usage: json!({}),
+            reasoning_bytes: 0,
+            text_bytes: 0,
+            tool_call_bytes: 0,
+            reasoning_events: 0,
+            text_events: 0,
+            tool_call_events: 0,
+            first_reasoning: None,
+            first_text: None,
+            first_tool_call: None,
+            request_started,
+        }
+    }
+
+    fn mark_first(kind: &mut Option<u128>, request_started: Instant) {
+        if kind.is_none() {
+            *kind = Some(request_started.elapsed().as_millis());
         }
     }
 
@@ -1181,18 +1265,30 @@ impl StreamState {
             }
             if let Some(delta) = choice.get("delta").and_then(Value::as_object) {
                 if let Some(reasoning) = reasoning_delta(delta).filter(|text| !text.is_empty()) {
-                    let index = self.ensure_thinking(&mut frames);
-                    frames.push(sse_frame(
-                        "content_block_delta",
-                        json!({"type":"content_block_delta", "index":index,
-                            "delta":{"type":"thinking_delta", "thinking":reasoning}}),
-                    ));
+                    // Count reasoning even when unexposed: the model still
+                    // produced (and billed) it, and progress telemetry should
+                    // show a stream that is thinking rather than hung.
+                    self.reasoning_bytes =
+                        self.reasoning_bytes.saturating_add(reasoning.len() as u64);
+                    self.reasoning_events = self.reasoning_events.saturating_add(1);
+                    Self::mark_first(&mut self.first_reasoning, self.request_started);
+                    if self.expose_thinking {
+                        let index = self.ensure_thinking(&mut frames);
+                        frames.push(sse_frame(
+                            "content_block_delta",
+                            json!({"type":"content_block_delta", "index":index,
+                                "delta":{"type":"thinking_delta", "thinking":reasoning}}),
+                        ));
+                    }
                 }
                 if let Some(text) = delta
                     .get("content")
                     .and_then(Value::as_str)
                     .filter(|text| !text.is_empty())
                 {
+                    self.text_bytes = self.text_bytes.saturating_add(text.len() as u64);
+                    self.text_events = self.text_events.saturating_add(1);
+                    Self::mark_first(&mut self.first_text, self.request_started);
                     let index = self.ensure_text(&mut frames);
                     frames.push(sse_frame(
                         "content_block_delta",
@@ -1202,6 +1298,24 @@ impl StreamState {
                 }
                 if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
                     for call in calls {
+                        self.tool_call_events = self.tool_call_events.saturating_add(1);
+                        if let Some(arguments) = call
+                            .get("function")
+                            .and_then(|function| function.get("arguments"))
+                            .and_then(Value::as_str)
+                        {
+                            self.tool_call_bytes =
+                                self.tool_call_bytes.saturating_add(arguments.len() as u64);
+                        }
+                        if self.first_tool_call.is_none()
+                            && call
+                                .get("function")
+                                .and_then(|function| function.get("name"))
+                                .and_then(Value::as_str)
+                                .is_some_and(|name| !name.is_empty())
+                        {
+                            self.first_tool_call = Some(self.request_started.elapsed().as_millis());
+                        }
                         self.handle_tool(call, &mut frames);
                     }
                 }
@@ -1405,10 +1519,41 @@ pub async fn parse_json_response(response: reqwest::Response) -> Result<Value, P
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Glm53Config;
+    use crate::optimize::optimize_request;
+    use std::time::Instant;
+
+    fn test_glm_config() -> Glm53Config {
+        Glm53Config::default()
+    }
+
+    /// Convert + apply the GLM policy exactly as the server does, including
+    /// alias resolution (claude-* ids map to the GLM upstream model).
+    fn convert_and_optimize(
+        bytes: &[u8],
+    ) -> Result<(ConvertedRequest, crate::optimize::RequestOptimization), ProtocolError> {
+        let mut converted = convert_request(bytes)?;
+        // Mirror the server: the alias "claude-sonnet-4-6" -> GLM upstream
+        // model is applied before the policy step.
+        if converted.model == "claude-sonnet-4-6" {
+            converted.body["model"] = Value::String("z-ai/glm-5.3-flash".into());
+        }
+        let optimization = optimize_request(
+            &mut converted.body,
+            &test_glm_config(),
+            crate::optimize::Origin::Anthropic {
+                thinking: converted.thinking.as_ref(),
+                output_effort: converted.output_effort.as_deref(),
+            },
+        )
+        .map_err(ProtocolError::invalid)?;
+        converted.expose_thinking = optimization.expose_thinking;
+        Ok((converted, optimization))
+    }
 
     #[test]
     fn request_converts_multimodal_tools_and_tool_result() {
-        let converted = convert_request(
+        let (converted, optimization) = convert_and_optimize(
             serde_json::to_vec(&json!({
                 "model":"claude-sonnet-4-6", "max_tokens":256,
                 "system":[{"type":"text","text":"system","cache_control":{"type":"ephemeral"}}],
@@ -1440,32 +1585,122 @@ mod tests {
         );
         assert_eq!(converted.body["messages"][3]["role"], "tool");
         assert_eq!(converted.body["parallel_tool_calls"], true);
+        // Small thinking budget -> low effort, explicitly on the wire.
         assert_eq!(converted.body["reasoning_effort"], "low");
+        assert_eq!(optimization.reasoning_effort, "low");
+        // thinking blocks never cross to the OpenAI wire as blocks; the
+        // historical reasoning_content is stripped before the last user turn.
+        assert!(converted.body["messages"][1]
+            .get("reasoning_content")
+            .is_none());
+        assert!(converted.body.get("thinking").is_none());
+        assert!(converted.body.get("metadata").is_none());
     }
 
     #[test]
-    fn nonstream_response_converts_reasoning_usage_and_parallel_tools() {
-        let converted = convert_response(
-            &json!({
-                "id":"chat_1","model":"upstream-model",
-                "choices":[{"message":{
-                    "content":"answer","reasoning":"think","tool_calls":[
-                        {"id":"call_1","function":{"name":"Read","arguments":"{\"file_path\":\"/tmp/é\"}"}},
-                        {"id":"call_2","function":{"name":"Write","arguments":"{}"}}
-                    ]
-                },"finish_reason":"tool_calls"}],
-                "usage":{"prompt_tokens":12,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":5}}
-            }),
-            "req_1",
-            "fallback",
+    fn request_without_thinking_defaults_to_explicit_high() {
+        let (converted, optimization) = convert_and_optimize(
+            serde_json::to_vec(&json!({
+                "model":"claude-sonnet-4-6", "max_tokens":64_000,
+                "messages":[{"role":"user","content":"hello"}]
+            }))
+            .unwrap()
+            .as_slice(),
         )
         .unwrap();
-        assert_eq!(converted["content"][0]["type"], "thinking");
-        assert_eq!(converted["content"][2]["input"]["file_path"], "/tmp/é");
-        assert_eq!(converted["content"][3]["name"], "Write");
-        assert_eq!(converted["stop_reason"], "tool_use");
-        assert_eq!(converted["usage"]["input_tokens"], 7);
-        assert_eq!(converted["usage"]["output_tokens"], 3);
+        // The critical unset->max regression: the effort must be explicit.
+        assert_eq!(converted.body["reasoning_effort"], "high");
+        assert_eq!(converted.body["max_tokens"], 16_384);
+        assert_eq!(optimization.client_max_tokens, Some(64_000));
+        assert_eq!(optimization.effective_max_tokens, Some(16_384));
+        assert!(!converted.expose_thinking);
+    }
+
+    #[test]
+    fn requested_thinking_is_exposed_and_unrequested_reasoning_is_not() {
+        let requested = convert_and_optimize(
+            serde_json::to_vec(&json!({
+                "model":"z-ai/glm-5.3-flash", "max_tokens":4_096,
+                "thinking":{"type":"adaptive"},
+                "messages":[{"role":"user","content":"hi"}]
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap()
+        .0;
+        assert!(requested.expose_thinking);
+        assert_eq!(requested.body["reasoning_effort"], "high");
+
+        let unrequested = convert_and_optimize(
+            serde_json::to_vec(&json!({
+                "model":"z-ai/glm-5.3-flash", "max_tokens":4_096,
+                "messages":[{"role":"user","content":"hi"}]
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap()
+        .0;
+        assert!(!unrequested.expose_thinking);
+
+        let disabled = convert_and_optimize(
+            serde_json::to_vec(&json!({
+                "model":"z-ai/glm-5.3-flash", "max_tokens":4_096,
+                "thinking":{"type":"disabled"},
+                "messages":[{"role":"user","content":"hi"}]
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap()
+        .0;
+        assert!(!disabled.expose_thinking);
+        assert_eq!(disabled.body["reasoning_effort"], "low");
+    }
+
+    #[test]
+    fn invalid_thinking_budgets_are_rejected_by_the_policy_step() {
+        let result = convert_and_optimize(
+            serde_json::to_vec(&json!({
+                "model":"z-ai/glm-5.3-flash", "max_tokens":256,
+                "thinking":{"type":"enabled","budget_tokens":4_096},
+                "messages":[{"role":"user","content":"hi"}]
+            }))
+            .unwrap()
+            .as_slice(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn nonstream_response_exposure_gates_thinking_blocks() {
+        let upstream = json!({
+            "id":"chat_1","model":"upstream-model",
+            "choices":[{"message":{
+                "content":"answer","reasoning":"think","tool_calls":[
+                    {"id":"call_1","function":{"name":"Read","arguments":"{\"file_path\":\"/tmp/é\"}"}},
+                    {"id":"call_2","function":{"name":"Write","arguments":"{}"}}
+                ]
+            },"finish_reason":"tool_calls"}],
+            "usage":{"prompt_tokens":12,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":5}}
+        });
+        let exposed = convert_response(&upstream, "req_1", "fallback", true).unwrap();
+        assert_eq!(exposed["content"][0]["type"], "thinking");
+        assert_eq!(exposed["content"][2]["input"]["file_path"], "/tmp/é");
+        assert_eq!(exposed["content"][3]["name"], "Write");
+        assert_eq!(exposed["stop_reason"], "tool_use");
+        assert_eq!(exposed["usage"]["input_tokens"], 7);
+        assert_eq!(exposed["usage"]["output_tokens"], 3);
+
+        let unexposed = convert_response(&upstream, "req_1", "fallback", false).unwrap();
+        assert!(unexposed["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|block| block["type"] != "thinking"));
+        assert_eq!(unexposed["content"][0]["type"], "text");
+        assert_eq!(unexposed["content"][1]["type"], "tool_use");
     }
 
     #[test]
@@ -1476,6 +1711,7 @@ mod tests {
             ]},"finish_reason":"tool_calls"}]}),
             "req",
             "model",
+            true,
         );
         assert!(result.is_err());
     }
@@ -1495,7 +1731,7 @@ mod tests {
 
     #[test]
     fn stream_lifecycle_handles_fragmented_parallel_tool_arguments() {
-        let mut state = StreamState::new("req".into(), "model".into());
+        let mut state = StreamState::new("req".into(), "model".into(), true, Instant::now());
         let mut frames = Vec::new();
         frames.extend(
             state.handle(r#"{"id":"chat","model":"m","choices":[{"delta":{"reasoning":"h"}}]}"#),
@@ -1513,16 +1749,46 @@ mod tests {
         assert!(text.contains("1}"));
         assert!(text.contains("thinking_delta"));
         assert!(text.ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
+        assert_eq!(state.reasoning_bytes, 1);
+        assert_eq!(state.text_bytes, 2);
+        assert!(state.first_tool_call.is_some());
+    }
+
+    #[test]
+    fn unrequested_reasoning_is_counted_but_never_emitted() {
+        let mut state = StreamState::new("req".into(), "model".into(), false, Instant::now());
+        let frames = state.handle(
+            r#"{"id":"chat","model":"m","choices":[{"delta":{"reasoning":"secret thinking"}}]}"#,
+        );
+        // message_start is emitted; no thinking block frames are.
+        let text = frames
+            .iter()
+            .map(|frame| String::from_utf8(frame.to_vec()).unwrap())
+            .collect::<String>();
+        assert!(text.contains("message_start"));
+        assert!(!text.contains("thinking"));
+        assert_eq!(state.reasoning_bytes, "secret thinking".len() as u64);
+        assert!(state.thinking_index.is_none());
+
+        // And a later text delta still produces a correct (index 0) text block.
+        let frames = state.handle(r#"{"choices":[{"delta":{"content":"ok"}}]}"#);
+        assert_eq!(frames.len(), 2); // content_block_start + text_delta
+        let text = frames
+            .iter()
+            .map(|frame| String::from_utf8(frame.to_vec()).unwrap())
+            .collect::<String>();
+        assert!(text.contains("\"index\":0"));
+        assert!(text.contains("text_delta"));
     }
 
     #[test]
     fn malformed_and_truncated_streams_are_terminal_errors() {
-        let mut malformed = StreamState::new("req".into(), "model".into());
+        let mut malformed = StreamState::new("req".into(), "model".into(), true, Instant::now());
         let text = String::from_utf8(malformed.handle("not json")[0].to_vec()).unwrap();
         assert!(text.starts_with("event: error"));
         assert!(malformed.terminal);
 
-        let mut truncated = StreamState::new("req".into(), "model".into());
+        let mut truncated = StreamState::new("req".into(), "model".into(), true, Instant::now());
         let frames = truncated.handle(r#"{"choices":[{"delta":{"content":"partial"}}]}"#);
         assert!(!frames.is_empty());
         assert!(truncated.finish_reason.is_none());

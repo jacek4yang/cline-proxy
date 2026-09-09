@@ -1,0 +1,6 @@
+# The official GLM-5.3-Flash chat template must render byte-identically on
+# every platform: CRLF checkouts would change prompt bytes and token counts.
+tools/glm_reference/assets/chat_template.jinja text eol=lf
+# Binary assets.
+*.gz binary
+tools/glm_reference/assets/tokenizer.json binary

@@ -13,9 +13,21 @@ use crate::glm53::reasoning::GlmReasoningEffort;
 use crate::glm53::CountError;
 
 /// Official zai-org/GLM-5.3-Flash `chat_template.jinja`.
-static CHAT_TEMPLATE: &str = include_str!("../../tools/glm_reference/assets/chat_template.jinja");
+static CHAT_TEMPLATE_RAW: &str =
+    include_str!("../../tools/glm_reference/assets/chat_template.jinja");
 
 static ENVIRONMENT: OnceLock<Environment<'static>> = OnceLock::new();
+
+/// The repository stores the template with LF endings, but a Windows
+/// checkout with `core.autocrlf=true` materializes CRLF, and `include_str!`
+/// would embed those bytes — silently changing every rendered prompt and
+/// breaking exact token parity (5 extra tokens on tool fixtures). Normalize
+/// to the official bytes regardless of checkout.
+static CHAT_TEMPLATE: OnceLock<String> = OnceLock::new();
+
+fn chat_template() -> &'static str {
+    CHAT_TEMPLATE.get_or_init(|| CHAT_TEMPLATE_RAW.replace("\r\n", "\n"))
+}
 
 /// Python `json.dumps(..., ensure_ascii=False)`-compatible serialization:
 /// insertion-ordered keys (serde_json `preserve_order`), `", "` item
@@ -82,7 +94,7 @@ fn environment() -> &'static Environment<'static> {
                 Ok(minijinja::Value::from(python_json(&json_value)))
             },
         );
-        environment.add_template("chat", CHAT_TEMPLATE).expect(
+        environment.add_template("chat", chat_template()).expect(
             "the embedded official chat template must compile; a minijinja \
              incompatibility is a build-time bug",
         );
