@@ -174,6 +174,14 @@ pub struct Glm53ReasoningConfig {
     pub strip_historical_thinking: bool,
     /// When upstream reasoning may be surfaced to the client.
     pub expose_thinking: ThinkingExposure,
+    /// Keep in-turn tool-loop reasoning in a bounded, memory-only shadow
+    /// store (issue #10): when the client did not request thinking, the
+    /// proxy stores reasoning from assistant turns that issued tool calls
+    /// and restores it onto the matching assistant turn of the next
+    /// request in the same reasoning epoch. Never persisted, never logged,
+    /// never truncated; disabled automatically when no stable session
+    /// identity exists.
+    pub shadow_current_turn: bool,
 }
 
 impl Default for Glm53ReasoningConfig {
@@ -183,6 +191,7 @@ impl Default for Glm53ReasoningConfig {
             adaptive_effort: Glm53Effort::High,
             strip_historical_thinking: true,
             expose_thinking: ThinkingExposure::default(),
+            shadow_current_turn: true,
         }
     }
 }

@@ -240,19 +240,23 @@ fn optimize_messages(
     glm: &Glm53Config,
     optimization: &mut RequestOptimization,
 ) {
-    let last_action_index = messages.iter().rposition(|message| {
-        matches!(
-            message.get("role").and_then(Value::as_str),
-            Some("user") | Some("tool")
-        )
-    });
+    // Reasoning-epoch boundary (issue #10): a `tool`-role message or a
+    // pure-tool-result user message continues the current epoch; the strip
+    // removes reasoning only from epochs *before* the newest human turn.
+    // OpenAI protocol has no block-array user content in this code path, so
+    // the boundary is the last plain `user` message (a `tool` role alone is
+    // never a human turn).
+    let epoch_boundary = messages
+        .iter()
+        .rposition(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        .unwrap_or(messages.len());
     for (index, message) in messages.iter_mut().enumerate() {
         let Some(object) = message.as_object_mut() else {
             continue;
         };
         if glm.reasoning.strip_historical_thinking
             && object.get("role").and_then(Value::as_str) == Some("assistant")
-            && last_action_index.is_some_and(|last| index < last)
+            && index < epoch_boundary
         {
             if let Some(removed) = object.remove("reasoning_content") {
                 optimization.historical_reasoning_bytes_removed = optimization
@@ -333,31 +337,22 @@ fn serialized_object_len(object: &Map<String, Value>) -> usize {
         .unwrap_or(0)
 }
 
-/// Strip historical `thinking` blocks from an *Anthropic* request in place
-/// (assistant blocks before the last user or tool_result message). Used for
-/// exact token accounting of the optimized request; the wire-level strip
-/// happens on the converted OpenAI body. Returns removed bytes.
+/// Strip historical `thinking` blocks from an *Anthropic* request in place.
+/// The reasoning-epoch boundary is the newest **human** user message — a
+/// `user` message that carries ordinary content, NOT a pure `tool_result`
+/// carrier (a tool result continues the current assistant reasoning epoch,
+/// it does not start a new one). Assistant thinking before that boundary is
+/// removed; current-epoch thinking is preserved for in-epoch continuity
+/// (issue #10). Used for exact token accounting of the optimized request;
+/// the wire-level strip happens on the converted OpenAI body. Returns
+/// removed bytes.
 pub fn strip_anthropic_thinking(request: &mut Value) -> usize {
     let Some(messages) = request.get_mut("messages").and_then(Value::as_array_mut) else {
         return 0;
     };
-    let last_action_index = messages.iter().rposition(|message| {
-        let is_user = message.get("role").and_then(Value::as_str) == Some("user");
-        let has_tool_result = message
-            .get("content")
-            .and_then(Value::as_array)
-            .is_some_and(|blocks| {
-                blocks
-                    .iter()
-                    .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
-            });
-        is_user || has_tool_result
-    });
+    let epoch_boundary = reasoning_epoch_boundary(messages);
     let mut removed = 0usize;
-    let Some(last_action_index) = last_action_index else {
-        return 0;
-    };
-    for message in messages.iter_mut().take(last_action_index) {
+    for message in messages.iter_mut().take(epoch_boundary) {
         if message.get("role").and_then(Value::as_str) != Some("assistant") {
             continue;
         }
@@ -369,6 +364,31 @@ pub fn strip_anthropic_thinking(request: &mut Value) -> usize {
         removed = removed.saturating_add(before.saturating_sub(blocks.len()));
     }
     removed
+}
+
+/// Index of the newest human user message (the reasoning-epoch boundary):
+/// a `user` message that contains any content other than tool_result
+/// blocks. Everything at and after that index belongs to the current
+/// epoch. When no human turn exists, the epoch covers the whole history
+/// (returns `messages.len()`).
+fn reasoning_epoch_boundary(messages: &[Value]) -> usize {
+    messages
+        .iter()
+        .rposition(|message| {
+            if message.get("role").and_then(Value::as_str) != Some("user") {
+                return false;
+            }
+            let has_human_content = match message.get("content") {
+                // A plain string is by definition human content.
+                Some(Value::String(text)) => !text.is_empty(),
+                Some(Value::Array(blocks)) => blocks
+                    .iter()
+                    .any(|block| block.get("type").and_then(Value::as_str) != Some("tool_result")),
+                _ => false,
+            };
+            has_human_content
+        })
+        .unwrap_or(messages.len())
 }
 
 /// Exact token count of the removed historical reasoning chunks (the
@@ -390,22 +410,8 @@ fn collect_anthropic_thinking(request: &Value, chunks: &mut Vec<String>) {
     let Some(messages) = request.get("messages").and_then(Value::as_array) else {
         return;
     };
-    let last_action_index = messages
-        .iter()
-        .rposition(|message| {
-            let is_user = message.get("role").and_then(Value::as_str) == Some("user");
-            let has_tool_result = message
-                .get("content")
-                .and_then(Value::as_array)
-                .is_some_and(|blocks| {
-                    blocks.iter().any(|block| {
-                        block.get("type").and_then(Value::as_str) == Some("tool_result")
-                    })
-                });
-            is_user || has_tool_result
-        })
-        .unwrap_or(0);
-    for message in messages.iter().take(last_action_index) {
+    let epoch_boundary = reasoning_epoch_boundary(messages);
+    for message in messages.iter().take(epoch_boundary) {
         if message.get("role").and_then(Value::as_str) != Some("assistant") {
             continue;
         }
@@ -501,6 +507,9 @@ mod tests {
 
     #[test]
     fn historical_reasoning_is_stripped_but_tool_chain_is_intact() {
+        // Two epochs: epoch 1 = user "fix the bug" + its tool loop; epoch 2
+        // starts at the second human turn. Only epoch-1 reasoning is
+        // historical.
         let mut body = json!({
             "model": "z-ai/glm-5.3-flash",
             "max_tokens": 1_000,
@@ -510,6 +519,7 @@ mod tests {
                  "tool_calls": [{"id": "call_1", "type": "function",
                      "function": {"name": "Read", "arguments": "{\"path\":\"a\"}"}}]},
                 {"role": "tool", "tool_call_id": "call_1", "content": "file body"},
+                {"role": "user", "content": "thanks, now make it faster"},
                 {"role": "assistant", "content": "again", "reasoning_content": "MORE THINKING",
                  "tool_calls": [{"id": "call_2", "type": "function",
                      "function": {"name": "Edit", "arguments": "{}"}}]},
@@ -526,18 +536,71 @@ mod tests {
         )
         .unwrap();
         let messages = body["messages"].as_array().unwrap();
+        // Epoch-1 reasoning stripped; epoch-2 (current) reasoning kept.
         assert!(messages[1].get("reasoning_content").is_none());
-        assert!(messages[3].get("reasoning_content").is_none());
+        assert!(messages[4].get("reasoning_content").is_some());
         // Text, tool_calls, ids, and order survive untouched.
         assert_eq!(messages[1]["content"], "looking");
         assert_eq!(messages[1]["tool_calls"][0]["id"], "call_1");
-        assert_eq!(messages[3]["tool_calls"][0]["id"], "call_2");
+        assert_eq!(messages[4]["tool_calls"][0]["id"], "call_2");
         assert_eq!(messages[2]["tool_call_id"], "call_1");
-        assert_eq!(messages[4]["tool_call_id"], "call_2");
+        assert_eq!(messages[5]["tool_call_id"], "call_2");
         assert_eq!(
             optimization.historical_reasoning_bytes_removed as usize,
-            "\"LONG OLD THINKING\"".len() + "\"MORE THINKING\"".len()
+            "\"LONG OLD THINKING\"".len()
         );
+    }
+
+    /// Within one epoch, tool-loop reasoning continuity is preserved on the
+    /// wire (issue #10): tool results do not erase the reasoning of the
+    /// assistant turns they belong to.
+    #[test]
+    fn same_epoch_tool_loop_reasoning_is_preserved() {
+        let mut body = json!({
+            "model": "z-ai/glm-5.3-flash",
+            "max_tokens": 1_000,
+            "messages": [
+                {"role": "user", "content": "fix the bug"},
+                {"role": "assistant", "content": "looking", "reasoning_content": "EPOCH CURRENT A",
+                 "tool_calls": [{"id": "call_1", "type": "function",
+                     "function": {"name": "Read", "arguments": "{\"path\":\"a\"}"}}]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "file body"},
+                {"role": "assistant", "content": "again", "reasoning_content": "EPOCH CURRENT B",
+                 "tool_calls": [{"id": "call_2", "type": "function",
+                     "function": {"name": "Edit", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "call_2", "content": "done"}
+            ]
+        });
+        let optimization = optimize_request(
+            &mut body,
+            &glm_config(),
+            Origin::Anthropic {
+                thinking: None,
+                output_effort: None,
+            },
+        )
+        .unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(optimization.historical_reasoning_bytes_removed, 0);
+        assert_eq!(messages[1]["reasoning_content"], "EPOCH CURRENT A");
+        assert_eq!(messages[3]["reasoning_content"], "EPOCH CURRENT B");
+        assert_tool_chain_intact_helper(&body);
+    }
+
+    fn assert_tool_chain_intact_helper(body: &Value) {
+        let messages = body["messages"].as_array().unwrap();
+        let mut pending = std::collections::BTreeSet::new();
+        for message in messages {
+            if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+                for call in calls {
+                    pending.insert(call["id"].as_str().unwrap().to_owned());
+                }
+            }
+            if message.get("role").and_then(Value::as_str) == Some("tool") {
+                assert!(pending.remove(message["tool_call_id"].as_str().unwrap()));
+            }
+        }
+        assert!(pending.is_empty());
     }
 
     #[test]
@@ -752,7 +815,10 @@ mod tests {
     }
 
     #[test]
-    fn strip_anthropic_thinking_removes_only_historical_blocks() {
+    fn strip_anthropic_thinking_follows_human_turn_epoch_boundary() {
+        // Same epoch: user task -> assistant thinking -> tool_result ->
+        // assistant thinking. A tool_result does NOT start a new epoch, so
+        // NOTHING is stripped until a new human turn arrives.
         let mut request = json!({
             "model": "z-ai/glm-5.3-flash",
             "max_tokens": 1_000,
@@ -771,11 +837,56 @@ mod tests {
                 ]}
             ]
         });
-        strip_anthropic_thinking(&mut request);
+        assert_eq!(strip_anthropic_thinking(&mut request), 0);
         let messages = request["messages"].as_array().unwrap();
+        assert_eq!(
+            messages[1]["content"][0]["thinking"], "old reasoning",
+            "same-epoch reasoning is preserved"
+        );
+        assert_eq!(messages[3]["content"][0]["thinking"], "current reasoning");
+
+        // After a NEW human turn, all earlier-epoch thinking is stripped.
+        request["messages"].as_array_mut().unwrap().push(json!(
+            {"role": "user", "content": "now do something else"}
+        ));
+        let removed = strip_anthropic_thinking(&mut request);
+        assert_eq!(removed, 2, "both epoch-1 thinking blocks are historical");
+        let messages = request["messages"].as_array().unwrap();
+        // Only the text blocks survive; order preserved.
         assert_eq!(messages[1]["content"].as_array().unwrap().len(), 1);
         assert_eq!(messages[1]["content"][0]["type"], "text");
-        assert_eq!(messages[3]["content"][0]["thinking"], "current reasoning");
-        assert_eq!(messages[3]["content"][1]["text"], "final");
+        assert_eq!(messages[1]["content"][0]["text"], "step");
+        assert_eq!(messages[3]["content"].as_array().unwrap().len(), 1);
+        assert_eq!(messages[3]["content"][0]["type"], "text");
+        assert_eq!(messages[3]["content"][0]["text"], "final");
+    }
+
+    #[test]
+    fn pure_tool_result_user_turn_never_starts_an_epoch() {
+        // Long tool loop within one epoch: strip boundary must skip past
+        // tool_result-only user messages even when they contain text too?
+        // No — a user message mixing tool_result AND human text starts a
+        // new epoch (it contains ordinary content).
+        let mut request = json!({
+            "model": "z-ai/glm-5.3-flash",
+            "messages": [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "t1"}, {"type": "text", "text": "a"}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t", "content": "r"},
+                    {"type": "text", "text": "actually also do X"}
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "t2"}, {"type": "text", "text": "b"}
+                ]}
+            ]
+        });
+        // The mixed user message at index 2 IS a human turn (has text).
+        assert_eq!(strip_anthropic_thinking(&mut request), 1);
+        let messages = request["messages"].as_array().unwrap();
+        assert_eq!(messages[1]["content"][0].get("thinking"), None);
+        assert_eq!(messages[3]["content"][0]["thinking"], "t2");
     }
 }

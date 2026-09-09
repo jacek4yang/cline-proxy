@@ -8,6 +8,7 @@ pub mod glm53;
 pub mod optimize;
 pub mod pool;
 pub mod rate_limit;
+pub mod reasoning_shadow;
 pub mod redaction;
 pub mod server;
 pub mod state;

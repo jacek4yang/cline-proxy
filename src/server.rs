@@ -44,6 +44,9 @@ pub struct AppState {
     /// (`glm53.telemetry.max_concurrent_token_counts`). `None` disables the
     /// accounting entirely, which is handled before acquisition.
     pub token_count_permits: Option<Arc<tokio::sync::Semaphore>>,
+    /// Bounded memory-only shadow store for in-turn tool-loop reasoning
+    /// (`glm53.reasoning.shadow_current_turn`). `None` disables restore.
+    pub reasoning_shadow: Option<Arc<crate::reasoning_shadow::ReasoningShadowStore>>,
 }
 
 impl AppState {
@@ -93,6 +96,15 @@ impl AppState {
         } else {
             None
         };
+        let reasoning_shadow = if config.glm53.reasoning.shadow_current_turn {
+            Some(Arc::new(
+                crate::reasoning_shadow::ReasoningShadowStore::new(
+                    crate::reasoning_shadow::ShadowLimits::default(),
+                ),
+            ))
+        } else {
+            None
+        };
         Ok(Self {
             config: Arc::new(config),
             upstream,
@@ -100,6 +112,7 @@ impl AppState {
             persistence_healthy: Arc::new(AtomicBool::new(true)),
             started: Instant::now(),
             token_count_permits,
+            reasoning_shadow,
         })
     }
 
@@ -386,6 +399,33 @@ async fn anthropic_messages(
         .prefix_hash
         .then(|| cache::extract_session_fingerprint(&body, &state.config.server.api_key))
         .flatten();
+    // Reasoning shadow restore (issue #10): when the client did not request
+    // thinking and a stable session identity exists, in-epoch reasoning for
+    // this conversation's tool calls is restored onto the matching
+    // assistant messages. Restored reasoning lives in the current epoch, so
+    // the strip step preserves it. The restore must run BEFORE the GLM
+    // policy (which strips historical thinking) sees the messages.
+    let shadow_eligible = state.config.glm53.reasoning.shadow_current_turn
+        && !matches!(
+            converted
+                .thinking
+                .as_ref()
+                .and_then(|t| t.get("type"))
+                .and_then(Value::as_str),
+            Some("enabled") | Some("adaptive")
+        );
+    if let (Some(shadow), Some(fp)) = (
+        state.reasoning_shadow.as_ref().filter(|_| shadow_eligible),
+        session_fp.as_deref(),
+    ) {
+        // A request whose newest message is a plain human user turn starts
+        // a new reasoning epoch: previous-epoch shadow state is dropped.
+        if request_starts_new_epoch(&converted.body) {
+            shadow.clear_session(fp);
+        } else if let Some(object) = converted.body.as_object_mut() {
+            shadow.restore_into(object, fp);
+        }
+    }
     // GLM policy: explicit reasoning effort (default high, never unset),
     // bounded output, historical-thinking strip, safe compaction, and the
     // per-request size breakdown telemetry.
@@ -492,6 +532,17 @@ async fn anthropic_messages(
         }
     };
     if converted.stream {
+        // Reasoning shadow context (issue #10): accumulate unexposed
+        // reasoning during the stream and commit it on completion.
+        let shadow_context = state
+            .reasoning_shadow
+            .as_ref()
+            .zip(session_fp.clone())
+            .filter(|_| shadow_eligible)
+            .map(|(store, fp)| anthropic::StreamShadowContext {
+                store: store.clone(),
+                session_fingerprint: fp,
+            });
         let mut response = Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/event-stream")
@@ -499,12 +550,15 @@ async fn anthropic_messages(
             .header("x-accel-buffering", "no")
             .body(anthropic::stream_body(
                 response,
-                request_id.clone(),
-                upstream_model,
-                result.selected.name.to_string(),
-                started,
-                state.config.runtime.stream_progress_secs,
-                converted.expose_thinking,
+                anthropic::StreamOptions {
+                    request_id: request_id.clone(),
+                    fallback_model: upstream_model,
+                    key_name: result.selected.name.to_string(),
+                    request_started: started,
+                    progress_secs: state.config.runtime.stream_progress_secs,
+                    expose_thinking: converted.expose_thinking,
+                    shadow: shadow_context,
+                },
             ))
             .unwrap_or_else(|_| Response::new(Body::empty()));
         insert_request_id(response.headers_mut(), &request_id);
@@ -514,6 +568,14 @@ async fn anthropic_messages(
         Ok(value) => value,
         Err(error) => return protocol_error(error, StatusCode::BAD_GATEWAY, &request_id),
     };
+    // Reasoning shadow store (issue #10): remember in-turn reasoning that
+    // issued tool calls so the next request in this epoch can restore it.
+    store_reasoning_shadow(
+        &state,
+        value.as_object(),
+        session_fp.as_deref(),
+        &request_id,
+    );
     match anthropic::convert_response(
         &value,
         &request_id,
@@ -645,6 +707,77 @@ async fn anthropic_count_tokens(
             .insert("x-cline-proxy-token-count", value);
     }
     response
+}
+
+/// True when the newest message of the converted OpenAI body is a plain
+/// human user message (not a tool result): the request starts a new
+/// reasoning epoch (issue #10).
+fn request_starts_new_epoch(openai_body: &Value) -> bool {
+    let Some(messages) = openai_body.get("messages").and_then(Value::as_array) else {
+        return false;
+    };
+    let Some(last) = messages.last() else {
+        return false;
+    };
+    last.get("role").and_then(Value::as_str) == Some("user")
+}
+
+/// Reasoning shadow store (issue #10): extract reasoning + tool-call ids
+/// from a completed upstream (non-stream) response and remember them for
+/// the next request in the same reasoning epoch. A response WITHOUT tool
+/// calls is a final answer: the session's shadow entries are cleared.
+/// Reasoning content is never logged.
+fn store_reasoning_shadow(
+    state: &AppState,
+    upstream: Option<&serde_json::Map<String, Value>>,
+    session_fp: Option<&str>,
+    request_id: &str,
+) {
+    let Some(shadow) = state.reasoning_shadow.as_ref() else {
+        return;
+    };
+    let Some(fp) = session_fp else {
+        return;
+    };
+    let Some(message) = upstream
+        .and_then(|value| value.get("choices"))
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .and_then(Value::as_object)
+    else {
+        return;
+    };
+    let reasoning = anthropic::reasoning_text_from_message(message);
+    let call_ids: Vec<String> = message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .map(|calls| {
+            calls
+                .iter()
+                .filter_map(|call| {
+                    call.get("id")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if call_ids.is_empty() {
+        // Final answer: the reasoning epoch ended; drop shadow state.
+        shadow.clear_session(fp);
+        return;
+    }
+    if !reasoning.is_empty() {
+        shadow.store(fp, &call_ids, &reasoning);
+    }
+    tracing::debug!(
+        request_id,
+        session = fp,
+        shadow_tool_calls = call_ids.len(),
+        shadow_reasoning_bytes = reasoning.len(),
+        "reasoning shadow store updated"
+    );
 }
 
 /// One log line attributing where request bytes went and what the GLM

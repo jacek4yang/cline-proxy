@@ -776,15 +776,32 @@ pub fn error_envelope(error_type: &str, message: impl Into<String>, request_id: 
     })
 }
 
-pub fn stream_body(
-    response: reqwest::Response,
-    request_id: String,
-    fallback_model: String,
-    key_name: String,
-    request_started: Instant,
-    progress_secs: u64,
-    expose_thinking: bool,
-) -> Body {
+pub struct StreamShadowContext {
+    pub store: std::sync::Arc<crate::reasoning_shadow::ReasoningShadowStore>,
+    pub session_fingerprint: String,
+}
+
+/// Options for [`stream_body`] beyond the response itself.
+pub struct StreamOptions {
+    pub request_id: String,
+    pub fallback_model: String,
+    pub key_name: String,
+    pub request_started: Instant,
+    pub progress_secs: u64,
+    pub expose_thinking: bool,
+    pub shadow: Option<StreamShadowContext>,
+}
+
+pub fn stream_body(response: reqwest::Response, options: StreamOptions) -> Body {
+    let StreamOptions {
+        request_id,
+        fallback_model,
+        key_name,
+        request_started,
+        progress_secs,
+        expose_thinking,
+        shadow,
+    } = options;
     let output = async_stream::stream! {
         let mut upstream = response.bytes_stream();
         let idle = tokio::time::sleep(STREAM_PING_INTERVAL);
@@ -828,6 +845,7 @@ pub fn stream_body(
                                 yield Ok::<Bytes, std::io::Error>(frame);
                             }
                             if state.terminal {
+                                state.commit_shadow(shadow.as_ref());
                                 telemetry.absorb(&state);
                                 telemetry.finish(if state.finish_reason.is_some() { "complete" } else { "protocol_error" });
                                 return;
@@ -891,6 +909,7 @@ pub fn stream_body(
                     telemetry.commit(frame.len());
                     yield Ok(frame);
                 }
+                state.commit_shadow(shadow.as_ref());
                 telemetry.absorb(&state);
                 telemetry.finish("complete");
             } else {
@@ -1206,6 +1225,11 @@ struct StreamState {
     first_text: Option<u128>,
     first_tool_call: Option<u128>,
     request_started: Instant,
+    /// Reasoning shadow (issue #10): full reasoning text accumulated when
+    /// NOT exposed to the client, for the shadow store. Kept only for the
+    /// stream duration; empty when exposed (client already has it) or no
+    /// shadow context was provided.
+    shadow_reasoning: String,
 }
 
 #[derive(Clone, Copy)]
@@ -1253,6 +1277,7 @@ impl StreamState {
             first_text: None,
             first_tool_call: None,
             request_started,
+            shadow_reasoning: String::new(),
         }
     }
 
@@ -1342,6 +1367,12 @@ impl StreamState {
                         self.reasoning_bytes.saturating_add(reasoning.len() as u64);
                     self.reasoning_events = self.reasoning_events.saturating_add(1);
                     Self::mark_first(&mut self.first_reasoning, self.request_started);
+                    if !self.expose_thinking {
+                        // Shadow accumulation: the client never sees this
+                        // text; the shadow store may hand it to the next
+                        // request in the same reasoning epoch.
+                        self.shadow_reasoning.push_str(reasoning);
+                    }
                     if self.expose_thinking {
                         let index = self.ensure_thinking(&mut frames);
                         frames.push(sse_frame(
@@ -1542,6 +1573,63 @@ impl StreamState {
         ));
         frames.push(sse_frame("message_stop", json!({"type":"message_stop"})));
         frames
+    }
+}
+
+/// Extract reasoning text from an upstream (non-stream) message object.
+/// Shared with the server's reasoning shadow store; returns "" when absent.
+pub fn reasoning_text_from_message(message: &Map<String, Value>) -> String {
+    for name in ["reasoning_content", "reasoning"] {
+        if let Some(text) = message.get(name).and_then(Value::as_str) {
+            return text.to_owned();
+        }
+    }
+    let Some(details) = message.get("reasoning_details") else {
+        return String::new();
+    };
+    match details {
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| {
+                item.as_str().or_else(|| {
+                    item.get("text")
+                        .or_else(|| item.get("content"))
+                        .and_then(Value::as_str)
+                })
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+impl StreamState {
+    /// Reasoning shadow commit (issue #10): called once when the stream
+    /// ends. Responses with tool calls store their (unexposed) reasoning;
+    /// final answers clear the session's shadow state.
+    fn commit_shadow(&mut self, shadow: Option<&StreamShadowContext>) {
+        let Some(context) = shadow else {
+            return;
+        };
+        if self.tools.is_empty() {
+            context.store.clear_session(&context.session_fingerprint);
+            return;
+        }
+        if self.shadow_reasoning.is_empty() {
+            return;
+        }
+        let ids: Vec<String> = self
+            .tools
+            .values()
+            .filter_map(|tool| tool.id.clone())
+            .collect();
+        if !ids.is_empty() {
+            context
+                .store
+                .store(&context.session_fingerprint, &ids, &self.shadow_reasoning);
+        }
+        self.shadow_reasoning.clear();
     }
 }
 

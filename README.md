@@ -145,10 +145,22 @@ Full rationale and evidence: `docs/GLM53_FLASH.md` and
   small `budget_tokens` (<8192)->`low`, large->`high`, and only an explicit
   `output_config.effort: "max"` produces `max`. Precedence: explicit
   `output_config.effort` > explicit `thinking` > proxy default.
-- **Historical thinking is stripped** from assistant messages before the
-  last user/tool-result turn. Text, tool calls, call ids, and order are
-  untouched, so long sessions stop paying for replayed reasoning. This is
-  the reliable local equivalent of GLM's `clear_thinking`.
+- **Historical thinking is stripped per reasoning epoch.** The epoch
+  boundary is the newest *human* user message — tool results continue the
+  current epoch rather than starting one. Reasoning from previous epochs
+  is removed; the current epoch keeps its in-turn reasoning continuity
+  across the tool loop. Text, tool calls, call ids, and order are always
+  untouched. This is the reliable local equivalent of GLM's
+  `clear_thinking`, refined by real tool-loop semantics (ADR 0006).
+- **Reasoning shadow store** (`shadow_current_turn`, default on): when
+  the client did not request thinking, the proxy briefly keeps the
+  in-turn reasoning that issued tool calls and restores it onto the
+  matching assistant turn of the next request in the same epoch — tool
+  loops keep their reasoning continuity without Claude Code ever storing
+  or replaying reasoning. Memory-only, bounded (256 sessions / 64 MiB /
+  1 MiB per entry / 10-minute TTL), never truncated, never logged,
+  never persisted; disabled automatically when no stable session identity
+  exists.
 - **Thinking exposure is `requested_only`:** upstream reasoning is surfaced
   to the client as Anthropic thinking blocks only when the request
   explicitly carries `thinking`. This prevents Claude Code from storing and

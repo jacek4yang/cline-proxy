@@ -51,7 +51,8 @@
       "default_effort": "high",
       "adaptive_effort": "high",
       "strip_historical_thinking": true,
-      "expose_thinking": "requested_only"
+      "expose_thinking": "requested_only",
+      "shadow_current_turn": true
     },
     "limits": {
       "max_output_tokens": 16384
