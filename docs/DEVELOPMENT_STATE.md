@@ -144,6 +144,37 @@ After merge, re-baseline and pick the next P1 from "Next task".
   `benches/request_optimization.rs` (convert+optimize+serialize ~ms-scale
   at 1 MB; exact count ~350 ms background).
 
+## Current branch (cache locality, issue #8)
+
+`perf/claude-code-cache-locality` — implemented so far:
+
+- `src/cache.rs`: `strip_leading_anthropic_billing_header` (LF/CRLF/CR,
+  start-anchored only), `strip_billing_header_in_anthropic_system`
+  (count_tokens parity), `canonical_json_string` +
+  `canonicalize_tool_arguments` (historical turns only, malformed args
+  untouched), `stable_prefix_hash` (SHA-256, sizes+hash only),
+  `session_fingerprint` (HMAC-SHA256, 16 hex chars) +
+  `extract_session_fingerprint` (metadata.user_id/session_id, None =
+  unstable), `log_prefix_telemetry`.
+- `anthropic.rs::normalize_system_messages` wired into the Anthropic
+  handler before the GLM policy (billing header stripped once, shared by
+  wire + count_tokens + telemetry).
+- `optimize`/`openai_chat` paths: canonicalization + prefix telemetry.
+- Stream telemetry: `cache_hit_ratio` (cached/prompt; OpenAI semantics:
+  cached ⊆ prompt — annotated in code, to verify against real Cline
+  usage) and `reasoning_ratio`.
+- Config: `glm53.context.{strip_volatile_billing_header,canonical_tool_json}`,
+  `glm53.telemetry.{prefix_hash,cache_metrics}` (defaults on).
+- Tests: billing-header variants (§47-50), canonical JSON (§48),
+  prefix-hash stability, session fingerprint privacy, end-to-end router
+  test: dynamic billing header + argument order → identical stripped
+  system + canonical arguments.
+- ADR 0005; README section.
+
+Pending on this branch: real E2E A/B (billing header strip on/off vs
+cached_tokens on live Cline), prompt_cache_key probe (explicit test
+script, not production), request-gzip probe (low priority), PR.
+
 ## Next task
 
 1. Land the glm53-efficient-reasoning PR (review closeout commit: bounded

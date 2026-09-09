@@ -175,6 +175,38 @@ Full rationale and evidence: `docs/GLM53_FLASH.md` and
   worker and never queued unboundedly; when the slot is busy the count is
   skipped and logged. Logs contain sizes/counts only, never prompt content.
 
+### Prompt-prefix stability (cache locality)
+
+Upstream prompt caches key on byte-exact prefixes, so per-turn byte drift
+in an otherwise identical conversation wastes prefill. cline-proxy
+addresses the drift sources it can (issue #8, ADR 0005):
+
+- **Volatile billing header**: Claude Code prepends an
+  `x-anthropic-billing-header: ...` line to the system text whose
+  attribution metadata changes between requests. A *leading* line of
+  exactly that shape is stripped (LF/CRLF/CR aware); a header mentioned
+  later in the text is never touched. Applied in Anthropic system
+  normalization so the wire body, `/v1/messages/count_tokens`, and
+  telemetry all see the same normalized system.
+- **Canonical tool-argument JSON**: historical assistant
+  `tool_calls[].function.arguments` strings are re-serialized with
+  deterministic key order so equivalent arguments are byte-identical
+  across turns. Arrays keep order; malformed strings, plain-text tool
+  results, shell output, and source code are never rewritten.
+- **Stable prefix telemetry**: each request logs `prefix_hash` and
+  `prefix_bytes` (hash of normalized system + messages + tools). Equal
+  hashes prove local byte stability, not an upstream cache hit.
+- **Session fingerprint**: when Claude Code supplies a session identity
+  (`metadata.user_id`/`session_id`), a 16-hex-char HMAC fingerprint is
+  logged (`session=...`). Raw ids are never logged; without identity the
+  field is `unstable` and no session-scoped behavior is attempted.
+- **Cache ratios**: `cache_hit_ratio` and `reasoning_ratio` are logged
+  from upstream usage when the upstream reports the underlying tokens.
+  Whether Cline's upstream exposes cache data is workload-dependent and
+  currently unverified; no improvement is claimed until a real A/B run
+  measures it. `prompt_cache_key` is *not* sent upstream — support is
+  unprobed and unknown parameters risk rejection.
+
 ## Key stickiness and persisted quota state
 
 Routing is **strict sticky sequential**. The active key is used for every

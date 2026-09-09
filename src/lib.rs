@@ -2,6 +2,7 @@
 //! tooling can exercise the exact modules the production binary uses.
 
 pub mod anthropic;
+pub mod cache;
 pub mod config;
 pub mod glm53;
 pub mod optimize;

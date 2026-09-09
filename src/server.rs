@@ -20,6 +20,7 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 
 use crate::anthropic::{self, ProtocolError};
+use crate::cache;
 use crate::config::{defaults, Config};
 use crate::optimize;
 use crate::pool::KeyPool;
@@ -302,7 +303,24 @@ async fn openai_chat(
             Ok(optimization) => optimization,
             Err(message) => return openai_error(StatusCode::BAD_REQUEST, message, &request_id),
         };
-    log_request_optimization(&request_id, "openai", &optimization);
+    // Canonicalize historical tool-call argument JSON for byte-stable
+    // prefixes (config-gated; plain-text content is never touched).
+    let canonicalized = if state.config.glm53.context.canonical_tool_json {
+        cache::canonicalize_tool_arguments(
+            value.as_object_mut().unwrap_or(&mut serde_json::Map::new()),
+        )
+    } else {
+        0
+    };
+    let prefix_telemetry = cache::log_prefix_telemetry(&value, None, &request_id);
+    log_request_optimization(
+        &request_id,
+        "openai",
+        &optimization,
+        0,
+        canonicalized,
+        &prefix_telemetry,
+    );
     let upstream_body = match serde_json::to_vec(&value) {
         Ok(body) => Bytes::from(body),
         Err(_) => {
@@ -350,6 +368,24 @@ async fn anthropic_messages(
     let requested_model = converted.model.clone();
     let upstream_model = state.config.resolve_model(&requested_model);
     anthropic::apply_model(&mut converted, upstream_model.clone());
+    // Prefix stability (issue #8): remove the volatile leading
+    // x-anthropic-billing-header line before anything else observes the
+    // system text, so the wire body, count_tokens, and the prefix hash all
+    // see the same normalized system.
+    let billing_header_bytes_removed = if state.config.glm53.context.strip_volatile_billing_header {
+        anthropic::normalize_system_messages(&mut converted.body)
+    } else {
+        0
+    };
+    // Session fingerprint: extracted from metadata (if present) before the
+    // GLM policy may drop it; only the HMAC fingerprint is ever logged.
+    let session_fp = state
+        .config
+        .glm53
+        .telemetry
+        .prefix_hash
+        .then(|| cache::extract_session_fingerprint(&body, &state.config.server.api_key))
+        .flatten();
     // GLM policy: explicit reasoning effort (default high, never unset),
     // bounded output, historical-thinking strip, safe compaction, and the
     // per-request size breakdown telemetry.
@@ -372,7 +408,28 @@ async fn anthropic_messages(
         }
     };
     converted.expose_thinking = optimization.expose_thinking;
-    log_request_optimization(&request_id, "anthropic", &optimization);
+    // Canonicalize historical tool-call argument JSON for byte-stable
+    // prefixes (config-gated; plain-text content is never touched). The
+    // converted body is always an object at this point.
+    let canonicalized = if state.config.glm53.context.canonical_tool_json {
+        converted
+            .body
+            .as_object_mut()
+            .map(cache::canonicalize_tool_arguments)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let prefix_telemetry =
+        cache::log_prefix_telemetry(&converted.body, session_fp.as_deref(), &request_id);
+    log_request_optimization(
+        &request_id,
+        "anthropic",
+        &optimization,
+        billing_header_bytes_removed,
+        canonicalized,
+        &prefix_telemetry,
+    );
     // Exact tokenizer telemetry is GLM-specific; generic-model requests have
     // no embedded tokenizer and skip it entirely.
     if optimization.model_family == optimize::ModelFamily::Glm53 {
@@ -515,12 +572,18 @@ async fn anthropic_count_tokens(
             &request_id,
         );
     }
-    // Count what the gateway would actually send: historical thinking
-    // stripped (when the policy strips) and the resolved reasoning effort
-    // applied, so Claude Code's context budgeting matches real upstream
-    // usage. Falls back to the official-oracle count when the policy is
-    // disabled.
+    // Count what the gateway would actually send: the volatile billing
+    // header stripped (same normalization as the wire path — issue #8),
+    // historical thinking stripped (when the policy strips), and the
+    // resolved reasoning effort applied, so Claude Code's context budgeting
+    // matches real upstream usage. Falls back to the official-oracle count
+    // when the policies are disabled.
     let mut counted = value.clone();
+    if state.config.glm53.context.strip_volatile_billing_header {
+        // The count pipeline consumes the *Anthropic* shape, so the
+        // system-level strip is applied to the `system` field directly.
+        cache::strip_billing_header_in_anthropic_system(&mut counted);
+    }
     if state.config.glm53.reasoning.strip_historical_thinking {
         optimize::strip_anthropic_thinking(&mut counted);
     }
@@ -590,6 +653,9 @@ fn log_request_optimization(
     request_id: &str,
     protocol: &str,
     optimization: &optimize::RequestOptimization,
+    billing_header_bytes_removed: u64,
+    canonicalized_arguments: usize,
+    prefix_telemetry: &(String, usize),
 ) {
     tracing::info!(
         request_id,
@@ -613,8 +679,12 @@ fn log_request_optimization(
         tools_bytes = optimization.tools_bytes,
         other_bytes = optimization.other_bytes(),
         historical_reasoning_bytes_removed = optimization.historical_reasoning_bytes_removed,
+        billing_header_bytes_removed,
+        canonicalized_arguments,
         empty_blocks_removed = optimization.empty_blocks_removed,
         normalized_text_blocks = optimization.normalized_text_blocks,
+        prefix_hash = %prefix_telemetry.0,
+        prefix_bytes = prefix_telemetry.1,
         "request optimization"
     );
 }
@@ -2435,6 +2505,90 @@ mod tests {
         assert_eq!(seen.len(), 7);
         assert_eq!(seen[6].authorization, "Bearer cline-key-6");
         std::fs::remove_dir_all(state_path.parent().unwrap()).ok();
+        task.abort();
+    }
+
+    /// Prefix stability end-to-end (issue #8): two Claude Code-shaped
+    /// requests that differ ONLY in the dynamic billing-header metadata and
+    /// in tool-argument key insertion order must produce byte-identical
+    /// upstream system prefixes. The billing header must be gone from the
+    /// wire, and the historical tool arguments canonicalized.
+    #[tokio::test]
+    async fn dynamic_billing_header_and_argument_order_produce_identical_prefix() {
+        let (base, mock, task) = start_mock().await;
+        mock.set(
+            "cline-key-1",
+            vec![
+                Spec::json(200, successful_json("one")),
+                Spec::json(200, successful_json("two")),
+            ],
+        )
+        .await;
+        let app = router(AppState::new(test_config(base, 1)).unwrap());
+        let history = json!([
+            {"role":"user","content":[{"type":"text","text":"fix the bug"}]},
+            {"role":"assistant","content":[
+                {"type":"thinking","thinking":"old reasoning","signature":"s"},
+                {"type":"tool_use","id":"toolu_1","name":"Edit",
+                 "input":{"path":"src/a.rs","line":12}}
+            ]},
+            {"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"toolu_1","content":"done"}
+            ]}
+        ]);
+        let make_request = |header_value: &str, argument_order: bool| {
+            let tool_use_input = if argument_order {
+                json!({"path":"src/a.rs","line":12})
+            } else {
+                json!({"line":12,"path":"src/a.rs"})
+            };
+            let mut history = history.clone();
+            history[1]["content"][1]["input"] = tool_use_input;
+            json!({
+                "model":"claude-sonnet-4-6",
+                "max_tokens":1_000,
+                "system":[
+                    {"type":"text","text":format!(
+                        "x-anthropic-billing-header: {{\"cch\":\"{header_value}\"}}\nYou are Claude Code.")},
+                    {"type":"text","text":"Be careful."}
+                ],
+                "messages":history,
+                "tools":[{"name":"Edit","input_schema":{"type":"object"}}]
+            })
+            .to_string()
+        };
+        let request_a = make_request("AAA", true);
+        let request_b = make_request("BBB", false);
+        for body in [request_a, request_b] {
+            let response = app
+                .clone()
+                .oneshot(gateway_request("/v1/messages", body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let seen = mock.seen().await;
+        assert_eq!(seen.len(), 2);
+        for request in &seen {
+            let system = &request.body["messages"][0];
+            assert_eq!(system["role"], "system");
+            let text = system["content"].as_array().unwrap();
+            // Billing header stripped from the leading text block only.
+            assert!(!text[0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("x-anthropic-billing-header"));
+            assert!(text[0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("You are Claude Code."));
+            assert_eq!(text[1]["text"], "Be careful.");
+            // Historical tool arguments canonicalized.
+            assert_eq!(
+                request.body["messages"][2]["tool_calls"][0]["function"]["arguments"],
+                "{\"line\":12,\"path\":\"src/a.rs\"}"
+            );
+        }
         task.abort();
     }
 

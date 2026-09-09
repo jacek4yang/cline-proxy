@@ -57,11 +57,15 @@
       "max_output_tokens": 16384
     },
     "context": {
-      "safe_compaction": true
+      "safe_compaction": true,
+      "strip_volatile_billing_header": true,
+      "canonical_tool_json": true
     },
     "telemetry": {
       "exact_input_tokens": true,
-      "max_concurrent_token_counts": 1
+      "max_concurrent_token_counts": 1,
+      "prefix_hash": true,
+      "cache_metrics": true
     }
   }
 }
