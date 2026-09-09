@@ -78,9 +78,14 @@ fn build_request(history: &[Value], thinking_control: Option<Value>) -> Vec<u8> 
     serde_json::to_vec(&request).unwrap()
 }
 
-/// Convert + optimize exactly as the /v1/messages handler does.
+/// Convert + optimize exactly as the /v1/messages handler does, including
+/// alias resolution (claude-* ids resolve to the GLM upstream model before
+/// the policy step runs).
 fn pipeline(bytes: &[u8]) -> (Value, cline_proxy::optimize::RequestOptimization) {
     let mut converted = convert_request(bytes).unwrap();
+    if converted.model == "claude-sonnet-4-6" {
+        cline_proxy::anthropic::apply_model(&mut converted, "z-ai/glm-5.3-flash".to_owned());
+    }
     let optimization = optimize_request(
         &mut converted.body,
         &glm_config(),

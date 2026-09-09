@@ -27,10 +27,50 @@ use serde_json::{Map, Value};
 use crate::config::Glm53Config;
 use crate::glm53::reasoning::resolve_reasoning_policy;
 
+/// Upstream model family, resolved from the *upstream* model id. GLM policy
+/// (reasoning effort, output cap, historical-reasoning strip, compaction) is
+/// GLM-specific wire semantics; every other model receives the wire request
+/// essentially untouched (issue #6 review: the policy must be model-scoped,
+/// never a global rewrite of all OpenAI-compatible bodies).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ModelFamily {
+    /// `z-ai/glm-*` ids resolved through `models.aliases`/`models.default`.
+    #[default]
+    Glm53,
+    /// Any other model id: passthrough-compatible handling only.
+    GenericOpenAi,
+}
+
+impl ModelFamily {
+    pub fn from_upstream_model(model: &str) -> Self {
+        let id = model.rsplit('/').next().unwrap_or(model);
+        // Segment match: "glm" alone (glm-5.3-flash) or glm followed by a
+        // version digit (glm53, glm4.7). Bare substring matching would
+        // misclassify ids that merely mention glm in another segment.
+        if id.split(['-', '_', '.', '+']).any(|segment| {
+            let lower = segment.to_ascii_lowercase();
+            let rest = lower.strip_prefix("glm").unwrap_or_else(|| {
+                if lower == "glm" {
+                    ""
+                } else {
+                    "\u{0}not-a-match"
+                }
+            });
+            rest.is_empty() || rest.starts_with(|character: char| character.is_ascii_digit())
+        }) {
+            Self::Glm53
+        } else {
+            Self::GenericOpenAi
+        }
+    }
+}
+
 /// Size/count telemetry for one optimized request. All fields are logged;
 /// none contain request content.
 #[derive(Debug, Default, Clone)]
 pub struct RequestOptimization {
+    pub model_family: ModelFamily,
+    /// GLM effort placed on the wire (`""` when the family does not use it).
     pub reasoning_effort: &'static str,
     pub expose_thinking: bool,
     pub client_max_tokens: Option<u64>,
@@ -67,8 +107,10 @@ pub enum Origin<'a> {
     OpenAi,
 }
 
-/// Apply the GLM-5.3-Flash request policy to an OpenAI Chat Completions
-/// body.
+/// Apply the upstream-model request policy to an OpenAI Chat Completions
+/// body. GLM-5.3-Flash gets the full GLM policy; every other model gets a
+/// compatibility passthrough (unknown models must fail safe toward
+/// compatibility, not silently receive GLM semantics).
 pub fn optimize_request(
     body: &mut Value,
     glm: &Glm53Config,
@@ -77,7 +119,40 @@ pub fn optimize_request(
     let Some(object) = body.as_object_mut() else {
         return Err("request body must be a JSON object".into());
     };
+    let upstream_model = object
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let family = ModelFamily::from_upstream_model(&upstream_model);
+    match family {
+        ModelFamily::Glm53 => optimize_glm(object, glm, origin),
+        ModelFamily::GenericOpenAi => optimize_generic(object),
+    }
+}
+
+/// Generic OpenAI-compatible passthrough: no GLM fields are injected, no
+/// GLM limits are applied. Byte telemetry still records what was seen.
+fn optimize_generic(object: &mut Map<String, Value>) -> Result<RequestOptimization, String> {
     let mut optimization = RequestOptimization {
+        model_family: ModelFamily::GenericOpenAi,
+        reasoning_effort: "",
+        before_bytes: serialized_len(&Value::Object(object.clone())),
+        ..RequestOptimization::default()
+    };
+    optimization.after_bytes = optimization.before_bytes;
+    compute_breakdown(object, &mut optimization);
+    Ok(optimization)
+}
+
+/// GLM-5.3-Flash policy (the historical behavior of this module).
+fn optimize_glm(
+    object: &mut Map<String, Value>,
+    glm: &Glm53Config,
+    origin: Origin<'_>,
+) -> Result<RequestOptimization, String> {
+    let mut optimization = RequestOptimization {
+        model_family: ModelFamily::Glm53,
         before_bytes: serialized_len(&Value::Object(object.clone())),
         ..RequestOptimization::default()
     };
@@ -459,7 +534,7 @@ mod tests {
     #[test]
     fn reasoning_after_the_last_user_turn_is_kept() {
         let mut body = json!({
-            "model": "m",
+            "model": "z-ai/glm-5.3-flash",
             "max_tokens": 1_000,
             "messages": [
                 {"role": "user", "content": "go"},
@@ -484,7 +559,7 @@ mod tests {
     #[test]
     fn safe_compaction_normalizes_and_drops_empty_blocks() {
         let mut body = json!({
-            "model": "m",
+            "model": "z-ai/glm-5.3-flash",
             "max_tokens": 1_000,
             "metadata": {"user_id": "anthropic-only"},
             "messages": [
@@ -548,7 +623,7 @@ mod tests {
     #[test]
     fn breakdown_reflects_sections() {
         let mut body = json!({
-            "model": "m",
+            "model": "z-ai/glm-5.3-flash",
             "max_tokens": 1_000,
             "messages": [
                 {"role": "system", "content": "system text"},
@@ -580,7 +655,7 @@ mod tests {
         config.context.safe_compaction = false;
         config.reasoning.strip_historical_thinking = false;
         let mut body = json!({
-            "model": "m",
+            "model": "z-ai/glm-5.3-flash",
             "max_tokens": 1_000,
             "metadata": {"user_id": "u"},
             "messages": [
@@ -604,9 +679,73 @@ mod tests {
     }
 
     #[test]
+    fn model_family_detection_is_conservative() {
+        use ModelFamily::{GenericOpenAi, Glm53};
+        for model in [
+            "z-ai/glm-5.3-flash",
+            "glm-5.3-flash",
+            "GLM53",
+            "glm4.7",
+            "openai/glm-4.6",
+            "zai/glm-4.5-air",
+            "glm", // a full "glm" segment matches
+        ] {
+            assert_eq!(ModelFamily::from_upstream_model(model), Glm53, "{model}");
+        }
+        for model in ["claude-sonnet-4-6", "deepseek-chat", "gpt-5", "qwen3-coder"] {
+            assert_eq!(
+                ModelFamily::from_upstream_model(model),
+                GenericOpenAi,
+                "{model}"
+            );
+        }
+        // Substrings inside unrelated tokens must not match.
+        for model in ["aglm-4", "gpt-glmish", "kaggle"] {
+            assert_eq!(
+                ModelFamily::from_upstream_model(model),
+                GenericOpenAi,
+                "{model}"
+            );
+        }
+    }
+
+    /// Unknown models fail safe toward compatibility: no GLM effort, no GLM
+    /// output cap, no message rewriting, no metadata removal.
+    #[test]
+    fn generic_models_receive_no_glm_semantics() {
+        let mut body = json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 1_000,
+            "metadata": {"user_id": "u"},
+            "reasoning_effort": "medium",
+            "messages": [
+                {"role": "system", "content": [{"type": "text", "text": "sys"}]},
+                {"role": "user", "content": [{"type": "text", "text": ""}, {"type": "text", "text": "go"}]},
+                {"role": "assistant", "content": "old", "reasoning_content": "OLD THINKING",
+                 "tool_calls": [{"id": "call_1", "type": "function",
+                     "function": {"name": "Read", "arguments": "{\"path\":\"a\"}"}}]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "body"}
+            ]
+        });
+        let before = body.clone();
+        let optimization = optimize_request(&mut body, &glm_config(), Origin::OpenAi).unwrap();
+        assert_eq!(optimization.model_family, ModelFamily::GenericOpenAi);
+        assert_eq!(optimization.reasoning_effort, "");
+        assert_eq!(optimization.effective_max_tokens, None);
+        assert_eq!(optimization.historical_reasoning_bytes_removed, 0);
+        assert_eq!(optimization.empty_blocks_removed, 0);
+        assert_eq!(optimization.normalized_text_blocks, 0);
+        // The body is byte-identical to the input (aside from nothing at all).
+        assert_eq!(body, before);
+        assert_eq!(body["reasoning_effort"], "medium");
+        assert_eq!(body["max_tokens"], 1_000);
+        assert!(body.get("metadata").is_some());
+    }
+
+    #[test]
     fn strip_anthropic_thinking_removes_only_historical_blocks() {
         let mut request = json!({
-            "model": "m",
+            "model": "z-ai/glm-5.3-flash",
             "max_tokens": 1_000,
             "messages": [
                 {"role": "user", "content": "task"},

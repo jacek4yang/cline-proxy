@@ -60,7 +60,8 @@
       "safe_compaction": true
     },
     "telemetry": {
-      "exact_input_tokens": true
+      "exact_input_tokens": true,
+      "max_concurrent_token_counts": 1
     }
   }
 }

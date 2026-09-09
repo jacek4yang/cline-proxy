@@ -224,15 +224,22 @@ impl Default for Glm53ContextConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct Glm53TelemetryConfig {
     /// Exact GLM token accounting per request via the embedded official
-    /// tokenizer. Runs in a background task after the upstream request is
-    /// dispatched, so it never adds to TTFT.
+    /// tokenizer. Runs in a bounded `spawn_blocking` task after the upstream
+    /// request is dispatched, so it never adds to TTFT and never occupies
+    /// more than `max_concurrent_token_counts` CPU slots at once. When the
+    /// slot is busy the count is skipped (logged), never queued.
     pub exact_input_tokens: bool,
+    /// Concurrent CPU slots for exact token counts. 1 suits most hosts;
+    /// raise on high-core machines, set `exact_input_tokens: false` (or 0)
+    /// to disable.
+    pub max_concurrent_token_counts: u32,
 }
 
 impl Default for Glm53TelemetryConfig {
     fn default() -> Self {
         Self {
             exact_input_tokens: true,
+            max_concurrent_token_counts: 1,
         }
     }
 }

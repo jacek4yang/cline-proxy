@@ -146,14 +146,43 @@ After merge, re-baseline and pick the next P1 from "Next task".
 
 ## Next task
 
-1. Land the glm53-efficient-reasoning PR; re-baseline on main.
+1. Land the glm53-efficient-reasoning PR (review closeout commit: bounded
+   spawn_blocking tokenizer telemetry, model-scoped GLM policy, estimate
+   naming); re-baseline on main.
 2. Real E2E before/after against live Cline + Claude Code (TTFT, input/
    output/reasoning tokens, first-tool-call latency, task success) using
    the new telemetry fields; record numbers in issue #6.
-3. P1 queue: Claude Code tool semantics matrix
-   (`docs/ANTHROPIC_COMPATIBILITY.md`); large-context low-copy OpenAI fast
-   path; Prometheus metrics + latency decomposition; SSE fuzzing; hot
-   reload; optional request-gzip compatibility probe (low priority).
+3. P1 queue: turn-scoped reasoning (Anthropic `role=user` +
+   `tool_result` must NOT end a reasoning epoch — current strip boundary
+   uses the last user/tool turn which is correct for Claude Code's shape
+   but should be expressed as human-turn vs tool-result semantics);
+   session/branch identity + reasoning shadow store; prompt prefix
+   stability (billing-header strip, canonical tool JSON, prefix hash);
+   Claude Code tool semantics matrix; request-gzip compatibility probe
+   (low priority).
+
+## Review closeout (PR #7, this branch)
+
+- `optimize.rs`: new `ModelFamily` (Glm53 vs GenericOpenAi) resolved from
+  the upstream model id (segment match: `glm` or `glm<digit>`);
+  `optimize_request` dispatches — GLM gets the full policy, all other
+  models are a strict byte-passthrough (no effort injection, no cap, no
+  strip, no metadata removal). Tests: family detection edges
+  (`aglm-4`, `kaggle`), generic passthrough byte-equality.
+- `server.rs`: exact token telemetry moved from `tokio::spawn` (async
+  workers) to `tokio::task::spawn_blocking` bounded by a semaphore
+  (`glm53.telemetry.max_concurrent_token_counts`, default 1,
+  `try_acquire_owned` — busy slot = skip + log, never queue).
+  Saturation test: 10 concurrent requests + liveness ticker (max sleep
+  gap < 500 ms proves no worker stall). Telemetry naming fixed: removed
+  chunk tokenization is now logged as
+  `estimated_tokens_removed_historical_reasoning` (exact before/after
+  would need a second full tokenization; not paid in production).
+  GLM-only: `count_tokens` rejects non-GLM upstream models with an
+  explicit error instead of a wrong-template count.
+- Tests must resolve the `claude-sonnet-4-6` alias before the policy step
+  (mirrors the server); helpers in `anthropic.rs` tests and
+  `tests/glm53_policy.rs` updated.
 
 ## Commands
 

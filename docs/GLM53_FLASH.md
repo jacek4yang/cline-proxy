@@ -142,13 +142,37 @@ upstream supplies them (byte counters are never converted to tokens).
 
 With `glm53.telemetry.exact_input_tokens` (default on), the embedded
 official tokenizer computes the exact token count of the *optimized*
-request in a **background task** (never on the TTFT path) and logs
-`input_tokens`, `tokens_removed_historical_reasoning`, and the derived
-`saved_percent`. `/v1/messages/count_tokens` counts the optimized request
-the same way (header `x-cline-proxy-token-count: exact_glm53_optimized`)
-so Claude Code's context budgeting matches real upstream usage; the
-official-oracle count (thinking kept) remains available via
-`count_input_tokens` when the strip policy is disabled.
+request. Because the tokenizer is CPU-bound (hundreds of ms per megabyte),
+the count runs on the **blocking pool under a bounded semaphore**
+(`glm53.telemetry.max_concurrent_token_counts`, default 1) — never on a
+Tokio worker thread, and never queued unboundedly: when the slot is busy
+the count is skipped and logged as `token_telemetry_skipped_busy`. The log
+reports `input_tokens` (exact, post-strip), and
+`estimated_tokens_removed_historical_reasoning` — the tokenization of the
+removed reasoning chunks alone. That figure is an **estimate** of what the
+full pre-strip request would have cost (tokenizing isolated chunks differs
+slightly from a full-context pass; an exact before/after delta would
+require a second full 1 MB-scale tokenization per request, which
+production does not pay for). `/v1/messages/count_tokens` counts the
+optimized request the same way (header
+`x-cline-proxy-token-count: exact_glm53_optimized`) so Claude Code's
+context budgeting matches real upstream usage; the official-oracle count
+(thinking kept) remains available via `count_input_tokens` when the strip
+policy is disabled. The exact counter is GLM-only: requests for non-GLM
+upstream models are rejected with an explicit error rather than counted
+with the wrong template.
+
+## Model scoping
+
+All GLM policy (reasoning effort, output cap, historical strip,
+compaction) is resolved from the *upstream* model id and applies only to
+GLM. The family test is segment-based (`glm` alone or followed by a digit:
+`glm-5.3-flash`, `glm53`, `glm4.7`), so ids that merely contain "glm" as a
+substring of another token are not misclassified. Every other model gets a
+compatibility passthrough — the wire body is untouched — and
+`count_tokens` returns an explicit error instead of a GLM-shaped count.
+This is the thin end of a model-capability layer: adding a family means
+adding a new policy branch, not widening a global one.
 
 ## Known behavior notes
 

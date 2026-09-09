@@ -39,6 +39,10 @@ pub struct AppState {
     pub state_file: Option<Arc<PathBuf>>,
     pub persistence_healthy: Arc<AtomicBool>,
     pub started: Instant,
+    /// Bounding permits for the CPU-bound exact tokenizer background jobs
+    /// (`glm53.telemetry.max_concurrent_token_counts`). `None` disables the
+    /// accounting entirely, which is handled before acquisition.
+    pub token_count_permits: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl AppState {
@@ -81,12 +85,20 @@ impl AppState {
             }
         }
         let upstream = ClineUpstream::new(&config, pool)?;
+        let token_count_permits = if config.glm53.telemetry.exact_input_tokens {
+            Some(Arc::new(tokio::sync::Semaphore::new(
+                config.glm53.telemetry.max_concurrent_token_counts.max(1) as usize,
+            )))
+        } else {
+            None
+        };
         Ok(Self {
             config: Arc::new(config),
             upstream,
             state_file,
             persistence_healthy: Arc::new(AtomicBool::new(true)),
             started: Instant::now(),
+            token_count_permits,
         })
     }
 
@@ -361,12 +373,16 @@ async fn anthropic_messages(
     };
     converted.expose_thinking = optimization.expose_thinking;
     log_request_optimization(&request_id, "anthropic", &optimization);
-    spawn_exact_token_telemetry(
-        state.clone(),
-        body.clone(),
-        optimization.reasoning_effort,
-        request_id.clone(),
-    );
+    // Exact tokenizer telemetry is GLM-specific; generic-model requests have
+    // no embedded tokenizer and skip it entirely.
+    if optimization.model_family == optimize::ModelFamily::Glm53 {
+        spawn_exact_token_telemetry(
+            state.clone(),
+            body.clone(),
+            optimization.reasoning_effort,
+            request_id.clone(),
+        );
+    }
     let upstream_body = match serde_json::to_vec(&converted.body) {
         Ok(body) => Bytes::from(body),
         Err(_) => {
@@ -487,6 +503,18 @@ async fn anthropic_count_tokens(
     };
     let upstream_model = state.config.resolve_model(requested_model);
     let started = Instant::now();
+    // The exact counter embodies the GLM official template; non-GLM models
+    // have no exact counter and must not be silently counted as GLM prompts.
+    if optimize::ModelFamily::from_upstream_model(&upstream_model) != optimize::ModelFamily::Glm53 {
+        return anthropic_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_request_error",
+            format!(
+                "exact token counting is only available for GLM models (requested upstream model: {upstream_model})"
+            ),
+            &request_id,
+        );
+    }
     // Count what the gateway would actually send: historical thinking
     // stripped (when the policy strips) and the resolved reasoning effort
     // applied, so Claude Code's context budgeting matches real upstream
@@ -566,6 +594,10 @@ fn log_request_optimization(
     tracing::info!(
         request_id,
         protocol,
+        model_family = match optimization.model_family {
+            optimize::ModelFamily::Glm53 => "glm53",
+            optimize::ModelFamily::GenericOpenAi => "generic_openai",
+        },
         reasoning_effort = optimization.reasoning_effort,
         thinking_exposure = if optimization.expose_thinking {
             "exposed"
@@ -588,13 +620,17 @@ fn log_request_optimization(
 }
 
 /// Exact GLM-5.3-Flash token accounting for the optimized request, run in a
-/// background task so the embedded-official tokenizer (hundreds of ms on
-/// megabyte-scale prompts) never adds to TTFT. Reports:
+/// **bounded** `spawn_blocking` task so the embedded-official tokenizer (a
+/// CPU-bound, hundreds-of-ms job on megabyte-scale prompts) never occupies a
+/// Tokio worker thread or stacks up unbounded background work. Never on the
+/// TTFT path. Reports:
 /// - `input_tokens`: exact count of what is actually sent (historical
 ///   thinking stripped, resolved effort applied)
-/// - `tokens_removed_historical_reasoning`: exact tokenization of the
-///   stripped reasoning chunks
-/// - derived before/after ratio (before = after + removed)
+/// - `estimated_tokens_removed_historical_reasoning`: tokenization of the
+///   stripped reasoning chunks alone — an *estimate* of what the full request
+///   would have cost (exact would require a second full pass over the
+///   pre-strip request, which production does not pay for)
+/// - derived before/after ratio (before = after + removed estimate)
 fn spawn_exact_token_telemetry(
     state: AppState,
     request_bytes: Bytes,
@@ -604,7 +640,23 @@ fn spawn_exact_token_telemetry(
     if !state.config.glm53.telemetry.exact_input_tokens {
         return;
     }
-    tokio::spawn(async move {
+    let Some(permits) = state.token_count_permits.clone() else {
+        return;
+    };
+    // The tokenizer is embedded and CPU-bound; one permit at a time by
+    // default. When the permit is busy, telemetry is skipped rather than
+    // queued: losing a count beats piling up megabyte-scale jobs. The owned
+    // permit keeps the semaphore alive for the count's duration.
+    let Ok(permit) = permits.clone().try_acquire_owned() else {
+        tracing::info!(
+            request_id,
+            token_telemetry_skipped_busy = true,
+            "exact token telemetry skipped: another count is in flight"
+        );
+        return;
+    };
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         let started = Instant::now();
         let Ok(mut request) = serde_json::from_slice::<Value>(&request_bytes) else {
             return;
@@ -629,7 +681,7 @@ fn spawn_exact_token_telemetry(
             request_id,
             input_tokens,
             estimated_input_tokens_before = before_estimate,
-            tokens_removed_historical_reasoning = removed_tokens,
+            estimated_tokens_removed_historical_reasoning = removed_tokens,
             saved_percent,
             count_method = "exact_glm53_optimized",
             count_duration_ms = started.elapsed().as_millis(),
@@ -2383,6 +2435,84 @@ mod tests {
         assert_eq!(seen.len(), 7);
         assert_eq!(seen[6].authorization, "Bearer cline-key-6");
         std::fs::remove_dir_all(state_path.parent().unwrap()).ok();
+        task.abort();
+    }
+
+    /// The exact tokenizer is CPU-bound and runs on the blocking pool under
+    /// a semaphore. Saturation test: many concurrent large requests must all
+    /// complete, the semaphore must hold (never more permits in flight than
+    /// configured), and the async runtime must stay responsive throughout
+    /// (SSE mock polling keeps progressing while counts run).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn token_telemetry_saturation_keeps_runtime_responsive_and_bounded() {
+        let (base, mock, task) = start_mock().await;
+        mock.set(
+            "cline-key-1",
+            (0..10)
+                .map(|_| Spec::json(200, successful_json("ok")))
+                .collect(),
+        )
+        .await;
+        let mut config = test_config(base, 1);
+        config.glm53.telemetry.exact_input_tokens = true;
+        config.glm53.telemetry.max_concurrent_token_counts = 1;
+        let state = AppState::new(config).unwrap();
+        let app = router(state.clone());
+        // ~70 KB bodies with thinking history so each count does real
+        // tokenization work.
+        let history_text = "analysis step: inspect the tokenizer pipeline and the ".repeat(300);
+        let bodies = (0..10)
+            .map(|index| {
+                json!({
+                    "model":"claude-sonnet-4-6",
+                    "max_tokens":128,
+                    "messages":[
+                        {"role":"user","content":[{"type":"text","text":format!("task {index}")}]},
+                        {"role":"assistant","content":[
+                            {"type":"thinking","thinking":history_text,"signature":"s"},
+                            {"type":"text","text":"reading"}
+                        ]},
+                        {"role":"user","content":[{"type":"text","text":"go on"}]}
+                    ]
+                })
+                .to_string()
+            })
+            .collect::<Vec<_>>();
+        // Drive requests and a concurrent "SSE polling" ticker together. The
+        // assertion is not tick count (CPU contention with the tokenizer is
+        // expected and legitimate) but liveness: no single tick gap may
+        // stall, which is what an occupied Tokio worker would cause.
+        let ticker = tokio::spawn(async move {
+            let mut max_gap_ms: u128 = 0;
+            let started = Instant::now();
+            let mut last = started;
+            while started.elapsed() < Duration::from_secs(15) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                let now = Instant::now();
+                max_gap_ms = max_gap_ms.max(now.duration_since(last).as_millis());
+                last = now;
+            }
+            max_gap_ms
+        });
+        let responses = futures_util::future::join_all(bodies.into_iter().map(|body| {
+            let app = app.clone();
+            async move {
+                app.oneshot(gateway_request("/v1/messages", body))
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        }))
+        .await;
+        assert!(responses.iter().all(|status| *status == StatusCode::OK));
+        let max_gap_ms = ticker.await.unwrap();
+        // A 5 ms sleep waking with a multi-hundred-ms gap means an async
+        // worker was blocked by CPU-bound work. spawn_blocking keeps the
+        // workers free; allow generous CI variance.
+        assert!(
+            max_gap_ms < 500,
+            "async runtime stalled under tokenizer load: max tick gap {max_gap_ms}ms"
+        );
         task.abort();
     }
 

@@ -1527,11 +1527,17 @@ mod tests {
         Glm53Config::default()
     }
 
-    /// Convert + apply the GLM policy exactly as the server does.
+    /// Convert + apply the GLM policy exactly as the server does, including
+    /// alias resolution (claude-* ids map to the GLM upstream model).
     fn convert_and_optimize(
         bytes: &[u8],
     ) -> Result<(ConvertedRequest, crate::optimize::RequestOptimization), ProtocolError> {
         let mut converted = convert_request(bytes)?;
+        // Mirror the server: the alias "claude-sonnet-4-6" -> GLM upstream
+        // model is applied before the policy step.
+        if converted.model == "claude-sonnet-4-6" {
+            converted.body["model"] = Value::String("z-ai/glm-5.3-flash".into());
+        }
         let optimization = optimize_request(
             &mut converted.body,
             &test_glm_config(),
@@ -1614,7 +1620,7 @@ mod tests {
     fn requested_thinking_is_exposed_and_unrequested_reasoning_is_not() {
         let requested = convert_and_optimize(
             serde_json::to_vec(&json!({
-                "model":"m", "max_tokens":4_096,
+                "model":"z-ai/glm-5.3-flash", "max_tokens":4_096,
                 "thinking":{"type":"adaptive"},
                 "messages":[{"role":"user","content":"hi"}]
             }))
@@ -1628,7 +1634,7 @@ mod tests {
 
         let unrequested = convert_and_optimize(
             serde_json::to_vec(&json!({
-                "model":"m", "max_tokens":4_096,
+                "model":"z-ai/glm-5.3-flash", "max_tokens":4_096,
                 "messages":[{"role":"user","content":"hi"}]
             }))
             .unwrap()
@@ -1640,7 +1646,7 @@ mod tests {
 
         let disabled = convert_and_optimize(
             serde_json::to_vec(&json!({
-                "model":"m", "max_tokens":4_096,
+                "model":"z-ai/glm-5.3-flash", "max_tokens":4_096,
                 "thinking":{"type":"disabled"},
                 "messages":[{"role":"user","content":"hi"}]
             }))
@@ -1657,7 +1663,7 @@ mod tests {
     fn invalid_thinking_budgets_are_rejected_by_the_policy_step() {
         let result = convert_and_optimize(
             serde_json::to_vec(&json!({
-                "model":"m", "max_tokens":256,
+                "model":"z-ai/glm-5.3-flash", "max_tokens":256,
                 "thinking":{"type":"enabled","budget_tokens":4_096},
                 "messages":[{"role":"user","content":"hi"}]
             }))

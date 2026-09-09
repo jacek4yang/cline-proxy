@@ -131,7 +131,10 @@ Full rationale and evidence: `docs/GLM53_FLASH.md` and
   },
   "limits": { "max_output_tokens": 16384 },
   "context": { "safe_compaction": true },
-  "telemetry": { "exact_input_tokens": true }
+  "telemetry": {
+    "exact_input_tokens": true,
+    "max_concurrent_token_counts": 1
+  }
 }
 ```
 
@@ -156,13 +159,21 @@ Full rationale and evidence: `docs/GLM53_FLASH.md` and
   block -> string, empty blocks dropped, Anthropic-only `metadata` dropped).
   Tool results are never truncated and tool schemas are never edited;
   Claude Code keeps full ownership of context compaction.
+- **Model-scoped policy.** The GLM semantics above apply only when the
+  resolved *upstream* model is a GLM id (`glm*` segment detection).
+  Every other OpenAI-compatible model passes through byte-for-byte: no
+  injected `reasoning_effort`, no output cap, no message rewriting, no
+  metadata removal. Unknown models fail safe toward compatibility, never
+  toward GLM semantics.
 - **Telemetry**: per-request byte breakdown and policy decisions
-  (`request optimization` log), per-stream reasoning/text/tool-call byte
-  accounting with first-tool-call latency, upstream usage tokens
-  (`prompt/completion/cached/reasoning`) when provided, and an exact GLM
-  token count of the optimized request computed in a background task
-  (`exact GLM token accounting` log). Logs contain sizes/counts only,
-  never prompt content.
+  (`request optimization` log, including the model family), per-stream
+  reasoning/text/tool-call byte accounting with first-tool-call latency,
+  upstream usage tokens (`prompt/completion/cached/reasoning`) when
+  provided, and an exact GLM token count of the optimized request. The
+  tokenizer is CPU-bound, so the count runs on the **blocking pool under a
+  semaphore** (`max_concurrent_token_counts`, default 1) — never on a Tokio
+  worker and never queued unboundedly; when the slot is busy the count is
+  skipped and logged. Logs contain sizes/counts only, never prompt content.
 
 ## Key stickiness and persisted quota state
 
