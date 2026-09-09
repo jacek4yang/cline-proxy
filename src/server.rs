@@ -1,8 +1,10 @@
 //! Axum routes, authentication, protocol dispatch, and graceful shutdown.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use axum::body::Body;
@@ -18,9 +20,12 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 
 use crate::anthropic::{self, ProtocolError};
-use crate::config::Config;
+use crate::cache;
+use crate::config::{defaults, Config};
+use crate::optimize;
 use crate::pool::KeyPool;
 use crate::redaction::{sanitize_json, sanitize_text};
+use crate::state::{self, StateLoadOutcome};
 use crate::upstream::{
     transport_error_class, BufferedUpstreamError, ClineUpstream, UpstreamError, UpstreamResponse,
     UpstreamResult,
@@ -32,20 +37,115 @@ const MAX_UPSTREAM_BODY_BYTES: usize = 16 * 1024 * 1024;
 pub struct AppState {
     pub config: Arc<Config>,
     pub upstream: ClineUpstream,
+    pub state_file: Option<Arc<PathBuf>>,
+    pub persistence_healthy: Arc<AtomicBool>,
+    pub started: Instant,
+    /// Bounding permits for the CPU-bound exact tokenizer background jobs
+    /// (`glm53.telemetry.max_concurrent_token_counts`). `None` disables the
+    /// accounting entirely, which is handled before acquisition.
+    pub token_count_permits: Option<Arc<tokio::sync::Semaphore>>,
+    /// Bounded memory-only shadow store for in-turn tool-loop reasoning
+    /// (`glm53.reasoning.shadow_current_turn`). `None` disables restore.
+    pub reasoning_shadow: Option<Arc<crate::reasoning_shadow::ReasoningShadowStore>>,
+    /// Bounded non-blocking JSONL log queue (issue #16). `None` disables
+    /// file logging; console summary logging always works.
+    pub log_sink: Option<crate::obs::LogSink>,
 }
 
 impl AppState {
     pub fn new(config: Config) -> Result<Self> {
+        Self::with_log_sink(config, None)
+    }
+
+    /// Production constructor also wires the adaptive JSONL log sink
+    /// (issue #16); tests construct without it.
+    pub fn with_log_sink(config: Config, log_sink: Option<crate::obs::LogSink>) -> Result<Self> {
         config.validate()?;
         let pool = KeyPool::new(&config.cline_api_keys);
         if pool.is_empty() {
             anyhow::bail!("at least one enabled Cline API key is required");
         }
+        let state_file = config.state_file_path().map(|path| Arc::new(path.clone()));
+        if let Some(path) = &state_file {
+            match state::load(path) {
+                StateLoadOutcome::Loaded(persisted) => {
+                    let summary = pool.restore(&persisted);
+                    tracing::info!(
+                        state_file = %path.display(),
+                        restored_cooldowns = summary.restored_cooldowns,
+                        expired_entries = summary.expired_entries,
+                        unknown_entries = summary.unknown_entries,
+                        restored_active_key = summary.restored_active_key.as_deref().unwrap_or(""),
+                        "runtime state loaded"
+                    );
+                }
+                StateLoadOutcome::Missing => {
+                    tracing::info!(
+                        state_file = %path.display(),
+                        "runtime state file not present; starting with empty state"
+                    );
+                }
+                StateLoadOutcome::Corrupt(reason) => {
+                    // Corrupt state is advisory only; never block startup and
+                    // never echo file contents (defense against unexpected
+                    // secret-shaped data in a damaged file).
+                    tracing::warn!(
+                        state_file = %path.display(),
+                        reason,
+                        "runtime state file was unreadable; starting with empty state"
+                    );
+                }
+            }
+        }
         let upstream = ClineUpstream::new(&config, pool)?;
+        let token_count_permits = if config.glm53.telemetry.exact_input_tokens {
+            Some(Arc::new(tokio::sync::Semaphore::new(
+                config.glm53.telemetry.max_concurrent_token_counts.max(1) as usize,
+            )))
+        } else {
+            None
+        };
+        let reasoning_shadow = if config.glm53.reasoning.shadow_current_turn {
+            Some(Arc::new(
+                crate::reasoning_shadow::ReasoningShadowStore::new(
+                    crate::reasoning_shadow::ShadowLimits::default(),
+                ),
+            ))
+        } else {
+            None
+        };
         Ok(Self {
             config: Arc::new(config),
             upstream,
+            state_file,
+            persistence_healthy: Arc::new(AtomicBool::new(true)),
+            started: Instant::now(),
+            token_count_permits,
+            reasoning_shadow,
+            log_sink,
         })
+    }
+
+    /// One synchronous debounced-state flush. Called by the writer task and
+    /// once more during graceful shutdown. Never called on the request path.
+    pub fn flush_runtime_state(&self) {
+        let Some(path) = self.state_file.as_ref() else {
+            return;
+        };
+        let persisted = self.upstream.pool().persisted_state();
+        match state::store(path, &persisted) {
+            Ok(()) => {
+                self.persistence_healthy.store(true, Ordering::Relaxed);
+            }
+            Err(error) => {
+                self.persistence_healthy.store(false, Ordering::Relaxed);
+                tracing::error!(
+                    state_file = %path.display(),
+                    error = %error,
+                    "failed to persist runtime state; cooldowns will be lost on restart"
+                );
+            }
+        }
     }
 }
 
@@ -56,6 +156,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/messages/count_tokens", post(anthropic_count_tokens))
         .route("/v1/chat/completions", post(openai_chat))
         .route("/v1/models", get(models))
+        .route("/admin/status", get(admin_status))
         .layer(DefaultBodyLimit::max(max_request_bytes))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -79,6 +180,51 @@ async fn readyz(State(state): State<AppState>) -> Response {
         return (StatusCode::SERVICE_UNAVAILABLE, "not ready\n").into_response();
     }
     (StatusCode::OK, "ready\n").into_response()
+}
+
+/// Authenticated, read-only operational snapshot. Never returns key material,
+/// authorization values, or raw upstream error text.
+async fn admin_status(State(state): State<AppState>) -> Response {
+    let pool = state.upstream.pool();
+    let keys = pool
+        .snapshots()
+        .into_iter()
+        .map(|snapshot| {
+            json!({
+                "name": snapshot.name.as_ref(),
+                "state": snapshot.phase.as_str(),
+                "cooldown_remaining_seconds": snapshot.cooldown_remaining.map(|d| d.as_secs()),
+                "cooldown_until_unix": snapshot.cooldown_until
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_secs()),
+                "rate_limit_kind": snapshot.rate_limit_kind.map(|kind| kind.as_str()),
+                "rate_limited_model": snapshot.last_429_model.as_deref().unwrap_or(""),
+                "last_429_at_unix": snapshot.last_429_at
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_secs()),
+                "last_success_at_unix": snapshot.last_success_at
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_secs()),
+                "requests": snapshot.requests,
+                "successes": snapshot.successes,
+                "rate_limits": snapshot.rate_limits,
+            })
+        })
+        .collect::<Vec<_>>();
+    let body = json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "uptime_seconds": state.started.elapsed().as_secs(),
+        "default_model": state.config.models.default,
+        "active_key": pool.active_key_name().map(|name| name.to_string()),
+        "active_key_age_seconds": pool.active_age().as_secs(),
+        "state_persistence": {
+            "enabled": state.state_file.is_some(),
+            "healthy": state.persistence_healthy.load(Ordering::Relaxed),
+        },
+        "keys": keys,
+    });
+    let request_id = "req_admin_status";
+    json_response(StatusCode::OK, body, request_id)
 }
 
 async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -171,6 +317,33 @@ async fn openai_chat(
     };
     let upstream_model = state.config.resolve_model(&requested_model);
     object.insert("model".into(), Value::String(upstream_model.clone()));
+    // GLM policy for OpenAI-protocol clients: explicit reasoning effort
+    // (default high, never unset), bounded output, historical-reasoning
+    // strip, safe compaction.
+    let optimization =
+        match optimize::optimize_request(&mut value, &state.config.glm53, optimize::Origin::OpenAi)
+        {
+            Ok(optimization) => optimization,
+            Err(message) => return openai_error(StatusCode::BAD_REQUEST, message, &request_id),
+        };
+    // Canonicalize historical tool-call argument JSON for byte-stable
+    // prefixes (config-gated; plain-text content is never touched).
+    let canonicalized = if state.config.glm53.context.canonical_tool_json {
+        cache::canonicalize_tool_arguments(
+            value.as_object_mut().unwrap_or(&mut serde_json::Map::new()),
+        )
+    } else {
+        0
+    };
+    let prefix_telemetry = cache::log_prefix_telemetry(&value, None, &request_id);
+    log_request_optimization(
+        &request_id,
+        "openai",
+        &optimization,
+        0,
+        canonicalized,
+        &prefix_telemetry,
+    );
     let upstream_body = match serde_json::to_vec(&value) {
         Ok(body) => Bytes::from(body),
         Err(_) => {
@@ -218,6 +391,119 @@ async fn anthropic_messages(
     let requested_model = converted.model.clone();
     let upstream_model = state.config.resolve_model(&requested_model);
     anthropic::apply_model(&mut converted, upstream_model.clone());
+    // Prefix stability (issue #8): remove the volatile leading
+    // x-anthropic-billing-header line before anything else observes the
+    // system text, so the wire body, count_tokens, and the prefix hash all
+    // see the same normalized system.
+    let billing_header_bytes_removed = if state.config.glm53.context.strip_volatile_billing_header {
+        anthropic::normalize_system_messages(&mut converted.body)
+    } else {
+        0
+    };
+    // Session fingerprint: extracted from metadata (if present) before the
+    // GLM policy may drop it; only the HMAC fingerprint is ever logged.
+    let session_fp = state
+        .config
+        .glm53
+        .telemetry
+        .prefix_hash
+        .then(|| cache::extract_session_fingerprint(&body, &state.config.server.api_key))
+        .flatten();
+    // Reasoning shadow restore (issue #10): when the client did not request
+    // thinking and a stable session identity exists, in-epoch reasoning for
+    // this conversation's tool calls is restored onto the matching
+    // assistant messages. Restored reasoning lives in the current epoch, so
+    // the strip step preserves it. The restore must run BEFORE the GLM
+    // policy (which strips historical thinking) sees the messages.
+    let shadow_eligible = state.config.glm53.reasoning.shadow_current_turn
+        && !matches!(
+            converted
+                .thinking
+                .as_ref()
+                .and_then(|t| t.get("type"))
+                .and_then(Value::as_str),
+            Some("enabled") | Some("adaptive")
+        );
+    if let (Some(shadow), Some(fp)) = (
+        state.reasoning_shadow.as_ref().filter(|_| shadow_eligible),
+        session_fp.as_deref(),
+    ) {
+        // A request whose newest message is a plain human user turn starts
+        // a new reasoning epoch: previous-epoch shadow state is dropped.
+        if request_starts_new_epoch(&converted.body) {
+            shadow.clear_session(fp);
+        } else if let Some(object) = converted.body.as_object_mut() {
+            shadow.restore_into(object, fp);
+        }
+    }
+    // GLM policy: explicit reasoning effort (default high, never unset),
+    // bounded output, historical-thinking strip, safe compaction, and the
+    // per-request size breakdown telemetry.
+    let optimization = match optimize::optimize_request(
+        &mut converted.body,
+        &state.config.glm53,
+        optimize::Origin::Anthropic {
+            thinking: converted.thinking.as_ref(),
+            output_effort: converted.output_effort.as_deref(),
+        },
+    ) {
+        Ok(optimization) => optimization,
+        Err(message) => {
+            return anthropic_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                message,
+                &request_id,
+            )
+        }
+    };
+    converted.expose_thinking = optimization.expose_thinking;
+    // Canonicalize historical tool-call argument JSON for byte-stable
+    // prefixes (config-gated; plain-text content is never touched). The
+    // converted body is always an object at this point.
+    let canonicalized = if state.config.glm53.context.canonical_tool_json {
+        converted
+            .body
+            .as_object_mut()
+            .map(cache::canonicalize_tool_arguments)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let prefix_telemetry =
+        cache::log_prefix_telemetry(&converted.body, session_fp.as_deref(), &request_id);
+    log_request_optimization(
+        &request_id,
+        "anthropic",
+        &optimization,
+        billing_header_bytes_removed,
+        canonicalized,
+        &prefix_telemetry,
+    );
+    // Exact tokenizer telemetry is GLM-specific; generic-model requests have
+    // no embedded tokenizer and skip it entirely.
+    if optimization.model_family == optimize::ModelFamily::Glm53 {
+        spawn_exact_token_telemetry(
+            state.clone(),
+            body.clone(),
+            optimization.reasoning_effort,
+            request_id.clone(),
+        );
+    }
+    // Cline upstream strategy (issue #14): streaming is the verified
+    // canonical upstream transport. A downstream non-stream request is
+    // served by ONE upstream streaming request aggregated locally — the
+    // decision is made BEFORE the request is sent, so a response-shape
+    // mismatch can never be recovered by paying for a second generation.
+    // Only the transport flags change; every cache-relevant field
+    // (system, tools, messages, effort, max_tokens) is untouched.
+    let upstream_stream = true;
+    if !converted.stream {
+        if let Some(object) = converted.body.as_object_mut() {
+            object.insert("stream".into(), Value::Bool(true));
+            object.insert("stream_options".into(), json!({"include_usage":true}));
+        }
+    }
     let upstream_body = match serde_json::to_vec(&converted.body) {
         Ok(body) => Bytes::from(body),
         Err(_) => {
@@ -229,31 +515,117 @@ async fn anthropic_messages(
             )
         }
     };
-    tracing::info!(
+    let upstream_request_bytes = upstream_body.len();
+    tracing::debug!(
         request_id,
         protocol = "anthropic",
         requested_model,
         upstream_model,
-        stream = converted.stream,
-        request_bytes = upstream_body.len(),
+        downstream_stream = converted.stream,
+        upstream_stream,
+        upstream_strategy = if converted.stream {
+            "native_streaming"
+        } else {
+            "stream_and_aggregate"
+        },
+        request_bytes = body.len(),
+        upstream_request_bytes = upstream_body.len(),
         "client request accepted"
     );
     let started = Instant::now();
+    // Adaptive observability (issue #16): ONE summary per request. For
+    // streams the static context moves into the stream and emits at close;
+    // for non-stream the handler emits directly after conversion.
+    let stream_summary = crate::obs::StreamSummary {
+        sink: state.log_sink.clone(),
+        session: session_fp.clone(),
+        requested_model: requested_model.clone(),
+        upstream_model: upstream_model.clone(),
+        model_family: if optimize::ModelFamily::from_upstream_model(&upstream_model)
+            == optimize::ModelFamily::Glm53
+        {
+            "glm53"
+        } else {
+            "generic_openai"
+        },
+        downstream_stream: converted.stream,
+        upstream_strategy: if converted.stream {
+            "native_streaming"
+        } else {
+            "stream_and_aggregate"
+        },
+        started,
+        slow_ttft_ms: state.config.logging.slow_ttft_ms,
+        slow_duration_ms: state.config.logging.slow_duration_ms,
+        reasoning_effort: optimization.reasoning_effort,
+        expose_thinking: optimization.expose_thinking,
+        client_max_tokens: optimization.client_max_tokens,
+        effective_max_tokens: optimization.effective_max_tokens,
+        request_bytes: body.len(),
+        upstream_request_bytes,
+        system_bytes: optimization.system_bytes,
+        messages_bytes: optimization.messages_bytes,
+        tools_bytes: optimization.tools_bytes,
+        historical_reasoning_bytes_removed: optimization.historical_reasoning_bytes_removed,
+        billing_header_bytes_removed,
+        canonicalized_arguments: canonicalized,
+    };
     let result = match state
         .upstream
-        .send_chat(
-            upstream_body,
-            converted.stream,
-            &request_id,
-            &upstream_model,
-        )
+        .send_chat(upstream_body, upstream_stream, &request_id, &upstream_model)
         .await
     {
         Ok(result) => result,
-        Err(error) => return upstream_failure(&state, error, true, &request_id),
+        Err(error) => {
+            // Transport failure: emit an anomalous summary (no key selected).
+            let mut builder = crate::obs::SummaryBuilder::new(
+                &request_id,
+                "anthropic",
+                requested_model.clone(),
+                upstream_model.clone(),
+                stream_summary.model_family,
+                session_fp.clone(),
+                converted.stream,
+                stream_summary.upstream_strategy,
+                started,
+                state.config.logging.slow_ttft_ms,
+                state.config.logging.slow_duration_ms,
+            );
+            builder.record(crate::obs::FlightEventKind::UpstreamInterrupted);
+            builder.mark_anomalous("transport_error");
+            builder.emit(
+                state.log_sink.as_ref(),
+                "(no key)",
+                0,
+                0,
+                optimization.reasoning_effort,
+                optimization.expose_thinking,
+                optimization.client_max_tokens,
+                optimization.effective_max_tokens,
+                body.len(),
+                0,
+                optimization.system_bytes,
+                optimization.messages_bytes,
+                optimization.tools_bytes,
+                optimization.historical_reasoning_bytes_removed,
+                billing_header_bytes_removed,
+                canonicalized,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                "upstream_error",
+            );
+            return upstream_failure(&state, error, true, &request_id);
+        }
     };
     let status = result.response.status();
-    tracing::info!(
+    tracing::debug!(
         request_id,
         selected_key_name = %result.selected.name,
         selected_key_index = result.selected.configured_index,
@@ -269,6 +641,17 @@ async fn anthropic_messages(
         }
     };
     if converted.stream {
+        // Reasoning shadow context (issue #10): accumulate unexposed
+        // reasoning during the stream and commit it on completion.
+        let shadow_context = state
+            .reasoning_shadow
+            .as_ref()
+            .zip(session_fp.clone())
+            .filter(|_| shadow_eligible)
+            .map(|(store, fp)| anthropic::StreamShadowContext {
+                store: store.clone(),
+                session_fingerprint: fp,
+            });
         let mut response = Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/event-stream")
@@ -276,23 +659,201 @@ async fn anthropic_messages(
             .header("x-accel-buffering", "no")
             .body(anthropic::stream_body(
                 response,
-                request_id.clone(),
-                upstream_model,
-                result.selected.name.to_string(),
-                started,
-                state.config.runtime.stream_progress_secs,
+                anthropic::StreamOptions {
+                    request_id: request_id.clone(),
+                    fallback_model: upstream_model,
+                    key_name: result.selected.name.to_string(),
+                    request_started: started,
+                    progress_secs: state.config.runtime.stream_progress_secs,
+                    expose_thinking: converted.expose_thinking,
+                    shadow: shadow_context,
+                    summary: Some(stream_summary.clone()),
+                },
             ))
             .unwrap_or_else(|_| Response::new(Body::empty()));
         insert_request_id(response.headers_mut(), &request_id);
         return response;
     }
-    let value = match anthropic::parse_json_response(response).await {
-        Ok(value) => value,
-        Err(error) => return protocol_error(error, StatusCode::BAD_GATEWAY, &request_id),
-    };
-    match anthropic::convert_response(&value, &request_id, &upstream_model) {
-        Ok(value) => json_response(StatusCode::OK, value, &request_id),
-        Err(error) => protocol_error(error, StatusCode::BAD_GATEWAY, &request_id),
+    // Downstream non-stream: aggregate the upstream stream (issue #14).
+    let (value, response_shape, first_event_ms, upstream_duration_ms) =
+        match anthropic::aggregate_stream_response(response, &request_id).await {
+            Ok(parts) => parts,
+            Err(error) => {
+                // A malformed or unusable 2xx body is a provider protocol
+                // error, never a key-quota signal: 502 without rotation.
+                let mut builder = crate::obs::SummaryBuilder::new(
+                    &request_id,
+                    "anthropic",
+                    requested_model.clone(),
+                    upstream_model.clone(),
+                    stream_summary.model_family,
+                    session_fp.clone(),
+                    false,
+                    "stream_and_aggregate",
+                    started,
+                    state.config.logging.slow_ttft_ms,
+                    state.config.logging.slow_duration_ms,
+                );
+                builder.record(crate::obs::FlightEventKind::ProtocolError);
+                builder.mark_anomalous("protocol_error");
+                builder.emit(
+                    state.log_sink.as_ref(),
+                    &result.selected.name,
+                    result.attempt as u64,
+                    result.failover_count as u64,
+                    optimization.reasoning_effort,
+                    optimization.expose_thinking,
+                    optimization.client_max_tokens,
+                    optimization.effective_max_tokens,
+                    body.len(),
+                    upstream_request_bytes,
+                    optimization.system_bytes,
+                    optimization.messages_bytes,
+                    optimization.tools_bytes,
+                    optimization.historical_reasoning_bytes_removed,
+                    billing_header_bytes_removed,
+                    canonicalized,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    "protocol_error",
+                );
+                return protocol_error(error, StatusCode::BAD_GATEWAY, &request_id);
+            }
+        };
+    let aggregation_timings = (
+        first_event_ms,
+        response_shape,
+        None::<u128>,
+        upstream_duration_ms,
+    );
+    tracing::debug!(
+        request_id,
+        downstream_stream = false,
+        upstream_strategy = "stream_and_aggregate",
+        response_shape = aggregation_timings.1.as_str(),
+        upstream_first_event_ms = first_event_ms.unwrap_or(0),
+        upstream_duration_ms,
+        aggregate_ms = started.elapsed().as_millis(),
+        "upstream stream aggregated for non-stream client"
+    );
+    // Reasoning shadow store (issue #10): remember in-turn reasoning that
+    // issued tool calls so the next request in this epoch can restore it.
+    store_reasoning_shadow(
+        &state,
+        value.as_object(),
+        session_fp.as_deref(),
+        &request_id,
+    );
+    let convert_started = std::time::Instant::now();
+    match anthropic::convert_response(
+        &value,
+        &request_id,
+        &upstream_model,
+        converted.expose_thinking,
+    ) {
+        Ok(value) => {
+            // Adaptive observability (issue #16): single summary emission
+            // for the non-stream path.
+            let mut builder = crate::obs::SummaryBuilder::new(
+                &request_id,
+                "anthropic",
+                requested_model.clone(),
+                upstream_model.clone(),
+                stream_summary.model_family,
+                session_fp.clone(),
+                false,
+                "stream_and_aggregate",
+                started,
+                state.config.logging.slow_ttft_ms,
+                state.config.logging.slow_duration_ms,
+            );
+            if aggregation_timings.0.is_some() {
+                builder.record(crate::obs::FlightEventKind::FirstUpstreamEvent);
+            }
+            builder.emit(
+                state.log_sink.as_ref(),
+                &result.selected.name,
+                result.attempt as u64,
+                result.failover_count as u64,
+                optimization.reasoning_effort,
+                optimization.expose_thinking,
+                optimization.client_max_tokens,
+                optimization.effective_max_tokens,
+                body.len(),
+                upstream_request_bytes,
+                optimization.system_bytes,
+                optimization.messages_bytes,
+                optimization.tools_bytes,
+                optimization.historical_reasoning_bytes_removed,
+                billing_header_bytes_removed,
+                canonicalized,
+                value.get("usage"),
+                aggregation_timings.0,
+                None,
+                None,
+                aggregation_timings.2,
+                aggregation_timings.0,
+                Some(aggregation_timings.3),
+                Some(aggregation_timings.1.as_str()),
+                Some(200),
+                "complete",
+            );
+            let _ = convert_started;
+            json_response(StatusCode::OK, value, &request_id)
+        }
+        Err(error) => {
+            let mut builder = crate::obs::SummaryBuilder::new(
+                &request_id,
+                "anthropic",
+                requested_model.clone(),
+                upstream_model.clone(),
+                stream_summary.model_family,
+                session_fp.clone(),
+                false,
+                "stream_and_aggregate",
+                started,
+                state.config.logging.slow_ttft_ms,
+                state.config.logging.slow_duration_ms,
+            );
+            builder.record(crate::obs::FlightEventKind::ProtocolError);
+            builder.mark_anomalous("protocol_error");
+            builder.emit(
+                state.log_sink.as_ref(),
+                &result.selected.name,
+                result.attempt as u64,
+                result.failover_count as u64,
+                optimization.reasoning_effort,
+                optimization.expose_thinking,
+                optimization.client_max_tokens,
+                optimization.effective_max_tokens,
+                body.len(),
+                upstream_request_bytes,
+                optimization.system_bytes,
+                optimization.messages_bytes,
+                optimization.tools_bytes,
+                optimization.historical_reasoning_bytes_removed,
+                billing_header_bytes_removed,
+                canonicalized,
+                None,
+                aggregation_timings.0,
+                None,
+                None,
+                aggregation_timings.2,
+                aggregation_timings.0,
+                Some(aggregation_timings.3),
+                Some(aggregation_timings.1.as_str()),
+                Some(200),
+                "protocol_error",
+            );
+            protocol_error(error, StatusCode::BAD_GATEWAY, &request_id)
+        }
     }
 }
 
@@ -330,9 +891,74 @@ async fn anthropic_count_tokens(
         );
     };
     let upstream_model = state.config.resolve_model(requested_model);
-    let count = match anthropic::approximate_input_tokens(&body) {
-        Ok(count) => count,
-        Err(error) => return protocol_error(error, StatusCode::BAD_REQUEST, &request_id),
+    let started = Instant::now();
+    // The exact counter embodies the GLM official template; non-GLM models
+    // have no exact counter and must not be silently counted as GLM prompts.
+    if optimize::ModelFamily::from_upstream_model(&upstream_model) != optimize::ModelFamily::Glm53 {
+        return anthropic_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_request_error",
+            format!(
+                "exact token counting is only available for GLM models (requested upstream model: {upstream_model})"
+            ),
+            &request_id,
+        );
+    }
+    // Count what the gateway would actually send: the volatile billing
+    // header stripped (same normalization as the wire path — issue #8),
+    // historical thinking stripped (when the policy strips), and the
+    // resolved reasoning effort applied, so Claude Code's context budgeting
+    // matches real upstream usage. Falls back to the official-oracle count
+    // when the policies are disabled.
+    let mut counted = value.clone();
+    if state.config.glm53.context.strip_volatile_billing_header {
+        // The count pipeline consumes the *Anthropic* shape, so the
+        // system-level strip is applied to the `system` field directly.
+        cache::strip_billing_header_in_anthropic_system(&mut counted);
+    }
+    if state.config.glm53.reasoning.strip_historical_thinking {
+        optimize::strip_anthropic_thinking(&mut counted);
+    }
+    let effort = match crate::glm53::reasoning::resolve_reasoning_policy(
+        value.get("thinking"),
+        value
+            .get("output_config")
+            .and_then(|config| config.get("effort"))
+            .and_then(Value::as_str),
+        value
+            .get("max_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(u64::MAX),
+        state.config.glm53.reasoning.default_effort,
+        state.config.glm53.reasoning.adaptive_effort,
+        state.config.glm53.reasoning.expose_thinking,
+    ) {
+        Ok(policy) => policy,
+        Err(message) => {
+            return anthropic_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                message,
+                &request_id,
+            )
+        }
+    };
+    let count_method = if state.config.glm53.reasoning.strip_historical_thinking {
+        counted["output_config"] = json!({"effort": effort.effort.as_str()});
+        "exact_glm53_optimized"
+    } else {
+        "exact_glm53"
+    };
+    let (count, count_method) = match crate::glm53::count::count_input_tokens(&counted) {
+        Ok(count) => (count, count_method),
+        Err(error) => {
+            return anthropic_error(
+                StatusCode::BAD_REQUEST,
+                error.error_type,
+                error.message,
+                &request_id,
+            )
+        }
     };
     tracing::info!(
         request_id,
@@ -340,15 +966,203 @@ async fn anthropic_count_tokens(
         requested_model,
         upstream_model,
         input_tokens = count,
-        token_count = "local_approximation",
+        token_count = count_method,
+        count_micros = started.elapsed().as_micros(),
         "token count completed"
     );
     let mut response = json_response(StatusCode::OK, json!({"input_tokens":count}), &request_id);
-    response.headers_mut().insert(
-        "x-cline-proxy-token-count",
-        HeaderValue::from_static("approximate"),
-    );
+    if let Ok(value) = HeaderValue::from_str(count_method) {
+        response
+            .headers_mut()
+            .insert("x-cline-proxy-token-count", value);
+    }
     response
+}
+
+/// True when the newest message of the converted OpenAI body is a plain
+/// human user message (not a tool result): the request starts a new
+/// reasoning epoch (issue #10).
+fn request_starts_new_epoch(openai_body: &Value) -> bool {
+    let Some(messages) = openai_body.get("messages").and_then(Value::as_array) else {
+        return false;
+    };
+    let Some(last) = messages.last() else {
+        return false;
+    };
+    last.get("role").and_then(Value::as_str) == Some("user")
+}
+
+/// Reasoning shadow store (issue #10): extract reasoning + tool-call ids
+/// from a completed upstream (non-stream) response and remember them for
+/// the next request in the same reasoning epoch. A response WITHOUT tool
+/// calls is a final answer: the session's shadow entries are cleared.
+/// Reasoning content is never logged.
+fn store_reasoning_shadow(
+    state: &AppState,
+    upstream: Option<&serde_json::Map<String, Value>>,
+    session_fp: Option<&str>,
+    request_id: &str,
+) {
+    let Some(shadow) = state.reasoning_shadow.as_ref() else {
+        return;
+    };
+    let Some(fp) = session_fp else {
+        return;
+    };
+    let Some(message) = upstream
+        .and_then(|value| value.get("choices"))
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .and_then(Value::as_object)
+    else {
+        return;
+    };
+    let reasoning = anthropic::reasoning_text_from_message(message);
+    let call_ids: Vec<String> = message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .map(|calls| {
+            calls
+                .iter()
+                .filter_map(|call| {
+                    call.get("id")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if call_ids.is_empty() {
+        // Final answer: the reasoning epoch ended; drop shadow state.
+        shadow.clear_session(fp);
+        return;
+    }
+    if !reasoning.is_empty() {
+        shadow.store(fp, &call_ids, &reasoning);
+    }
+    tracing::debug!(
+        request_id,
+        session = fp,
+        shadow_tool_calls = call_ids.len(),
+        shadow_reasoning_bytes = reasoning.len(),
+        "reasoning shadow store updated"
+    );
+}
+
+/// One log line attributing where request bytes went and what the GLM
+/// policy decided. Sizes and counts only — never request content.
+fn log_request_optimization(
+    request_id: &str,
+    protocol: &str,
+    optimization: &optimize::RequestOptimization,
+    billing_header_bytes_removed: u64,
+    canonicalized_arguments: usize,
+    prefix_telemetry: &(String, usize),
+) {
+    // Detail remains available at debug level; the per-request console
+    // surface is the single summary line (issue #16).
+    tracing::debug!(
+        request_id,
+        protocol,
+        model_family = match optimization.model_family {
+            optimize::ModelFamily::Glm53 => "glm53",
+            optimize::ModelFamily::GenericOpenAi => "generic_openai",
+        },
+        reasoning_effort = optimization.reasoning_effort,
+        thinking_exposure = if optimization.expose_thinking {
+            "exposed"
+        } else {
+            "suppressed"
+        },
+        client_max_tokens = optimization.client_max_tokens.unwrap_or(0),
+        effective_max_tokens = optimization.effective_max_tokens.unwrap_or(0),
+        openai_bytes_before = optimization.before_bytes,
+        openai_bytes_after = optimization.after_bytes,
+        system_bytes = optimization.system_bytes,
+        messages_bytes = optimization.messages_bytes,
+        tools_bytes = optimization.tools_bytes,
+        other_bytes = optimization.other_bytes(),
+        historical_reasoning_bytes_removed = optimization.historical_reasoning_bytes_removed,
+        billing_header_bytes_removed,
+        canonicalized_arguments,
+        empty_blocks_removed = optimization.empty_blocks_removed,
+        normalized_text_blocks = optimization.normalized_text_blocks,
+        prefix_hash = %prefix_telemetry.0,
+        prefix_bytes = prefix_telemetry.1,
+        "request optimization"
+    );
+}
+
+/// Exact GLM-5.3-Flash token accounting for the optimized request, run in a
+/// **bounded** `spawn_blocking` task so the embedded-official tokenizer (a
+/// CPU-bound, hundreds-of-ms job on megabyte-scale prompts) never occupies a
+/// Tokio worker thread or stacks up unbounded background work. Never on the
+/// TTFT path. Reports:
+/// - `input_tokens`: exact count of what is actually sent (historical
+///   thinking stripped, resolved effort applied)
+/// - `estimated_tokens_removed_historical_reasoning`: tokenization of the
+///   stripped reasoning chunks alone — an *estimate* of what the full request
+///   would have cost (exact would require a second full pass over the
+///   pre-strip request, which production does not pay for)
+/// - derived before/after ratio (before = after + removed estimate)
+fn spawn_exact_token_telemetry(
+    state: AppState,
+    request_bytes: Bytes,
+    reasoning_effort: &'static str,
+    request_id: String,
+) {
+    if !state.config.glm53.telemetry.exact_input_tokens {
+        return;
+    }
+    let Some(permits) = state.token_count_permits.clone() else {
+        return;
+    };
+    // The tokenizer is embedded and CPU-bound; one permit at a time by
+    // default. When the permit is busy, telemetry is skipped rather than
+    // queued: losing a count beats piling up megabyte-scale jobs. The owned
+    // permit keeps the semaphore alive for the count's duration.
+    let Ok(permit) = permits.clone().try_acquire_owned() else {
+        tracing::info!(
+            request_id,
+            token_telemetry_skipped_busy = true,
+            "exact token telemetry skipped: another count is in flight"
+        );
+        return;
+    };
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let started = Instant::now();
+        let Ok(mut request) = serde_json::from_slice::<Value>(&request_bytes) else {
+            return;
+        };
+        let removed_tokens = match optimize::removed_reasoning_tokens(&request) {
+            Ok(tokens) => tokens,
+            Err(_) => return, // uncountable content; bytes telemetry still applies
+        };
+        optimize::strip_anthropic_thinking(&mut request);
+        // Align the count with the effort actually placed on the wire.
+        request["output_config"] = json!({"effort": reasoning_effort});
+        let Ok(input_tokens) = crate::glm53::count::count_input_tokens(&request) else {
+            return;
+        };
+        let before_estimate = u64::from(input_tokens).saturating_add(removed_tokens);
+        let saved_percent = if before_estimate > 0 {
+            (removed_tokens as f64 / before_estimate as f64 * 100.0 * 10.0).round() / 10.0
+        } else {
+            0.0
+        };
+        tracing::info!(
+            request_id,
+            input_tokens,
+            estimated_input_tokens_before = before_estimate,
+            estimated_tokens_removed_historical_reasoning = removed_tokens,
+            saved_percent,
+            count_method = "exact_glm53_optimized",
+            count_duration_ms = started.elapsed().as_millis(),
+            "exact GLM token accounting for optimized request"
+        );
+    });
 }
 
 async fn openai_upstream_response(
@@ -394,15 +1208,45 @@ async fn openai_upstream_response(
         Ok(bytes) => bytes,
         Err(message) => return openai_error(StatusCode::BAD_GATEWAY, message, request_id),
     };
-    if serde_json::from_slice::<Value>(&bytes).is_err() {
-        return openai_error(
-            StatusCode::BAD_GATEWAY,
-            "upstream returned invalid JSON",
-            request_id,
-        );
-    }
-    let mut response =
-        (status, [(header::CONTENT_TYPE, "application/json")], bytes).into_response();
+    let value: Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(_) => {
+            return openai_error(
+                StatusCode::BAD_GATEWAY,
+                "upstream returned invalid JSON",
+                request_id,
+            )
+        }
+    };
+    // Normalize the known upstream envelopes strictly (issue #14): a 2xx
+    // body the OpenAI client cannot use is a provider protocol error
+    // (502, no key rotation), never a passthrough of unknown shapes.
+    let observed_shape = anthropic::classify_nonstream_body(&value);
+    let (normalized, response_shape) = match anthropic::normalize_nonstream_body(value) {
+        Ok(parts) => parts,
+        Err(error) => {
+            tracing::info!(
+                request_id,
+                response_shape = observed_shape.as_str(),
+                error = %error,
+                "upstream non-stream body was not usable"
+            );
+            return openai_error(StatusCode::BAD_GATEWAY, error.message, request_id);
+        }
+    };
+    tracing::debug!(
+        request_id,
+        response_shape = response_shape.as_str(),
+        body_bytes = bytes.len(),
+        "upstream non-stream envelope normalized"
+    );
+    let out_bytes = serde_json::to_vec(&normalized).unwrap_or_else(|_| bytes.to_vec());
+    let mut response = (
+        status,
+        [(header::CONTENT_TYPE, "application/json")],
+        out_bytes,
+    )
+        .into_response();
     insert_request_id(response.headers_mut(), request_id);
     response
 }
@@ -712,7 +1556,7 @@ async fn response_log_middleware(request: Request<Body>, next: Next) -> Response
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.contains("text/event-stream"));
-    tracing::info!(
+    tracing::debug!(
         request_id,
         protocol,
         method = %method,
@@ -805,8 +1649,25 @@ pub async fn serve(state: AppState) -> Result<()> {
         .await
         .with_context(|| format!("binding gateway to {bind}"))?;
     tracing::info!(bind, "cline-proxy listening");
+    // Debounced runtime-state writer: mutations signal the pool's Notify,
+    // this task coalesces them and performs the atomic file replacement off
+    // the request path. Healthy requests never touch the disk.
+    let writer = state.state_file.as_ref().map(|path| {
+        let state = state.clone();
+        let debounce = Duration::from_millis(defaults::STATE_DEBOUNCE_MS);
+        let path = path.clone();
+        tokio::spawn(async move {
+            loop {
+                state.upstream.pool().dirty().notified().await;
+                // Coalesce any notifications that arrived during the wait.
+                tokio::time::sleep(debounce).await;
+                state.flush_runtime_state();
+                tracing::debug!(state_file = %path.display(), "runtime state persisted");
+            }
+        })
+    });
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let app = router(state);
+    let app = router(state.clone());
     let mut task = tokio::spawn(async move {
         axum::serve(
             listener,
@@ -817,9 +1678,10 @@ pub async fn serve(state: AppState) -> Result<()> {
         })
         .await
     });
-    tokio::select! {
+    let shutdown_result = tokio::select! {
         result = &mut task => {
             result.context("gateway task failed")?.context("serving HTTP")?;
+            Ok(())
         }
         signal = shutdown_signal() => {
             match &signal {
@@ -845,10 +1707,17 @@ pub async fn serve(state: AppState) -> Result<()> {
                     let _ = task.await;
                 }
             }
-            signal?;
+            signal
         }
+    };
+    // Final flush happens inside the shutdown deadline; it is a small
+    // serialized snapshot and cannot meaningfully block exit.
+    if let Some(writer) = writer {
+        writer.abort();
+        let _ = writer.await;
     }
-    Ok(())
+    state.flush_runtime_state();
+    shutdown_result
 }
 
 async fn shutdown_signal() -> Result<()> {
@@ -1048,6 +1917,9 @@ mod tests {
                 enabled: true,
             })
             .collect();
+        // Tests opt in to persistence explicitly so the default working
+        // directory is never polluted by runtime-state.json.
+        config.runtime.state_file = None;
         config
     }
 
@@ -1665,14 +2537,390 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let value: Value = serde_json::from_str(&response_text(response).await).unwrap();
-        assert_eq!(value["content"][0]["type"], "thinking");
-        assert_eq!(value["content"][2]["type"], "tool_use");
-        assert_eq!(value["content"][2]["input"]["file_path"], "/tmp/a");
+        // The request carries no `thinking`, so upstream reasoning is not
+        // exposed: the response starts with the text block, not thinking.
+        assert_eq!(value["content"][0]["type"], "text");
+        assert_eq!(value["content"][0]["text"], "calling");
+        assert_eq!(value["content"][1]["type"], "tool_use");
+        assert_eq!(value["content"][1]["input"]["file_path"], "/tmp/a");
         assert_eq!(value["stop_reason"], "tool_use");
         assert_eq!(value["usage"]["output_tokens"], 4);
         let seen = mock.seen().await;
         assert_eq!(seen[0].body["messages"][1]["role"], "tool");
         assert_eq!(seen[0].body["model"], "z-ai/glm-5.3-flash");
+        // GLM policy on the wire: explicit effort + capped output.
+        assert_eq!(seen[0].body["reasoning_effort"], "high");
+        assert_eq!(seen[0].body["max_tokens"], 128);
+        task.abort();
+    }
+
+    // --- non-stream aggregation (issue #14) ---
+
+    fn sse_chunk(value: &Value) -> String {
+        format!("data: {value}\n\ndata: [DONE]\n\n")
+    }
+
+    /// A downstream `stream=false` request reaches the upstream as ONE
+    /// streaming request and returns a single Anthropic JSON response.
+    #[tokio::test]
+    async fn anthropic_nonstream_aggregates_upstream_streaming_text() {
+        let (base, mock, task) = start_mock().await;
+        mock.set(
+            "cline-key-1",
+            vec![Spec::sse(sse_chunk(&json!({
+                "id":"chat","model":"z-ai/glm-5.3-flash",
+                "choices":[{"delta":{"content":"Hello from streaming"}},
+                    {"delta":{},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":10,"completion_tokens":4,
+                    "prompt_tokens_details":{"cached_tokens":7}}
+            })))],
+        )
+        .await;
+        let app = router(AppState::new(test_config(base, 1)).unwrap());
+        let response = app
+            .oneshot(gateway_request(
+                "/v1/messages",
+                json!({
+                    "model":"claude-sonnet-4-6","max_tokens":128,"stream":false,
+                    "messages":[{"role":"user","content":"hi"}]
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+        let value: Value = serde_json::from_str(&response_text(response).await).unwrap();
+        assert_eq!(value["content"][0]["type"], "text");
+        assert_eq!(value["content"][0]["text"], "Hello from streaming");
+        assert_eq!(value["stop_reason"], "end_turn");
+        // Cache metrics survive aggregation (§43).
+        assert_eq!(value["usage"]["cache_read_input_tokens"], 7);
+        assert_eq!(value["usage"]["output_tokens"], 4);
+        // The upstream request was switched to streaming before send (§14).
+        let seen = mock.seen().await;
+        assert_eq!(seen[0].body["stream"], true);
+        assert_eq!(seen[0].body["stream_options"]["include_usage"], true);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn anthropic_nonstream_aggregates_parallel_tool_calls_and_suppresses_reasoning() {
+        let (base, mock, task) = start_mock().await;
+        let sse = format!(
+            "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            json!({"id":"chat","choices":[{"delta":{"reasoning_content":"INTERNAL THINKING"}}]}),
+            json!({"choices":[{"delta":{"tool_calls":[
+                {"index":0,"id":"call_a","function":{"name":"Read","arguments":"{\"pa"}},
+                {"index":1,"id":"call_b","function":{"name":"Edit","arguments":"{\"li"}}
+            ]}}]}),
+            json!({"choices":[{"delta":{"tool_calls":[
+                {"index":1,"function":{"arguments":"ne\":2}"}},
+                {"index":0,"function":{"arguments":"th\":\"a.rs\"}"}}
+            ]}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}],
+            "usage":{"prompt_tokens":9,"completion_tokens":5}}),
+        );
+        mock.set("cline-key-1", vec![Spec::sse(sse)]).await;
+        let app = router(AppState::new(test_config(base, 1)).unwrap());
+        let response = app
+            .oneshot(gateway_request(
+                "/v1/messages",
+                json!({
+                    "model":"claude-sonnet-4-6","max_tokens":128,"stream":false,
+                    "messages":[{"role":"user","content":"edit the file"}]
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: Value = serde_json::from_str(&response_text(response).await).unwrap();
+        // Unrequested thinking is suppressed even on the aggregate path (§90).
+        assert!(value["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|b| b["type"] != "thinking"));
+        let tool_uses: Vec<&Value> = value["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|b| b["type"] == "tool_use")
+            .collect();
+        assert_eq!(tool_uses.len(), 2);
+        assert_eq!(tool_uses[0]["id"], "call_a");
+        assert_eq!(tool_uses[0]["input"]["path"], "a.rs");
+        assert_eq!(tool_uses[1]["id"], "call_b");
+        assert_eq!(tool_uses[1]["input"]["line"], 2);
+        assert_eq!(value["stop_reason"], "tool_use");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn anthropic_nonstream_aggregation_commits_reasoning_shadow() {
+        let (base, mock, task) = start_mock().await;
+        let tool_response = json!({
+            "id":"chat","choices":[{"delta":{
+                "reasoning_content":"EPHEMERAL LOOP REASONING",
+                "tool_calls":[{"index":0,"id":"call_1",
+                    "function":{"name":"Bash","arguments":"{\"command\":\"cargo test\"}"}}]},
+                "finish_reason":"tool_calls"}],
+            "usage":{"prompt_tokens":9,"completion_tokens":6}
+        });
+        mock.set(
+            "cline-key-1",
+            vec![
+                Spec::sse(sse_chunk(&tool_response)),
+                Spec::sse(sse_chunk(&json!({
+                    "id":"chat2","choices":[{"delta":{"content":"done"},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":9,"completion_tokens":2}
+                }))),
+            ],
+        )
+        .await;
+        let app = router(AppState::new(test_config(base, 1)).unwrap());
+        // Turn 1: tool call with unexposed reasoning → shadow committed.
+        let response = app
+            .clone()
+            .oneshot(gateway_request(
+                "/v1/messages",
+                json!({
+                    "model":"claude-sonnet-4-6","max_tokens":128,"stream":false,
+                    "metadata":{"user_id":"shadow_session_1"},
+                    "messages":[{"role":"user","content":"run tests"}]
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // Turn 2: tool result → the wire must carry the restored reasoning.
+        let response = app
+            .oneshot(gateway_request(
+                "/v1/messages",
+                json!({
+                    "model":"claude-sonnet-4-6","max_tokens":128,"stream":false,
+                    "metadata":{"user_id":"shadow_session_1"},
+                    "messages":[
+                        {"role":"user","content":"run tests"},
+                        {"role":"assistant","content":[{"type":"tool_use","id":"call_1",
+                            "name":"Bash","input":{"command":"cargo test"}}]},
+                        {"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1",
+                            "content":"ok"}]}
+                    ]
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let seen = mock.seen().await;
+        let assistant = seen[1].body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .unwrap();
+        assert_eq!(
+            assistant["reasoning_content"].as_str().unwrap_or(""),
+            "EPHEMERAL LOOP REASONING",
+            "shadow continuity must survive the aggregate path (§92)"
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn anthropic_nonstream_aggregation_exposes_requested_thinking() {
+        let (base, mock, task) = start_mock().await;
+        mock.set(
+            "cline-key-1",
+            vec![Spec::sse(format!(
+                "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                json!({"id":"chat","choices":[{"delta":{"reasoning_content":"VISIBLE THINKING"}}]}),
+                json!({"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":5,"completion_tokens":3}})
+            ))],
+        )
+        .await;
+        let app = router(AppState::new(test_config(base, 1)).unwrap());
+        let response = app
+            .oneshot(gateway_request(
+                "/v1/messages",
+                json!({
+                    "model":"claude-sonnet-4-6","max_tokens":128,"stream":false,
+                    "thinking":{"type":"adaptive"},
+                    "messages":[{"role":"user","content":"hi"}]
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(&response_text(response).await).unwrap();
+        assert_eq!(value["content"][0]["type"], "thinking");
+        assert_eq!(value["content"][0]["thinking"], "VISIBLE THINKING");
+        assert_eq!(value["content"][1]["type"], "text");
+        task.abort();
+    }
+
+    /// A 200 whose body is unusable (empty stream / missing choices) is a
+    /// provider protocol error: 502 WITHOUT key rotation (§21/§50/§94).
+    #[tokio::test]
+    async fn anthropic_nonstream_protocol_errors_never_rotate_keys() {
+        let (base, mock, task) = start_mock().await;
+        mock.set(
+            "cline-key-1",
+            vec![
+                Spec::sse("data: [DONE]\n\n"),
+                Spec::sse("data: {\"choices\":[],\"usage\":{}}\n\ndata: [DONE]\n\n"),
+            ],
+        )
+        .await;
+        let state = AppState::new(test_config(base, 2)).unwrap();
+        let app = router(state.clone());
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(gateway_request(
+                    "/v1/messages",
+                    json!({
+                        "model":"claude-sonnet-4-6","max_tokens":128,"stream":false,
+                        "messages":[{"role":"user","content":"hi"}]
+                    })
+                    .to_string(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        }
+        // Both calls stayed on key 1: no failover for a 200 body problem.
+        let seen = mock.seen().await;
+        assert_eq!(seen.len(), 2);
+        assert!(seen
+            .iter()
+            .all(|request| request.authorization == "Bearer cline-key-1"));
+        assert_eq!(
+            state.upstream.pool().select(&HashSet::new()).unwrap().index,
+            0
+        );
+        task.abort();
+    }
+
+    /// Defensive fallback: upstream answered a stream request with a
+    /// complete JSON body in the known Cline envelope → normalized and
+    /// converted, not discarded.
+    #[tokio::test]
+    async fn anthropic_nonstream_json_fallback_normalizes_cline_envelope() {
+        let (base, mock, task) = start_mock().await;
+        mock.set(
+            "cline-key-1",
+            vec![Spec::json(
+                200,
+                json!({
+                    "success": true,
+                    "data": {
+                        "id":"chat","model":"z-ai/glm-5.3-flash",
+                        "choices":[{"message":{"content":"wrapped hello"},
+                            "finish_reason":"stop"}],
+                        "usage":{"prompt_tokens":6,"completion_tokens":2}
+                    }
+                })
+                .to_string(),
+            )],
+        )
+        .await;
+        let app = router(AppState::new(test_config(base, 1)).unwrap());
+        let response = app
+            .oneshot(gateway_request(
+                "/v1/messages",
+                json!({
+                    "model":"claude-sonnet-4-6","max_tokens":128,"stream":false,
+                    "messages":[{"role":"user","content":"hi"}]
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: Value = serde_json::from_str(&response_text(response).await).unwrap();
+        assert_eq!(value["content"][0]["text"], "wrapped hello");
+        task.abort();
+    }
+
+    /// 429 before any stream content: the existing sticky failover must
+    /// work unchanged for the aggregate strategy (§93).
+    #[tokio::test]
+    async fn anthropic_nonstream_429_fails_over_then_aggregates() {
+        let (base, mock, task) = start_mock().await;
+        mock.set("cline-key-1", vec![Spec::json(429, "Retry after 30m")])
+            .await;
+        mock.set(
+            "cline-key-2",
+            vec![Spec::sse(sse_chunk(&json!({
+                "id":"chat","choices":[{"delta":{"content":"after failover"},
+                    "finish_reason":"stop"}],
+                "usage":{"prompt_tokens":5,"completion_tokens":3}
+            })))],
+        )
+        .await;
+        let app = router(AppState::new(test_config(base, 2)).unwrap());
+        let response = app
+            .oneshot(gateway_request(
+                "/v1/messages",
+                json!({
+                    "model":"claude-sonnet-4-6","max_tokens":128,"stream":false,
+                    "messages":[{"role":"user","content":"hi"}]
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: Value = serde_json::from_str(&response_text(response).await).unwrap();
+        assert_eq!(value["content"][0]["text"], "after failover");
+        let seen = mock.seen().await;
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].authorization, "Bearer cline-key-1");
+        assert_eq!(seen[1].authorization, "Bearer cline-key-2");
+        task.abort();
+    }
+
+    /// OpenAI-protocol non-stream clients get the same envelope
+    /// normalization (wrapped Cline body → standard OpenAI response).
+    #[tokio::test]
+    async fn openai_nonstream_wrapped_envelope_is_normalized() {
+        let (base, mock, task) = start_mock().await;
+        mock.set(
+            "cline-key-1",
+            vec![Spec::json(
+                200,
+                json!({
+                    "success": true,
+                    "data": {
+                        "id":"chat","model":"z-ai/glm-5.3-flash",
+                        "choices":[{"message":{"content":"normalized"},"finish_reason":"stop"}],
+                        "usage":{"prompt_tokens":5,"completion_tokens":1}
+                    }
+                })
+                .to_string(),
+            )],
+        )
+        .await;
+        let app = router(AppState::new(test_config(base, 1)).unwrap());
+        let response = app
+            .oneshot(gateway_request(
+                "/v1/chat/completions",
+                json!({
+                    "model":"claude-sonnet-4-6",
+                    "messages":[{"role":"user","content":"hi"}]
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: Value = serde_json::from_str(&response_text(response).await).unwrap();
+        assert_eq!(value["choices"][0]["message"]["content"], "normalized");
         task.abort();
     }
 
@@ -1708,11 +2956,61 @@ mod tests {
         assert!(body.starts_with("event: message_start"));
         assert_eq!(body.matches("\"type\":\"tool_use\"").count(), 2);
         assert!(body.contains("input_json_delta"));
-        assert!(body.contains("thinking_delta"));
-        assert!(body.contains("signature_delta"));
+        // No `thinking` in the request: reasoning is suppressed, and no
+        // thinking block (hence no signature) is ever emitted.
+        assert!(!body.contains("thinking_delta"));
+        assert!(!body.contains("signature_delta"));
         assert!(body.contains("\"stop_reason\":\"tool_use\""));
         assert!(body.ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_exposes_thinking_only_when_requested() {
+        let (base, mock, task) = start_mock().await;
+        let sse = format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            json!({"id":"chat","model":"z-ai/glm-5.3-flash","choices":[{"delta":{"reasoning":"visible think"}}]}),
+            json!({"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":3,"completion_tokens":2,
+                    "completion_tokens_details":{"reasoning_tokens":1}}})
+        );
+        mock.set("cline-key-1", vec![Spec::sse(sse.clone())]).await;
+        let app = router(AppState::new(test_config(base, 1)).unwrap());
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(header::AUTHORIZATION, "Bearer gateway-secret")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "model":"claude-sonnet-4-6","max_tokens":128,
+                    "stream":true,
+                    "thinking":{"type":"adaptive"},
+                    "messages":[{"role":"user","content":"hello"}]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        *request.uri_mut() = "/v1/messages".parse().unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let body = response_text(response).await;
+        assert!(body.contains("thinking_delta"));
+        assert!(body.contains("visible think"));
+        assert!(body.contains("signature_delta"));
+        // And when thinking is NOT requested, the same reasoning is suppressed.
+        let (base2, mock2, task2) = start_mock().await;
+        mock2.set("cline-key-1", vec![Spec::sse(sse.clone())]).await;
+        let app2 = router(AppState::new(test_config(base2, 1)).unwrap());
+        let response2 = app2
+            .oneshot(gateway_request("/v1/messages", anthropic_body(true)))
+            .await
+            .unwrap();
+        let body2 = response_text(response2).await;
+        assert!(!body2.contains("visible think"));
+        assert!(!body2.contains("thinking_delta"));
+        task.abort();
+        task2.abort();
     }
 
     #[tokio::test]
@@ -1755,7 +3053,10 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(count.headers()["x-cline-proxy-token-count"], "approximate");
+        assert_eq!(
+            count.headers()["x-cline-proxy-token-count"],
+            "exact_glm53_optimized"
+        );
         let count_value: Value = serde_json::from_str(&response_text(count).await).unwrap();
         assert!(count_value["input_tokens"].as_u64().unwrap() > 0);
         assert!(mock.seen().await.is_empty());
@@ -1918,5 +3219,342 @@ mod tests {
             0
         );
         task.await.unwrap();
+    }
+
+    fn unique_state_path(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "cline-proxy-server-test-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("runtime-state.json")
+    }
+
+    /// Production regression: key1–key5 confirm daily-quota 429s, key6
+    /// succeeds, state persists, and after a full process restart the next
+    /// logical request must reach key6 on the FIRST attempt with zero failed
+    /// probes.
+    #[tokio::test]
+    async fn restart_with_persisted_state_skips_known_cooling_keys() {
+        let (base, mock, task) = start_mock().await;
+        let cooldowns = ["8h 37m", "9h 42m", "10h 13m", "10h 55m", "11h 53m"];
+        for (index, cooldown) in cooldowns.iter().enumerate() {
+            mock.set(
+                &format!("cline-key-{}", index + 1),
+                vec![Spec::json(
+                    429,
+                    json!({"error":{"message":format!(
+                        "Daily free limit reached on model z-ai/glm-5.3-flash. Try again in {cooldown}"
+                    )}})
+                    .to_string(),
+                )],
+            )
+            .await;
+        }
+        mock.set(
+            "cline-key-6",
+            vec![
+                Spec::json(200, successful_json("healthy key")),
+                Spec::json(200, successful_json("healthy key after restart")),
+            ],
+        )
+        .await;
+
+        let state_path = unique_state_path("restart");
+        let mut config = test_config(base, 6);
+        config.runtime.state_file = Some(state_path.to_string_lossy().into_owned());
+
+        // First logical request: serial discovery of five exhausted keys.
+        let state = AppState::new(config.clone()).unwrap();
+        let app = router(state.clone());
+        let response = app
+            .oneshot(gateway_request("/v1/chat/completions", chat_body(false)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(mock.seen().await.len(), 6);
+        let snapshots = state.upstream.pool().snapshots();
+        assert_eq!(snapshots[5].name.as_ref(), "cline-6");
+        for snapshot in &snapshots[..5] {
+            assert_eq!(snapshot.phase, crate::pool::KeyPhase::Cooling);
+            assert_eq!(
+                snapshot.rate_limit_kind,
+                Some(crate::rate_limit::RateLimitKind::DailyQuota)
+            );
+        }
+
+        // Persist (the writer task debounces; tests flush synchronously) and
+        // simulate a full process restart with a fresh AppState.
+        state.flush_runtime_state();
+        let state_file_contents = std::fs::read_to_string(&state_path).unwrap();
+        assert!(!state_file_contents.contains("cline-key-"));
+        assert!(!state_file_contents.contains("gateway-secret"));
+        let restarted = AppState::new(config).unwrap();
+        assert_eq!(
+            restarted
+                .upstream
+                .pool()
+                .active_key_name()
+                .map(|name| name.to_string())
+                .as_deref(),
+            Some("cline-6")
+        );
+        let app = router(restarted);
+        let response = app
+            .oneshot(gateway_request("/v1/chat/completions", chat_body(false)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let seen = mock.seen().await;
+        assert_eq!(seen.len(), 7);
+        assert_eq!(seen[6].authorization, "Bearer cline-key-6");
+        std::fs::remove_dir_all(state_path.parent().unwrap()).ok();
+        task.abort();
+    }
+
+    /// Prefix stability end-to-end (issue #8): two Claude Code-shaped
+    /// requests that differ ONLY in the dynamic billing-header metadata and
+    /// in tool-argument key insertion order must produce byte-identical
+    /// upstream system prefixes. The billing header must be gone from the
+    /// wire, and the historical tool arguments canonicalized.
+    #[tokio::test]
+    async fn dynamic_billing_header_and_argument_order_produce_identical_prefix() {
+        let (base, mock, task) = start_mock().await;
+        mock.set(
+            "cline-key-1",
+            vec![
+                Spec::json(200, successful_json("one")),
+                Spec::json(200, successful_json("two")),
+            ],
+        )
+        .await;
+        let app = router(AppState::new(test_config(base, 1)).unwrap());
+        let history = json!([
+            {"role":"user","content":[{"type":"text","text":"fix the bug"}]},
+            {"role":"assistant","content":[
+                {"type":"thinking","thinking":"old reasoning","signature":"s"},
+                {"type":"tool_use","id":"toolu_1","name":"Edit",
+                 "input":{"path":"src/a.rs","line":12}}
+            ]},
+            {"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"toolu_1","content":"done"}
+            ]}
+        ]);
+        let make_request = |header_value: &str, argument_order: bool| {
+            let tool_use_input = if argument_order {
+                json!({"path":"src/a.rs","line":12})
+            } else {
+                json!({"line":12,"path":"src/a.rs"})
+            };
+            let mut history = history.clone();
+            history[1]["content"][1]["input"] = tool_use_input;
+            json!({
+                "model":"claude-sonnet-4-6",
+                "max_tokens":1_000,
+                "system":[
+                    {"type":"text","text":format!(
+                        "x-anthropic-billing-header: {{\"cch\":\"{header_value}\"}}\nYou are Claude Code.")},
+                    {"type":"text","text":"Be careful."}
+                ],
+                "messages":history,
+                "tools":[{"name":"Edit","input_schema":{"type":"object"}}]
+            })
+            .to_string()
+        };
+        let request_a = make_request("AAA", true);
+        let request_b = make_request("BBB", false);
+        for body in [request_a, request_b] {
+            let response = app
+                .clone()
+                .oneshot(gateway_request("/v1/messages", body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let seen = mock.seen().await;
+        assert_eq!(seen.len(), 2);
+        for request in &seen {
+            let system = &request.body["messages"][0];
+            assert_eq!(system["role"], "system");
+            let text = system["content"].as_array().unwrap();
+            // Billing header stripped from the leading text block only.
+            assert!(!text[0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("x-anthropic-billing-header"));
+            assert!(text[0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("You are Claude Code."));
+            assert_eq!(text[1]["text"], "Be careful.");
+            // Historical tool arguments canonicalized.
+            assert_eq!(
+                request.body["messages"][2]["tool_calls"][0]["function"]["arguments"],
+                "{\"line\":12,\"path\":\"src/a.rs\"}"
+            );
+        }
+        task.abort();
+    }
+
+    /// The exact tokenizer is CPU-bound and runs on the blocking pool under
+    /// a semaphore. Saturation test: many concurrent large requests must all
+    /// complete, the semaphore must hold (never more permits in flight than
+    /// configured), and the async runtime must stay responsive throughout
+    /// (SSE mock polling keeps progressing while counts run).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn token_telemetry_saturation_keeps_runtime_responsive_and_bounded() {
+        let (base, mock, task) = start_mock().await;
+        mock.set(
+            "cline-key-1",
+            (0..10)
+                .map(|_| Spec::json(200, successful_json("ok")))
+                .collect(),
+        )
+        .await;
+        let mut config = test_config(base, 1);
+        config.glm53.telemetry.exact_input_tokens = true;
+        config.glm53.telemetry.max_concurrent_token_counts = 1;
+        let state = AppState::new(config).unwrap();
+        let app = router(state.clone());
+        // ~70 KB bodies with thinking history so each count does real
+        // tokenization work.
+        let history_text = "analysis step: inspect the tokenizer pipeline and the ".repeat(300);
+        let bodies = (0..10)
+            .map(|index| {
+                json!({
+                    "model":"claude-sonnet-4-6",
+                    "max_tokens":128,
+                    "messages":[
+                        {"role":"user","content":[{"type":"text","text":format!("task {index}")}]},
+                        {"role":"assistant","content":[
+                            {"type":"thinking","thinking":history_text,"signature":"s"},
+                            {"type":"text","text":"reading"}
+                        ]},
+                        {"role":"user","content":[{"type":"text","text":"go on"}]}
+                    ]
+                })
+                .to_string()
+            })
+            .collect::<Vec<_>>();
+        // Drive requests and a concurrent "SSE polling" ticker together. The
+        // assertion is not tick count (CPU contention with the tokenizer is
+        // expected and legitimate) but liveness: no single tick gap may
+        // stall, which is what an occupied Tokio worker would cause.
+        let ticker = tokio::spawn(async move {
+            let mut max_gap_ms: u128 = 0;
+            let started = Instant::now();
+            let mut last = started;
+            while started.elapsed() < Duration::from_secs(15) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                let now = Instant::now();
+                max_gap_ms = max_gap_ms.max(now.duration_since(last).as_millis());
+                last = now;
+            }
+            max_gap_ms
+        });
+        let responses = futures_util::future::join_all(bodies.into_iter().map(|body| {
+            let app = app.clone();
+            async move {
+                app.oneshot(gateway_request("/v1/messages", body))
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        }))
+        .await;
+        assert!(responses.iter().all(|status| *status == StatusCode::OK));
+        let max_gap_ms = ticker.await.unwrap();
+        // A 5 ms sleep waking with a multi-hundred-ms gap means an async
+        // worker was blocked by CPU-bound work. spawn_blocking keeps the
+        // workers free; allow generous CI variance.
+        assert!(
+            max_gap_ms < 500,
+            "async runtime stalled under tokenizer load: max tick gap {max_gap_ms}ms"
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn corrupt_runtime_state_starts_safely_and_serves() {
+        let (base, mock, task) = start_mock().await;
+        mock.set("cline-key-1", vec![Spec::json(200, successful_json("ok"))])
+            .await;
+        let state_path = unique_state_path("corrupt");
+        std::fs::write(&state_path, b"{ definitively not json").unwrap();
+        let mut config = test_config(base, 2);
+        config.runtime.state_file = Some(state_path.to_string_lossy().into_owned());
+        let state = AppState::new(config).unwrap();
+        let app = router(state);
+        let response = app
+            .oneshot(gateway_request("/v1/chat/completions", chat_body(false)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(mock.seen().await.len(), 1);
+        std::fs::remove_dir_all(state_path.parent().unwrap()).ok();
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn admin_status_requires_auth_and_leaks_no_secrets() {
+        let (base, mock, task) = start_mock().await;
+        mock.set(
+            "cline-key-1",
+            vec![Spec::json(
+                429,
+                r#"{"error":{"message":"Daily free limit reached. Try again in 9h"}}"#,
+            )],
+        )
+        .await;
+        mock.set("cline-key-2", vec![Spec::json(200, successful_json("ok"))])
+            .await;
+        let state_path = unique_state_path("admin");
+        let mut config = test_config(base, 2);
+        config.runtime.state_file = Some(state_path.to_string_lossy().into_owned());
+        let state = AppState::new(config).unwrap();
+        let app = router(state.clone());
+        let unauthenticated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+        // Trigger a 429 so rate-limit metadata exists, then flush state.
+        let response = app
+            .clone()
+            .oneshot(gateway_request("/v1/chat/completions", chat_body(false)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let status = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/admin/status")
+                    .header(header::AUTHORIZATION, "Bearer gateway-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+        let body = response_text(status).await;
+        let value: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["keys"][0]["state"], "cooling");
+        assert_eq!(value["keys"][0]["rate_limit_kind"], "daily_quota");
+        assert_eq!(value["active_key"], "cline-2");
+        assert!(!body.contains("cline-key-1"));
+        assert!(!body.contains("cline-key-2"));
+        assert!(!body.contains("gateway-secret"));
+        assert!(!body.contains("Daily free limit"));
+        state.flush_runtime_state();
+        std::fs::remove_dir_all(state_path.parent().unwrap()).ok();
+        task.abort();
     }
 }

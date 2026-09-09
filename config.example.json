@@ -43,6 +43,39 @@
     "log_level": "info",
     "log_format": "pretty",
     "stream_progress_secs": 30,
-    "shutdown_timeout_secs": 30
+    "shutdown_timeout_secs": 30,
+    "state_file": "runtime-state.json"
+  },
+  "glm53": {
+    "reasoning": {
+      "default_effort": "high",
+      "adaptive_effort": "high",
+      "strip_historical_thinking": true,
+      "expose_thinking": "requested_only",
+      "shadow_current_turn": true
+    },
+    "limits": {
+      "max_output_tokens": 16384
+    },
+    "context": {
+      "safe_compaction": true,
+      "strip_volatile_billing_header": true,
+      "canonical_tool_json": true
+    },
+    "telemetry": {
+      "exact_input_tokens": true,
+      "max_concurrent_token_counts": 1,
+      "prefix_hash": true,
+      "cache_metrics": true
+    }
+  },
+  "logging": {
+    "directory": "logs",
+    "max_file_size_mb": 64,
+    "max_total_size_mb": 1024,
+    "cleanup_target_percent": 85,
+    "flush_interval_ms": 1000,
+    "slow_ttft_ms": 15000,
+    "slow_duration_ms": 60000
   }
 }

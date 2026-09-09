@@ -18,15 +18,20 @@ The binary contains five intentionally small subsystems:
   `/v1/chat/completions`, `/v1/models`, `/healthz`, and `/readyz`.
 - One long-lived rustls `reqwest::Client` provides HTTP/2, gzip, pooling,
   keep-alive, connect timeout, and read-inactivity timeout behavior.
-- A concurrency-safe pool holds the sticky active key and per-key effective-429
-  cooldown metadata. No lock is held over a network await.
+- A concurrency-safe pool holds the sticky active key, per-key effective-429
+  cooldown metadata (Healthy → Cooling → HalfOpen with single-flight
+  probing), and runtime counters. No lock is held over a network await.
+- A debounced writer persists key cooldowns and the active key to a local
+  JSON state file (name-keyed, wall-clock deadlines, atomic rename) so
+  restarts never re-probe keys with known quota cooldowns.
 - The Anthropic adapter converts structured messages, images, tool use/results,
   reasoning, usage, stop reasons, and stateful OpenAI SSE into Anthropic SSE.
 - Central error and redaction paths remove configured secrets, Bearer values,
   API-key fields, cookies, and JWT-like values.
 
-There is no OAuth, credential refresh, database, Redis, web UI, balance poller,
-or admin API. Configuration is read once from JSON at startup.
+There is no OAuth, credential refresh, database, Redis, web UI, or balance
+poller. Configuration is read once from JSON at startup; `/admin/status` is a
+read-only, authenticated operational snapshot.
 
 ## Build and install
 
@@ -110,6 +115,160 @@ Anthropic Messages, and token-count request accounting. For example:
 
 No live model-list request is needed for readiness or model discovery.
 
+### GLM-5.3-Flash request policy (reasoning, output, context)
+
+Requests are optimized for coding-agent workloads before they reach Cline.
+Full rationale and evidence: `docs/GLM53_FLASH.md` and
+`docs/adr/0004-glm53-bounded-reasoning-and-context-policy.md`.
+
+```json
+"glm53": {
+  "reasoning": {
+    "default_effort": "high",
+    "adaptive_effort": "high",
+    "strip_historical_thinking": true,
+    "expose_thinking": "requested_only"
+  },
+  "limits": { "max_output_tokens": 16384 },
+  "context": { "safe_compaction": true },
+  "telemetry": {
+    "exact_input_tokens": true,
+    "max_concurrent_token_counts": 1
+  }
+}
+```
+
+- **Explicit reasoning effort, always.** The official GLM template coerces
+  unset effort to `max`; cline-proxy never sends unset. Without explicit
+  client controls the effort is `high` (strong analysis/planning without
+  multi-minute `max` runaways). `disabled`->`low`, `adaptive`->`high`,
+  small `budget_tokens` (<8192)->`low`, large->`high`, and only an explicit
+  `output_config.effort: "max"` produces `max`. Precedence: explicit
+  `output_config.effort` > explicit `thinking` > proxy default.
+- **Historical thinking is stripped per reasoning epoch.** The epoch
+  boundary is the newest *human* user message — tool results continue the
+  current epoch rather than starting one. Reasoning from previous epochs
+  is removed; the current epoch keeps its in-turn reasoning continuity
+  across the tool loop. Text, tool calls, call ids, and order are always
+  untouched. This is the reliable local equivalent of GLM's
+  `clear_thinking`, refined by real tool-loop semantics (ADR 0006).
+- **Reasoning shadow store** (`shadow_current_turn`, default on): when
+  the client did not request thinking, the proxy briefly keeps the
+  in-turn reasoning that issued tool calls and restores it onto the
+  matching assistant turn of the next request in the same epoch — tool
+  loops keep their reasoning continuity without Claude Code ever storing
+  or replaying reasoning. Memory-only, bounded (256 sessions / 64 MiB /
+  1 MiB per entry / 10-minute TTL), never truncated, never logged,
+  never persisted; disabled automatically when no stable session identity
+  exists.
+- **Thinking exposure is `requested_only`:** upstream reasoning is surfaced
+  to the client as Anthropic thinking blocks only when the request
+  explicitly carries `thinking`. This prevents Claude Code from storing and
+  re-sending reasoning (the main multi-turn amplification source).
+- **Output is capped**: `effective_max_tokens = min(client, 16384)` by
+  default; a request without a bound gets the cap.
+- **Safe compaction only**: lossless structural normalization (single text
+  block -> string, empty blocks dropped, Anthropic-only `metadata` dropped).
+  Tool results are never truncated and tool schemas are never edited;
+  Claude Code keeps full ownership of context compaction.
+- **Model-scoped policy.** The GLM semantics above apply only when the
+  resolved *upstream* model is a GLM id (`glm*` segment detection).
+  Every other OpenAI-compatible model passes through byte-for-byte: no
+  injected `reasoning_effort`, no output cap, no message rewriting, no
+  metadata removal. Unknown models fail safe toward compatibility, never
+  toward GLM semantics.
+- **Telemetry**: per-request byte breakdown and policy decisions
+  (`request optimization` log, including the model family), per-stream
+  reasoning/text/tool-call byte accounting with first-tool-call latency,
+  upstream usage tokens (`prompt/completion/cached/reasoning`) when
+  provided, and an exact GLM token count of the optimized request. The
+  tokenizer is CPU-bound, so the count runs on the **blocking pool under a
+  semaphore** (`max_concurrent_token_counts`, default 1) — never on a Tokio
+  worker and never queued unboundedly; when the slot is busy the count is
+  skipped and logged. Logs contain sizes/counts only, never prompt content.
+
+### Adaptive bounded observability
+
+One request = one summary. A request-local trace aggregates counters,
+timings, tokens, and routing in memory; on completion exactly one compact
+console line and one JSONL record are emitted through a **bounded queue
+→ dedicated writer thread** (disk IO never runs on a Tokio worker, a
+full queue drops the record instead of ever slowing a request). Detailed
+lifecycle events live in a request-local RAM flight recorder and are
+attached only to anomalous requests (errors, 429, transport failures,
+TTFT/duration over `logging.slow_ttft_ms`/`slow_duration_ms`).
+File logging has a hard disk quota (`max_total_size_mb`, default 1 GB)
+with 85% cleanup watermark and 64 MB rotation; there is no fsync;
+failures degrade file logging to disabled — the proxy never fails a
+request because of logs. Logs carry names, counts, sizes, timings, and
+fingerprints only, never prompts, reasoning, tool output, or raw session
+ids. See `docs/OBSERVABILITY.md`, `docs/PERFORMANCE.md`, and ADR 0007.
+
+### Prompt-prefix stability (cache locality)
+
+Upstream prompt caches key on byte-exact prefixes, so per-turn byte drift
+in an otherwise identical conversation wastes prefill. cline-proxy
+addresses the drift sources it can (issue #8, ADR 0005):
+
+- **Volatile billing header**: Claude Code prepends an
+  `x-anthropic-billing-header: ...` line to the system text whose
+  attribution metadata changes between requests. A *leading* line of
+  exactly that shape is stripped (LF/CRLF/CR aware); a header mentioned
+  later in the text is never touched. Applied in Anthropic system
+  normalization so the wire body, `/v1/messages/count_tokens`, and
+  telemetry all see the same normalized system.
+- **Canonical tool-argument JSON**: historical assistant
+  `tool_calls[].function.arguments` strings are re-serialized with
+  deterministic key order so equivalent arguments are byte-identical
+  across turns. Arrays keep order; malformed strings, plain-text tool
+  results, shell output, and source code are never rewritten.
+- **Stable prefix telemetry**: each request logs `prefix_hash` and
+  `prefix_bytes` (hash of normalized system + messages + tools). Equal
+  hashes prove local byte stability, not an upstream cache hit.
+- **Session fingerprint**: when Claude Code supplies a session identity
+  (`metadata.user_id`/`session_id`), a 16-hex-char HMAC fingerprint is
+  logged (`session=...`). Raw ids are never logged; without identity the
+  field is `unstable` and no session-scoped behavior is attempted.
+- **Cache ratios**: `cache_hit_ratio` and `reasoning_ratio` are logged
+  from upstream usage. Verified against live traffic: Cline reports
+  `cached_tokens` (subset of `prompt_tokens`), and a real ~300 K-token
+  Claude Code session sustained **99.8-100.0% cache hit ratios** across
+  consecutive turns with these stability mechanisms enabled
+  (`docs/DEVELOPMENT_STATE.md`). `prompt_cache_key` is *not* sent —
+  high cache hits are achieved without it.
+
+## Key stickiness and persisted quota state
+
+Routing is **strict sticky sequential**. The active key is used for every
+request until it confirms an effective upstream HTTP 429; then it enters
+cooldown and the next configured key becomes active until *its* quota is
+exhausted. Successes, 5xx, timeouts, connection resets, TLS/DNS errors, and
+stream interruptions never rotate the key, and a recovered key whose cooldown
+expired never steals the active role back from a healthy key.
+
+Key cooldowns and the active selection survive process restarts:
+
+- `runtime.state_file` (default `./runtime-state.json`; set to `null` or `""`
+  to disable) stores one versioned JSON snapshot.
+- The file is keyed by configured key **name** (never by position), so
+  reordering the key list cannot cool the wrong key.
+- Deadlines are wall-clock Unix milliseconds; nothing secret is ever written:
+  no API keys, no authorization values, no raw upstream error text.
+- Writes are atomic (temp file + rename) and debounced off the request path;
+  healthy requests never touch the disk. A final flush runs during graceful
+  shutdown.
+- A missing, truncated, or unreadable state file is **non-fatal**: the gateway
+  logs a sanitized warning and starts with empty state. Persistence health is
+  visible in `/admin/status`.
+- On startup, expired cooldowns are restored as probe-eligible (never as
+  active cooldowns), and the persisted active key is restored if it still
+  exists and is enabled — so a restart no longer re-probes keys that are
+  hours away from quota recovery.
+
+A confirmed effective 429 is further classified as `daily_quota`, `transient`,
+or `unknown` (`rate_limit_kind` in `/admin/status`). Classification happens
+only *after* the 429 is confirmed and never widens failover conditions.
+
 ## Run
 
 ```bash
@@ -136,11 +295,29 @@ x-api-key: <gateway key>
 Health endpoints are intentionally unauthenticated. The gateway key is never
 forwarded. The Cline keys are never returned to clients.
 
+`GET /admin/status` (same gateway authentication) returns a read-only
+operational snapshot: version, uptime, the active key and its age, and per-key
+state (`healthy` / `cooling` / `half_open` / `probing`), cooldown deadlines,
+rate-limit kind, model scope, and request counters. It never returns key
+material or raw upstream error text.
+
 ## Claude Code
 
 Point Claude Code's Anthropic base URL at the local gateway. Provide
 `CLINE_PROXY_GATEWAY_KEY` through your normal secret-management mechanism; it
 must equal `server.api_key`:
+
+### Exact token counting
+
+`POST /v1/messages/count_tokens` returns the **exact** GLM-5.3-Flash prompt
+token count, computed in-process with the official tokenizer and official
+chat template (zai-org/GLM-5.3-Flash, revision pinned in
+`docs/GLM53_FLASH.md` — no Python, no network at runtime). Responses carry
+`x-cline-proxy-token-count: exact_glm53_optimized` (counting the optimized request the gateway would actually send; the oracle-faithful count is used when the strip policy is disabled). See
+`docs/adr/0003-glm53-exact-tokenizer.md` for the parity guarantees, the
+reasoning-effort mapping, and the two documented exclusions (non-text
+documents are rejected rather than undercounted; images count as their
+template placeholder).
 
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8788
@@ -168,11 +345,6 @@ arguments can be split at arbitrary chunk boundaries and multiple call indexes
 can be interleaved. Malformed or truncated upstream streams produce one
 Anthropic error event and are never replayed. Dropping the downstream body
 drops the reqwest body so abandoned streaming work is cancelled upstream.
-
-`POST /v1/messages/count_tokens` is a local UTF-8/JSON byte-based estimate
-(`ceil(serialized prompt bytes / 4)`), not the exact tokenizer for the selected
-Cline model. It performs no billable upstream request and returns
-`x-cline-proxy-token-count: approximate` so this limitation is explicit.
 
 ## Manual integration tests
 

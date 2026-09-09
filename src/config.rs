@@ -8,6 +8,8 @@ use anyhow::{bail, Context, Result};
 use axum::http::{HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 
+use crate::glm53::reasoning::ThinkingExposure;
+
 pub mod defaults {
     pub const BIND: &str = "127.0.0.1:8788";
     pub const BASE_URL: &str = "https://api.cline.bot/api/v1";
@@ -18,6 +20,23 @@ pub mod defaults {
     pub const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
     pub const STREAM_PROGRESS_SECS: u64 = 30;
     pub const SHUTDOWN_TIMEOUT_SECS: u64 = 30;
+    pub const STATE_FILE: &str = "runtime-state.json";
+    /// Coalesce window for the debounced runtime-state writer. Short enough
+    /// that a confirmed quota 429 reaches disk quickly, long enough to turn
+    /// a multi-key 429 burst into one write.
+    pub const STATE_DEBOUNCE_MS: u64 = 150;
+    /// Default upstream output ceiling. 8K is tight for complex coding
+    /// turns; 32K+ invites runaway generation (issue #6). Overridable.
+    pub const MAX_OUTPUT_TOKENS: u32 = 16_384;
+    // Adaptive file logging defaults (issue #16): sized for a low-resource
+    // host while bounding disk at ~1 GB.
+    pub const LOG_DIRECTORY: &str = "logs";
+    pub const LOG_MAX_FILE_MB: u64 = 64;
+    pub const LOG_MAX_TOTAL_MB: u64 = 1024;
+    pub const LOG_CLEANUP_TARGET_PERCENT: u64 = 85;
+    pub const LOG_FLUSH_INTERVAL_MS: u64 = 1000;
+    pub const LOG_SLOW_TTFT_MS: u64 = 15_000;
+    pub const LOG_SLOW_DURATION_MS: u64 = 60_000;
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -28,6 +47,8 @@ pub struct Config {
     pub cline_api_keys: Vec<ClineKeyConfig>,
     pub models: ModelsConfig,
     pub runtime: RuntimeConfig,
+    pub logging: LoggingConfig,
+    pub glm53: Glm53Config,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -136,6 +157,141 @@ pub enum LogFormat {
     Json,
 }
 
+/// GLM-5.3-Flash request policy (issue #6): bounded reasoning, zero
+/// historical-thinking amplification, capped output. All fields documented
+/// in docs/GLM53_FLASH.md; defaults are the production recommendations.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Glm53Config {
+    pub reasoning: Glm53ReasoningConfig,
+    pub limits: Glm53LimitsConfig,
+    pub context: Glm53ContextConfig,
+    pub telemetry: Glm53TelemetryConfig,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Glm53ReasoningConfig {
+    /// Effort used when the request carries no explicit reasoning control.
+    /// `high` keeps strong coding analysis without the `max` runaway the
+    /// official template would otherwise select for unset efforts.
+    pub default_effort: Glm53Effort,
+    /// Effort used for `thinking: {type: "adaptive"}`.
+    pub adaptive_effort: Glm53Effort,
+    /// Strip `thinking`/`reasoning_content` from historical assistant
+    /// messages (before the last user/tool-result turn) on the upstream
+    /// wire. Text, tool_calls, ids, and order are never touched.
+    pub strip_historical_thinking: bool,
+    /// When upstream reasoning may be surfaced to the client.
+    pub expose_thinking: ThinkingExposure,
+    /// Keep in-turn tool-loop reasoning in a bounded, memory-only shadow
+    /// store (issue #10): when the client did not request thinking, the
+    /// proxy stores reasoning from assistant turns that issued tool calls
+    /// and restores it onto the matching assistant turn of the next
+    /// request in the same reasoning epoch. Never persisted, never logged,
+    /// never truncated; disabled automatically when no stable session
+    /// identity exists.
+    pub shadow_current_turn: bool,
+}
+
+impl Default for Glm53ReasoningConfig {
+    fn default() -> Self {
+        Self {
+            default_effort: Glm53Effort::High,
+            adaptive_effort: Glm53Effort::High,
+            strip_historical_thinking: true,
+            expose_thinking: ThinkingExposure::default(),
+            shadow_current_turn: true,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Glm53LimitsConfig {
+    /// Upstream output ceiling: `effective_max_tokens = min(client, this)`.
+    pub max_output_tokens: u32,
+}
+
+impl Default for Glm53LimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_output_tokens: defaults::MAX_OUTPUT_TOKENS,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Glm53ContextConfig {
+    /// Lossless structural normalization only: single-text-block content
+    /// arrays become strings, empty text blocks are dropped, Anthropic-only
+    /// `metadata` is not forwarded. Never truncates tool results or edits
+    /// tool schemas.
+    pub safe_compaction: bool,
+    /// Remove a *leading* `x-anthropic-billing-header: ...` line from the
+    /// system text. Its dynamic attribution metadata changes between
+    /// requests and would break the system prefix (and upstream prompt
+    /// cache locality) every turn. Start-anchored only: a header mentioned
+    /// later in the text is never touched.
+    pub strip_volatile_billing_header: bool,
+    /// Deterministic key order for historical assistant tool-call argument
+    /// JSON strings. Equivalent semantics then serialize to identical
+    /// bytes, preserving upstream prefix-cache locality. Arrays keep their
+    /// order; plain-text tool results are never parsed or rewritten.
+    pub canonical_tool_json: bool,
+}
+
+impl Default for Glm53ContextConfig {
+    fn default() -> Self {
+        Self {
+            safe_compaction: true,
+            strip_volatile_billing_header: true,
+            canonical_tool_json: true,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Glm53TelemetryConfig {
+    /// Exact GLM token accounting per request via the embedded official
+    /// tokenizer. Runs in a bounded `spawn_blocking` task after the upstream
+    /// request is dispatched, so it never adds to TTFT and never occupies
+    /// more than `max_concurrent_token_counts` CPU slots at once. When the
+    /// slot is busy the count is skipped (logged), never queued.
+    pub exact_input_tokens: bool,
+    /// Concurrent CPU slots for exact token counts. 1 suits most hosts;
+    /// raise on high-core machines, set `exact_input_tokens: false` (or 0)
+    /// to disable.
+    pub max_concurrent_token_counts: u32,
+    /// Stable-prefix hash telemetry per request (`prefix_hash` +
+    /// `prefix_bytes`): a local byte-stability metric, never a proof of an
+    /// upstream cache hit. Also enables session fingerprint extraction.
+    pub prefix_hash: bool,
+    /// Cache metrics from upstream usage when provided: `cached_tokens`,
+    /// `cache_hit_ratio`, `reasoning_ratio`. Ratios are only logged when
+    /// the upstream reports the underlying token figures.
+    pub cache_metrics: bool,
+}
+
+impl Default for Glm53TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            exact_input_tokens: true,
+            max_concurrent_token_counts: 1,
+            prefix_hash: true,
+            cache_metrics: true,
+        }
+    }
+}
+
+/// Config-facing effort level. Reuses the GLM effort vocabulary; `max` is
+/// valid as an explicit client-driven outcome but rejected as a proxy
+/// default (startup validation), because a default of `max` recreates the
+/// runaway this configuration exists to prevent.
+pub type Glm53Effort = crate::glm53::reasoning::GlmReasoningEffort;
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RuntimeConfig {
@@ -144,6 +300,11 @@ pub struct RuntimeConfig {
     pub log_format: LogFormat,
     pub stream_progress_secs: u64,
     pub shutdown_timeout_secs: u64,
+    /// Path of the persisted key runtime state file (relative paths resolve
+    /// against the working directory). `null` or an empty string disables
+    /// persistence. The file never contains key material; see
+    /// `docs/adr/0001-persistent-key-runtime-state-and-stickiness.md`.
+    pub state_file: Option<String>,
 }
 
 impl Default for RuntimeConfig {
@@ -154,7 +315,64 @@ impl Default for RuntimeConfig {
             log_format: LogFormat::Pretty,
             stream_progress_secs: defaults::STREAM_PROGRESS_SECS,
             shutdown_timeout_secs: defaults::SHUTDOWN_TIMEOUT_SECS,
+            state_file: Some(defaults::STATE_FILE.into()),
         }
+    }
+}
+
+/// Bounded adaptive file logging (issue #16): one JSONL record per request
+/// through a dedicated writer thread with a hard directory quota. All
+/// fields have production-safe defaults suitable for a 2C2G host.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LoggingConfig {
+    /// Rolling JSONL request summaries under this directory. `null`/empty
+    /// disables file logging entirely (console still works).
+    pub directory: Option<String>,
+    /// Rotation size per segment.
+    pub max_file_size_mb: u64,
+    /// HARD bound on total managed log bytes; oldest segments are deleted
+    /// past this until `cleanup_target_percent` of the quota remains.
+    pub max_total_size_mb: u64,
+    pub cleanup_target_percent: u64,
+    /// Writer flush cadence (also its queue-wait slice). Data since the
+    /// last flush may be lost on a crash — observability is not a
+    /// transaction; no fsync is ever performed.
+    pub flush_interval_ms: u64,
+    /// Anomaly thresholds: requests slower than these attach their flight
+    /// trace to the summary. Errors/429/transport failures always do.
+    pub slow_ttft_ms: u64,
+    pub slow_duration_ms: u64,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            directory: Some(defaults::LOG_DIRECTORY.into()),
+            max_file_size_mb: defaults::LOG_MAX_FILE_MB,
+            max_total_size_mb: defaults::LOG_MAX_TOTAL_MB,
+            cleanup_target_percent: defaults::LOG_CLEANUP_TARGET_PERCENT,
+            flush_interval_ms: defaults::LOG_FLUSH_INTERVAL_MS,
+            slow_ttft_ms: defaults::LOG_SLOW_TTFT_MS,
+            slow_duration_ms: defaults::LOG_SLOW_DURATION_MS,
+        }
+    }
+}
+
+impl LoggingConfig {
+    pub fn enabled(&self) -> bool {
+        self.directory
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|path| !path.is_empty())
+    }
+
+    pub fn directory_path(&self) -> Option<PathBuf> {
+        self.directory
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
     }
 }
 
@@ -238,6 +456,46 @@ impl Config {
         }
         tracing_subscriber::EnvFilter::try_new(&self.runtime.log_level)
             .context("runtime.log_level must be a valid tracing filter")?;
+
+        if self.logging.enabled() {
+            if self.logging.max_file_size_mb == 0 {
+                bail!("logging.max_file_size_mb must be greater than zero");
+            }
+            if self.logging.max_total_size_mb < self.logging.max_file_size_mb {
+                bail!(
+                    "logging.max_total_size_mb ({}) must be >= max_file_size_mb ({})",
+                    self.logging.max_total_size_mb,
+                    self.logging.max_file_size_mb
+                );
+            }
+            if self.logging.cleanup_target_percent == 0 || self.logging.cleanup_target_percent > 100
+            {
+                bail!("logging.cleanup_target_percent must be 1..=100");
+            }
+            if self.logging.flush_interval_ms < 50 || self.logging.flush_interval_ms > 60_000 {
+                bail!("logging.flush_interval_ms must be 50..60000");
+            }
+        }
+        if !(1024..=131_072).contains(&self.glm53.limits.max_output_tokens) {
+            bail!(
+                "glm53.limits.max_output_tokens must be between 1024 and 131072 (got {})",
+                self.glm53.limits.max_output_tokens
+            );
+        }
+        for (field, effort) in [
+            (
+                "glm53.reasoning.default_effort",
+                self.glm53.reasoning.default_effort,
+            ),
+            (
+                "glm53.reasoning.adaptive_effort",
+                self.glm53.reasoning.adaptive_effort,
+            ),
+        ] {
+            if effort == crate::glm53::reasoning::GlmReasoningEffort::Max {
+                bail!("{field} must not be `max`; explicit max stays available via output_config.effort");
+            }
+        }
         Ok(())
     }
 
@@ -257,6 +515,16 @@ impl Config {
         models.sort();
         models.dedup();
         models
+    }
+
+    /// Resolved runtime-state path, or `None` when persistence is disabled.
+    pub fn state_file_path(&self) -> Option<PathBuf> {
+        self.runtime
+            .state_file
+            .as_ref()
+            .map(|path| path.trim())
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
     }
 }
 
@@ -414,6 +682,10 @@ mod tests {
             config.runtime.shutdown_timeout_secs,
             defaults::SHUTDOWN_TIMEOUT_SECS
         );
+        assert_eq!(
+            config.runtime.state_file.as_deref(),
+            Some(defaults::STATE_FILE)
+        );
         assert!(config.cline_api_keys.is_empty());
     }
 
@@ -423,5 +695,61 @@ mod tests {
         let config = Config::load(path).expect("example configuration must remain valid");
         assert_eq!(config.cline_api_keys.len(), 2);
         assert_eq!(config.upstream.headers, default_cline_headers());
+        assert_eq!(
+            config.glm53.reasoning.default_effort,
+            crate::glm53::reasoning::GlmReasoningEffort::High
+        );
+        assert_eq!(
+            config.glm53.limits.max_output_tokens,
+            defaults::MAX_OUTPUT_TOKENS
+        );
+        assert!(config.glm53.reasoning.strip_historical_thinking);
+        assert!(config.glm53.context.safe_compaction);
+        assert!(config.glm53.context.strip_volatile_billing_header);
+        assert!(config.glm53.context.canonical_tool_json);
+        assert!(config.glm53.telemetry.prefix_hash);
+        assert!(config.glm53.telemetry.cache_metrics);
+    }
+
+    #[test]
+    fn glm53_policy_defaults_are_production_safe() {
+        let config = Config::default();
+        assert_eq!(
+            config.glm53.reasoning.default_effort,
+            crate::glm53::reasoning::GlmReasoningEffort::High
+        );
+        assert_eq!(
+            config.glm53.reasoning.expose_thinking,
+            crate::glm53::reasoning::ThinkingExposure::RequestedOnly
+        );
+        assert_eq!(
+            config.glm53.limits.max_output_tokens,
+            defaults::MAX_OUTPUT_TOKENS
+        );
+        assert!(config.glm53.reasoning.strip_historical_thinking);
+        assert!(config.glm53.telemetry.exact_input_tokens);
+    }
+
+    #[test]
+    fn glm53_policy_rejects_default_max_and_out_of_range_caps() {
+        let mut config = valid_config();
+        config.glm53.reasoning.default_effort = crate::glm53::reasoning::GlmReasoningEffort::Max;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("default_effort"), "{error}");
+
+        let mut config = valid_config();
+        config.glm53.limits.max_output_tokens = 100;
+        assert!(config.validate().is_err());
+        let mut config = valid_config();
+        config.glm53.limits.max_output_tokens = 1_000_000;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn glm53_policy_rejects_unknown_fields() {
+        let config = valid_config();
+        let mut json = serde_json::to_value(&config).unwrap();
+        json["glm53"]["reasoning"]["strip_history"] = serde_json::Value::Bool(true);
+        assert!(serde_json::from_value::<Config>(json).is_err());
     }
 }

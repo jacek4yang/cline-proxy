@@ -1,0 +1,110 @@
+{
+ "name": "rust_code",
+ "anthropic_request": {
+  "model": "z-ai/glm-5.3-flash",
+  "max_tokens": 512,
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "Review this Rust snippet for correctness:\n"
+     },
+     {
+      "type": "text",
+      "text": "fn main() {\n    let points = vec![(0, 0), (1, 2)];\n    for (x, y) in &points {\n        println!(\"({x}, {y})\");\n    }\n}"
+     }
+    ]
+   }
+  ]
+ },
+ "glm_messages": [
+  {
+   "role": "user",
+   "content": [
+    {
+     "type": "text",
+     "text": "Review this Rust snippet for correctness:\n"
+    },
+    {
+     "type": "text",
+     "text": "fn main() {\n    let points = vec![(0, 0), (1, 2)];\n    for (x, y) in &points {\n        println!(\"({x}, {y})\");\n    }\n}"
+    }
+   ]
+  }
+ ],
+ "glm_tools": [],
+ "reasoning_effort": null,
+ "clear_thinking": false,
+ "add_generation_prompt": true,
+ "rendered_prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Review this Rust snippet for correctness:\nfn main() {\n    let points = vec![(0, 0), (1, 2)];\n    for (x, y) in &points {\n        println!(\"({x}, {y})\");\n    }\n}<|assistant|><think>",
+ "token_ids": [
+  154822,
+  154824,
+  154826,
+  25062,
+  287,
+  29905,
+  371,
+  25,
+  7487,
+  154827,
+  19395,
+  419,
+  33627,
+  42820,
+  369,
+  56936,
+  510,
+  8821,
+  1887,
+  368,
+  341,
+  262,
+  1077,
+  3501,
+  284,
+  7486,
+  0,
+  9693,
+  15,
+  11,
+  220,
+  15,
+  701,
+  320,
+  16,
+  11,
+  220,
+  17,
+  12581,
+  262,
+  369,
+  320,
+  87,
+  11,
+  379,
+  8,
+  304,
+  609,
+  7706,
+  341,
+  286,
+  13742,
+  17203,
+  2306,
+  87,
+  2137,
+  314,
+  88,
+  5410,
+  797,
+  262,
+  456,
+  92,
+  154828,
+  154841
+ ],
+ "token_count": 65
+}

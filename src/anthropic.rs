@@ -9,6 +9,7 @@ use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
+use axum::http::header;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::{json, Map, Value};
@@ -55,6 +56,14 @@ pub struct ConvertedRequest {
     pub body: Value,
     pub model: String,
     pub stream: bool,
+    /// Explicit Anthropic reasoning controls, preserved for
+    /// `crate::optimize::optimize_request` (the single resolution point).
+    /// Never forwarded to the OpenAI wire.
+    pub thinking: Option<Value>,
+    pub output_effort: Option<String>,
+    /// Whether upstream reasoning may be surfaced as Anthropic thinking
+    /// blocks. Set by the GLM policy step; false until then.
+    pub expose_thinking: bool,
 }
 
 pub fn convert_request(bytes: &[u8]) -> Result<ConvertedRequest, ProtocolError> {
@@ -70,6 +79,12 @@ pub fn convert_request(bytes: &[u8]) -> Result<ConvertedRequest, ProtocolError> 
         .filter(|value| *value > 0)
         .ok_or_else(|| ProtocolError::invalid("max_tokens must be a positive integer"))?;
     let stream = optional_bool(object, "stream")?.unwrap_or(false);
+    let thinking = object.get("thinking").cloned();
+    let output_effort = object
+        .get("output_config")
+        .and_then(|config| config.get("effort"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
 
     let mut output = Map::new();
     output.insert("model".into(), Value::String(model.clone()));
@@ -119,13 +134,17 @@ pub fn convert_request(bytes: &[u8]) -> Result<ConvertedRequest, ProtocolError> 
             output.insert("parallel_tool_calls".into(), Value::Bool(parallel));
         }
     }
-    if let Some(thinking) = object.get("thinking") {
-        if let Some(effort) = convert_thinking(thinking, max_tokens)? {
-            output.insert("reasoning_effort".into(), Value::String(effort.into()));
-        }
-    }
+    // `thinking` and `output_config.effort` are resolved by
+    // `crate::optimize::optimize_request` against the GLM policy config, so
+    // there is exactly one mapping and every request leaves with an explicit
+    // `reasoning_effort` (unset would coerce to `max` upstream).
     if let Some(config) = object.get("output_config") {
-        convert_output_config(config, &mut output)?;
+        if !config.is_object() {
+            return Err(ProtocolError::invalid("output_config must be an object"));
+        }
+        if let Some(format) = config.get("format") {
+            output.insert("response_format".into(), convert_output_format(format)?);
+        }
     }
     if let Some(format) = object.get("output_format") {
         output.insert("response_format".into(), convert_output_format(format)?);
@@ -137,52 +156,15 @@ pub fn convert_request(bytes: &[u8]) -> Result<ConvertedRequest, ProtocolError> 
         body: Value::Object(output),
         model,
         stream,
+        thinking,
+        output_effort,
+        expose_thinking: false,
     })
 }
 
 pub fn apply_model(converted: &mut ConvertedRequest, model: String) {
     converted.model = model.clone();
     converted.body["model"] = Value::String(model);
-}
-
-pub fn approximate_input_tokens(bytes: &[u8]) -> Result<usize, ProtocolError> {
-    let input: Value = serde_json::from_slice(bytes)
-        .map_err(|error| ProtocolError::invalid(format!("invalid JSON: {error}")))?;
-    let object = input
-        .as_object()
-        .ok_or_else(|| ProtocolError::invalid("request body must be a JSON object"))?;
-    required_string(object, "model")?;
-    if !object.get("messages").is_some_and(Value::is_array) {
-        return Err(ProtocolError::invalid("messages must be an array"));
-    }
-    let mut bytes = estimated_json_bytes(object.get("messages").unwrap_or(&Value::Null));
-    for field in ["system", "tools", "tool_choice", "output_format"] {
-        if let Some(value) = object.get(field) {
-            bytes = bytes.saturating_add(estimated_json_bytes(value));
-        }
-    }
-    Ok(bytes.div_ceil(4))
-}
-
-fn estimated_json_bytes(value: &Value) -> usize {
-    match value {
-        Value::Null => 4,
-        Value::Bool(true) => 4,
-        Value::Bool(false) => 5,
-        Value::Number(number) => number.to_string().len(),
-        Value::String(text) => text.len().saturating_add(2),
-        Value::Array(values) => values.iter().fold(2usize, |total, value| {
-            total
-                .saturating_add(1)
-                .saturating_add(estimated_json_bytes(value))
-        }),
-        Value::Object(object) => object.iter().fold(2usize, |total, (name, value)| {
-            total
-                .saturating_add(name.len())
-                .saturating_add(3)
-                .saturating_add(estimated_json_bytes(value))
-        }),
-    }
 }
 
 fn convert_system(value: &Value) -> Result<Value, ProtocolError> {
@@ -206,6 +188,57 @@ fn convert_system(value: &Value) -> Result<Value, ProtocolError> {
         })
         .collect::<Result<Vec<_>, _>>()
         .map(Value::Array)
+}
+
+/// Normalize the converted OpenAI body's system message(s) for prefix
+/// stability: strip a *leading* `x-anthropic-billing-header:` line (its
+/// dynamic attribution metadata would otherwise change the system prefix
+/// every turn), then join consecutive system messages into one so the
+/// message order is always `system... user...` regardless of how the
+/// client split its system content (issue #8). Returns removed bytes.
+pub fn normalize_system_messages(body: &mut Value) -> u64 {
+    let Some(object) = body.as_object_mut() else {
+        return 0;
+    };
+    let Some(messages) = object.get_mut("messages").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+    // Strip a leading billing header from every system message's text.
+    let mut removed_bytes = 0u64;
+    for message in messages.iter_mut() {
+        if message.get("role").and_then(Value::as_str) != Some("system") {
+            continue;
+        }
+        let strip = |text: &str| -> String {
+            let cut = crate::cache::strip_leading_anthropic_billing_header(text);
+            if cut == 0 {
+                return text.to_owned();
+            }
+            text[cut..].to_owned()
+        };
+        match message.get_mut("content") {
+            Some(Value::String(text)) => {
+                let stripped = strip(text);
+                removed_bytes =
+                    removed_bytes.saturating_add(text.len().saturating_sub(stripped.len()) as u64);
+                message["content"] = Value::String(stripped);
+            }
+            Some(Value::Array(blocks)) => {
+                for block in blocks.iter_mut() {
+                    if block.get("type").and_then(Value::as_str) == Some("text") {
+                        if let Some(Value::String(text)) = block.get_mut("text") {
+                            let stripped = strip(text);
+                            removed_bytes = removed_bytes
+                                .saturating_add(text.len().saturating_sub(stripped.len()) as u64);
+                            *text = stripped;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    removed_bytes
 }
 
 fn convert_message(
@@ -483,62 +516,6 @@ fn convert_tool_choice(value: &Value) -> Result<(Value, Option<bool>), ProtocolE
     Ok((choice, parallel))
 }
 
-fn convert_thinking(value: &Value, max_tokens: u64) -> Result<Option<&'static str>, ProtocolError> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| ProtocolError::invalid("thinking must be an object"))?;
-    match required_string(object, "type")? {
-        "disabled" => Ok(None),
-        "adaptive" => Ok(Some("high")),
-        "enabled" => {
-            let budget = object
-                .get("budget_tokens")
-                .and_then(Value::as_u64)
-                .filter(|value| *value > 0)
-                .ok_or_else(|| ProtocolError::invalid("thinking budget_tokens must be positive"))?;
-            if budget >= max_tokens {
-                return Err(ProtocolError::invalid(
-                    "thinking budget_tokens must be less than max_tokens",
-                ));
-            }
-            Ok(Some(if budget < 4_096 {
-                "low"
-            } else if budget < 16_384 {
-                "medium"
-            } else {
-                "high"
-            }))
-        }
-        kind => Err(ProtocolError::invalid(format!(
-            "unsupported thinking type {kind:?}"
-        ))),
-    }
-}
-
-fn convert_output_config(
-    value: &Value,
-    output: &mut Map<String, Value>,
-) -> Result<(), ProtocolError> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| ProtocolError::invalid("output_config must be an object"))?;
-    if let Some(effort) = object.get("effort") {
-        let effort = effort
-            .as_str()
-            .ok_or_else(|| ProtocolError::invalid("output_config.effort must be a string"))?;
-        let effort = match effort {
-            "low" | "medium" | "high" => effort,
-            "xhigh" | "max" => "high",
-            _ => return Err(ProtocolError::invalid("unsupported output_config.effort")),
-        };
-        output.insert("reasoning_effort".into(), Value::String(effort.into()));
-    }
-    if let Some(format) = object.get("format") {
-        output.insert("response_format".into(), convert_output_format(format)?);
-    }
-    Ok(())
-}
-
 fn convert_output_format(value: &Value) -> Result<Value, ProtocolError> {
     let object = value
         .as_object()
@@ -618,6 +595,7 @@ pub fn convert_response(
     upstream: &Value,
     request_id: &str,
     fallback_model: &str,
+    expose_thinking: bool,
 ) -> Result<Value, ProtocolError> {
     let choice = upstream
         .get("choices")
@@ -629,7 +607,15 @@ pub fn convert_response(
         .and_then(Value::as_object)
         .ok_or_else(|| ProtocolError::upstream("upstream choice did not contain a message"))?;
     let mut content = Vec::new();
-    let reasoning = reasoning_text(message);
+    // Anti-amplification gate: reasoning reaches the client only when the
+    // request explicitly asked for thinking. Unexposed reasoning still cost
+    // this turn's output tokens, but it can never be stored, replayed, and
+    // re-counted by Claude Code on later turns.
+    let reasoning = if expose_thinking {
+        reasoning_text(message)
+    } else {
+        String::new()
+    };
     if !reasoning.is_empty() {
         content.push(json!({
             "type":"thinking",
@@ -791,14 +777,299 @@ pub fn error_envelope(error_type: &str, message: impl Into<String>, request_id: 
     })
 }
 
-pub fn stream_body(
+pub struct StreamShadowContext {
+    pub store: std::sync::Arc<crate::reasoning_shadow::ReasoningShadowStore>,
+    pub session_fingerprint: String,
+}
+
+// --- Upstream stream aggregation for non-stream clients (issue #14) ---
+//
+// Cline streaming is the verified-canonical upstream transport; native
+// non-stream bodies are not (production: 200s whose bodies lacked
+// `choices` after 34-73 s generations). For a downstream non-stream
+// request the proxy therefore sends ONE upstream streaming request and
+// aggregates it locally into a standard OpenAI response body, which then
+// flows through the SAME `convert_response` semantics (thinking exposure,
+// tool_use, stop-reason mapping, usage, reasoning shadow) as every other
+// path. The decision happens before the upstream request is sent — a
+// response-shape mismatch must never be recovered by paying for a second
+// generation.
+//
+// The accumulator holds only the semantic response (text, reasoning,
+// tool-call fragments, usage) — never raw SSE history.
+
+const MAX_AGGREGATED_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+/// One upstream tool call being assembled from delta fragments. Arguments
+/// are appended byte-exactly with `push_str` (never trimmed, reordered, or
+/// reformatted — the JSON must be exactly what the model generated).
+#[derive(Default)]
+struct ToolAccumulator {
+    id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+}
+
+#[derive(Default)]
+struct NonStreamAccumulator {
+    id: Option<String>,
+    model: Option<String>,
+    reasoning: String,
+    text: String,
+    tools: HashMap<u64, ToolAccumulator>,
+    /// Tool-call indices in first-seen (model generation) order.
+    tool_order: Vec<u64>,
+    finish_reason: Option<String>,
+    usage: Value,
+    aggregated_bytes: usize,
+    saw_event: bool,
+    first_event_ms: Option<u128>,
+    first_tool_call_ms: Option<u128>,
+    started: Option<Instant>,
+}
+
+impl NonStreamAccumulator {
+    fn new() -> Self {
+        Self {
+            usage: json!({}),
+            started: Some(Instant::now()),
+            ..Self::default()
+        }
+    }
+
+    fn elapsed_ms(&self) -> u128 {
+        self.started
+            .map(|started| started.elapsed().as_millis())
+            .unwrap_or(0)
+    }
+
+    /// Handle one SSE `data:` payload from the upstream OpenAI-shaped
+    /// stream. Usage-only chunks (empty/absent choices + usage) update the
+    /// usage and continue — they are not protocol errors (§13/§89).
+    fn handle(&mut self, data: &str) -> Result<(), ProtocolError> {
+        if data.trim() == "[DONE]" {
+            return Ok(());
+        }
+        let value: Value = serde_json::from_str(data)
+            .map_err(|_| ProtocolError::upstream("upstream sent invalid SSE JSON"))?;
+        if value.get("error").is_some() {
+            return Err(ProtocolError::upstream("upstream stream error"));
+        }
+        self.saw_event = true;
+        if self.first_event_ms.is_none() {
+            self.first_event_ms = Some(self.elapsed_ms());
+        }
+        if let Some(id) = value.get("id").and_then(Value::as_str) {
+            self.id.get_or_insert_with(|| id.to_owned());
+        }
+        if let Some(model) = value.get("model").and_then(Value::as_str) {
+            self.model.get_or_insert_with(|| model.to_owned());
+        }
+        if let Some(usage) = value.get("usage") {
+            if usage.is_object() && !usage.as_object().is_some_and(Map::is_empty) {
+                // Last complete usage wins (upstream sends one final
+                // cumulative usage; never double-count partials).
+                self.usage = usage.clone();
+            }
+        }
+        let Some(choice) = value
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+        else {
+            // Usage-only or empty-choices chunk: not an error mid-stream.
+            return Ok(());
+        };
+        if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+            self.finish_reason = Some(reason.to_owned());
+        }
+        let Some(delta) = choice.get("delta").and_then(Value::as_object) else {
+            return Ok(());
+        };
+        if let Some(reasoning) = reasoning_delta(delta).filter(|text| !text.is_empty()) {
+            self.reasoning.push_str(reasoning);
+        }
+        if let Some(text) = delta
+            .get("content")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+        {
+            self.text.push_str(text);
+        }
+        if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
+            if self.first_tool_call_ms.is_none() {
+                self.first_tool_call_ms = Some(self.elapsed_ms());
+            }
+            for call in calls {
+                let index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
+                let tool = self.tools.entry(index).or_default();
+                if !self.tool_order.contains(&index) {
+                    self.tool_order.push(index);
+                }
+                if let Some(id) = call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                {
+                    tool.id.get_or_insert_with(|| id.to_owned());
+                }
+                if let Some(function) = call.get("function").and_then(Value::as_object) {
+                    if let Some(name) = function
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .filter(|name| !name.is_empty())
+                    {
+                        tool.name.get_or_insert_with(|| name.to_owned());
+                    }
+                    if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+                        tool.arguments.push_str(arguments);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Assemble the standard OpenAI non-stream response body. Malformed
+    /// tool arguments are left exactly as received — the downstream
+    /// conversion (`convert_response`) applies the existing safe-error
+    /// semantics; the aggregator never "repairs" model output.
+    fn into_response(self, request_id: &str) -> Result<Value, ProtocolError> {
+        if !self.saw_event
+            || (self.text.is_empty()
+                && self.reasoning.is_empty()
+                && self.tools.is_empty()
+                && self.finish_reason.is_none())
+        {
+            return Err(ProtocolError::upstream(
+                "upstream stream ended without any response content",
+            ));
+        }
+        let tool_calls: Vec<Value> = self
+            .tool_order
+            .iter()
+            .filter_map(|index| {
+                let tool = self.tools.get(index)?;
+                if tool.name.is_none() && tool.arguments.is_empty() {
+                    return None; // never received a usable fragment
+                }
+                Some(json!({
+                    "id": tool.id.clone().unwrap_or_else(|| format!("toolu_{index}")),
+                    "type": "function",
+                    "function": {
+                        "name": tool.name.clone().unwrap_or_else(|| "unknown".into()),
+                        "arguments": tool.arguments,
+                    }
+                }))
+            })
+            .collect();
+        let mut message = Map::new();
+        message.insert("role".into(), Value::String("assistant".into()));
+        message.insert("content".into(), Value::String(self.text));
+        if !self.reasoning.is_empty() {
+            message.insert("reasoning_content".into(), Value::String(self.reasoning));
+        }
+        if !tool_calls.is_empty() {
+            message.insert("tool_calls".into(), Value::Array(tool_calls));
+        }
+        Ok(json!({
+            "id": self.id.unwrap_or_else(|| request_id.to_owned()),
+            "model": self.model.unwrap_or_default(),
+            "choices":[{
+                "index": 0,
+                "message": Value::Object(message),
+                "finish_reason": self.finish_reason.unwrap_or_else(|| "stop".into()),
+            }],
+            "usage": self.usage,
+        }))
+    }
+}
+
+/// Consume one upstream streaming response and aggregate it into a final
+/// standard OpenAI response body. If the upstream replied with plain JSON
+/// despite a stream request (defensive), the body is normalized through
+/// the strict envelope layer instead. Returns the body plus upstream-side
+/// timings (`first_event_ms`, `duration_ms`) — never client-facing TTFT.
+pub async fn aggregate_stream_response(
     response: reqwest::Response,
-    request_id: String,
-    fallback_model: String,
-    key_name: String,
-    request_started: Instant,
-    progress_secs: u64,
-) -> Body {
+    request_id: &str,
+) -> Result<(Value, UpstreamBodyShape, Option<u128>, u128), ProtocolError> {
+    let started = Instant::now();
+    let is_json = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("application/json"));
+    if is_json {
+        // Defensive: upstream answered a stream request with a complete
+        // JSON body. Normalize the known envelopes strictly.
+        let value = parse_json_response(response).await?;
+        let (normalized, shape) = normalize_nonstream_body(value)?;
+        return Ok((normalized, shape, None, started.elapsed().as_millis()));
+    }
+    let mut upstream = response.bytes_stream();
+    let mut decoder = SseDecoder::default();
+    let mut accumulator = NonStreamAccumulator::new();
+    loop {
+        let Some(chunk) = upstream.next().await else {
+            break;
+        };
+        let chunk =
+            chunk.map_err(|_| ProtocolError::upstream("upstream stream was interrupted"))?;
+        accumulator.aggregated_bytes = accumulator.aggregated_bytes.saturating_add(chunk.len());
+        if accumulator.aggregated_bytes > MAX_AGGREGATED_RESPONSE_BYTES {
+            return Err(ProtocolError::upstream(
+                "upstream response exceeded the safe aggregation limit",
+            ));
+        }
+        let events = decoder.push(&chunk).map_err(|_| {
+            ProtocolError::upstream("upstream SSE event exceeded the gateway limit")
+        })?;
+        for event in events {
+            accumulator.handle(&event.data)?;
+        }
+    }
+    for event in decoder
+        .finish()
+        .map_err(|_| ProtocolError::upstream("upstream SSE event exceeded the gateway limit"))?
+    {
+        accumulator.handle(&event.data)?;
+    }
+    let timings = (accumulator.first_event_ms, started.elapsed().as_millis());
+    let body = accumulator.into_response(request_id)?;
+    Ok((
+        body,
+        UpstreamBodyShape::StandardOpenAi,
+        timings.0,
+        timings.1,
+    ))
+}
+
+/// Options for [`stream_body`] beyond the response itself.
+pub struct StreamOptions {
+    pub request_id: String,
+    pub fallback_model: String,
+    pub key_name: String,
+    pub request_started: Instant,
+    pub progress_secs: u64,
+    pub expose_thinking: bool,
+    pub shadow: Option<StreamShadowContext>,
+    /// Adaptive observability (issue #16): static summary context; the
+    /// stream emits the single RequestSummary at close.
+    pub summary: Option<crate::obs::StreamSummary>,
+}
+
+pub fn stream_body(response: reqwest::Response, options: StreamOptions) -> Body {
+    let StreamOptions {
+        request_id,
+        fallback_model,
+        key_name,
+        request_started,
+        progress_secs,
+        expose_thinking,
+        shadow,
+        summary,
+    } = options;
     let output = async_stream::stream! {
         let mut upstream = response.bytes_stream();
         let idle = tokio::time::sleep(STREAM_PING_INTERVAL);
@@ -807,11 +1078,12 @@ pub fn stream_body(
         let progress = tokio::time::sleep(progress_interval);
         tokio::pin!(progress);
         let mut decoder = SseDecoder::default();
-        let mut state = StreamState::new(request_id, fallback_model);
+        let mut state = StreamState::new(request_id, fallback_model, expose_thinking, request_started);
         let mut telemetry = StreamTelemetry::new(
             state.request_id.clone(),
-            key_name,
+            key_name.clone(),
             request_started,
+            summary,
         );
         loop {
             tokio::select! {
@@ -828,6 +1100,7 @@ pub fn stream_body(
                                 ));
                                 telemetry.commit(frame.len());
                                 yield Ok::<Bytes, std::io::Error>(frame);
+                                telemetry.absorb(&state);
                                 telemetry.finish("decode_error");
                                 return;
                             }
@@ -841,6 +1114,8 @@ pub fn stream_body(
                                 yield Ok::<Bytes, std::io::Error>(frame);
                             }
                             if state.terminal {
+                                state.commit_shadow(shadow.as_ref());
+                                telemetry.absorb(&state);
                                 telemetry.finish(if state.finish_reason.is_some() { "complete" } else { "protocol_error" });
                                 return;
                             }
@@ -858,6 +1133,7 @@ pub fn stream_body(
                         ));
                         telemetry.commit(frame.len());
                         yield Ok(frame);
+                        telemetry.absorb(&state);
                         telemetry.finish("upstream_error");
                         return;
                     }
@@ -883,6 +1159,7 @@ pub fn stream_body(
                 ));
                 telemetry.commit(frame.len());
                 yield Ok(frame);
+                telemetry.absorb(&state);
                 telemetry.finish("decode_error");
                 return;
             }
@@ -901,6 +1178,8 @@ pub fn stream_body(
                     telemetry.commit(frame.len());
                     yield Ok(frame);
                 }
+                state.commit_shadow(shadow.as_ref());
+                telemetry.absorb(&state);
                 telemetry.finish("complete");
             } else {
                 let frame = sse_frame("error", error_envelope(
@@ -908,6 +1187,7 @@ pub fn stream_body(
                 ));
                 telemetry.commit(frame.len());
                 yield Ok(frame);
+                telemetry.absorb(&state);
                 telemetry.finish("unexpected_eof");
             }
         }
@@ -919,6 +1199,9 @@ struct StreamTelemetry {
     request_id: String,
     key_name: String,
     started: Instant,
+    /// Adaptive observability (issue #16): emits the single RequestSummary
+    /// at close. `None` (tests) falls back to the debug lifecycle line.
+    summary: Option<crate::obs::StreamSummary>,
     upstream_chunks: u64,
     upstream_bytes: u64,
     upstream_events: u64,
@@ -927,14 +1210,34 @@ struct StreamTelemetry {
     committed_to_client: bool,
     saw_first_event: bool,
     finished: bool,
+    /// TTFT: first upstream event (issue #16 summary field).
+    first_event_ms: Option<u128>,
+    /// Output composition accounting, absorbed from the stream state at
+    /// completion. Bytes are SSE delta payload sizes, not tokens.
+    reasoning_bytes: u64,
+    text_bytes: u64,
+    tool_call_bytes: u64,
+    reasoning_events: u64,
+    text_events: u64,
+    tool_call_events: u64,
+    first_reasoning_ms: Option<u128>,
+    first_text_ms: Option<u128>,
+    first_tool_call_ms: Option<u128>,
+    usage: Option<Value>,
 }
 
 impl StreamTelemetry {
-    fn new(request_id: String, key_name: String, started: Instant) -> Self {
+    fn new(
+        request_id: String,
+        key_name: String,
+        started: Instant,
+        summary: Option<crate::obs::StreamSummary>,
+    ) -> Self {
         Self {
             request_id,
             key_name,
             started,
+            summary,
             upstream_chunks: 0,
             upstream_bytes: 0,
             upstream_events: 0,
@@ -943,6 +1246,33 @@ impl StreamTelemetry {
             committed_to_client: false,
             saw_first_event: false,
             finished: false,
+            first_event_ms: None,
+            reasoning_bytes: 0,
+            text_bytes: 0,
+            tool_call_bytes: 0,
+            reasoning_events: 0,
+            text_events: 0,
+            tool_call_events: 0,
+            first_reasoning_ms: None,
+            first_text_ms: None,
+            first_tool_call_ms: None,
+            usage: None,
+        }
+    }
+
+    /// Copy the output-composition counters the stream state collected.
+    fn absorb(&mut self, state: &StreamState) {
+        self.reasoning_bytes = state.reasoning_bytes;
+        self.text_bytes = state.text_bytes;
+        self.tool_call_bytes = state.tool_call_bytes;
+        self.reasoning_events = state.reasoning_events;
+        self.text_events = state.text_events;
+        self.tool_call_events = state.tool_call_events;
+        self.first_reasoning_ms = state.first_reasoning;
+        self.first_text_ms = state.first_text;
+        self.first_tool_call_ms = state.first_tool_call;
+        if state.usage.is_object() && !state.usage.as_object().is_some_and(Map::is_empty) {
+            self.usage = Some(state.usage.clone());
         }
     }
 
@@ -951,12 +1281,7 @@ impl StreamTelemetry {
             return;
         }
         self.saw_first_event = true;
-        tracing::info!(
-            request_id = %self.request_id,
-            selected_key_name = %self.key_name,
-            time_to_first_event_ms = self.started.elapsed().as_millis(),
-            "Anthropic stream received first upstream event"
-        );
+        self.first_event_ms = Some(self.started.elapsed().as_millis());
     }
 
     fn commit(&mut self, bytes: usize) {
@@ -968,7 +1293,7 @@ impl StreamTelemetry {
     }
 
     fn log_progress(&self) {
-        tracing::info!(
+        tracing::debug!(
             request_id = %self.request_id,
             selected_key_name = %self.key_name,
             elapsed_ms = self.started.elapsed().as_millis(),
@@ -978,6 +1303,9 @@ impl StreamTelemetry {
             downstream_frames = self.downstream_frames,
             downstream_bytes = self.downstream_bytes,
             committed_to_client = self.committed_to_client,
+            reasoning_bytes = self.reasoning_bytes,
+            text_bytes = self.text_bytes,
+            tool_call_bytes = self.tool_call_bytes,
             "Anthropic stream still active"
         );
     }
@@ -987,7 +1315,58 @@ impl StreamTelemetry {
             return;
         }
         self.finished = true;
-        tracing::info!(
+        let usage = self.usage.as_ref();
+        // Only report token figures the upstream actually provided; byte
+        // counters above are always real measurements and never converted.
+        let prompt_tokens = usage
+            .and_then(|usage| usage.get("prompt_tokens"))
+            .and_then(Value::as_u64);
+        let completion_tokens = usage
+            .and_then(|usage| usage.get("completion_tokens"))
+            .and_then(Value::as_u64);
+        let cached_tokens = usage
+            .and_then(|usage| usage.get("prompt_tokens_details"))
+            .and_then(|details| details.get("cached_tokens"))
+            .and_then(Value::as_u64);
+        let reasoning_tokens = usage
+            .and_then(|usage| usage.get("completion_tokens_details"))
+            .and_then(|details| details.get("reasoning_tokens"))
+            .and_then(Value::as_u64);
+        // Ratios (issue #8): only computed from figures the upstream
+        // actually reported. OpenAI semantics: `prompt_tokens` INCLUDES
+        // `cached_tokens` (cached is a subset, reported in
+        // prompt_tokens_details), so hit ratio = cached/prompt. If a future
+        // upstream reports them as disjoint, this must be revisited.
+        let cache_hit_ratio = match (cached_tokens, prompt_tokens) {
+            (Some(cached), Some(prompt)) if prompt > 0 => {
+                Some((cached.min(prompt) as f64 / prompt as f64 * 1000.0).round() / 10.0)
+            }
+            _ => None,
+        };
+        let reasoning_ratio = match (reasoning_tokens, completion_tokens) {
+            (Some(reasoning), Some(completion)) if completion > 0 => {
+                Some((reasoning.min(completion) as f64 / completion as f64 * 1000.0).round() / 10.0)
+            }
+            _ => None,
+        };
+        // Adaptive observability (issue #16): the summary is the single
+        // per-request record (console line + JSONL); the wide lifecycle
+        // line stays available at debug level.
+        if let Some(stream_summary) = self.summary.take() {
+            stream_summary.finish(
+                crate::obs::StreamSnap {
+                    request_id: &self.request_id,
+                    key_name: &self.key_name,
+                    ttft_ms: self.first_event_ms,
+                    first_reasoning_ms: self.first_reasoning_ms,
+                    first_text_ms: self.first_text_ms,
+                    first_tool_call_ms: self.first_tool_call_ms,
+                    usage,
+                },
+                outcome,
+            );
+        }
+        tracing::debug!(
             request_id = %self.request_id,
             selected_key_name = %self.key_name,
             outcome,
@@ -996,6 +1375,22 @@ impl StreamTelemetry {
             upstream_events = self.upstream_events,
             downstream_frames = self.downstream_frames,
             committed_to_client = self.committed_to_client,
+            reasoning_bytes = self.reasoning_bytes,
+            text_bytes = self.text_bytes,
+            tool_call_bytes = self.tool_call_bytes,
+            reasoning_events = self.reasoning_events,
+            text_events = self.text_events,
+            tool_call_events = self.tool_call_events,
+            first_reasoning_ms = self.first_reasoning_ms.unwrap_or(0),
+            first_text_ms = self.first_text_ms.unwrap_or(0),
+            first_tool_call_ms = self.first_tool_call_ms.unwrap_or(0),
+            prompt_tokens = prompt_tokens.unwrap_or(0),
+            completion_tokens = completion_tokens.unwrap_or(0),
+            cached_tokens = cached_tokens.unwrap_or(0),
+            reasoning_tokens = reasoning_tokens.unwrap_or(0),
+            cache_hit_ratio = cache_hit_ratio,
+            reasoning_ratio = reasoning_ratio,
+            usage_present = usage.is_some(),
             "Anthropic stream closed"
         );
     }
@@ -1101,6 +1496,9 @@ struct StreamState {
     fallback_model: String,
     started: bool,
     terminal: bool,
+    /// Anti-amplification gate: when false, upstream reasoning is counted
+    /// but never emitted as Anthropic thinking blocks.
+    expose_thinking: bool,
     blocks: Vec<BlockKind>,
     text_index: Option<usize>,
     thinking_index: Option<usize>,
@@ -1108,6 +1506,23 @@ struct StreamState {
     finish_reason: Option<String>,
     stop_sequence: Value,
     usage: Value,
+    /// Output-composition accounting (SSE delta payload bytes; never
+    /// converted to tokens — upstream usage supplies tokens when present).
+    reasoning_bytes: u64,
+    text_bytes: u64,
+    tool_call_bytes: u64,
+    reasoning_events: u64,
+    text_events: u64,
+    tool_call_events: u64,
+    first_reasoning: Option<u128>,
+    first_text: Option<u128>,
+    first_tool_call: Option<u128>,
+    request_started: Instant,
+    /// Reasoning shadow (issue #10): full reasoning text accumulated when
+    /// NOT exposed to the client, for the shadow store. Kept only for the
+    /// stream duration; empty when exposed (client already has it) or no
+    /// shadow context was provided.
+    shadow_reasoning: String,
 }
 
 #[derive(Clone, Copy)]
@@ -1126,12 +1541,18 @@ struct ToolStream {
 }
 
 impl StreamState {
-    fn new(request_id: String, fallback_model: String) -> Self {
+    fn new(
+        request_id: String,
+        fallback_model: String,
+        expose_thinking: bool,
+        request_started: Instant,
+    ) -> Self {
         Self {
             request_id,
             fallback_model,
             started: false,
             terminal: false,
+            expose_thinking,
             blocks: Vec::new(),
             text_index: None,
             thinking_index: None,
@@ -1139,6 +1560,23 @@ impl StreamState {
             finish_reason: None,
             stop_sequence: Value::Null,
             usage: json!({}),
+            reasoning_bytes: 0,
+            text_bytes: 0,
+            tool_call_bytes: 0,
+            reasoning_events: 0,
+            text_events: 0,
+            tool_call_events: 0,
+            first_reasoning: None,
+            first_text: None,
+            first_tool_call: None,
+            request_started,
+            shadow_reasoning: String::new(),
+        }
+    }
+
+    fn mark_first(kind: &mut Option<u128>, request_started: Instant) {
+        if kind.is_none() {
+            *kind = Some(request_started.elapsed().as_millis());
         }
     }
 
@@ -1215,18 +1653,36 @@ impl StreamState {
             }
             if let Some(delta) = choice.get("delta").and_then(Value::as_object) {
                 if let Some(reasoning) = reasoning_delta(delta).filter(|text| !text.is_empty()) {
-                    let index = self.ensure_thinking(&mut frames);
-                    frames.push(sse_frame(
-                        "content_block_delta",
-                        json!({"type":"content_block_delta", "index":index,
-                            "delta":{"type":"thinking_delta", "thinking":reasoning}}),
-                    ));
+                    // Count reasoning even when unexposed: the model still
+                    // produced (and billed) it, and progress telemetry should
+                    // show a stream that is thinking rather than hung.
+                    self.reasoning_bytes =
+                        self.reasoning_bytes.saturating_add(reasoning.len() as u64);
+                    self.reasoning_events = self.reasoning_events.saturating_add(1);
+                    Self::mark_first(&mut self.first_reasoning, self.request_started);
+                    if !self.expose_thinking {
+                        // Shadow accumulation: the client never sees this
+                        // text; the shadow store may hand it to the next
+                        // request in the same reasoning epoch.
+                        self.shadow_reasoning.push_str(reasoning);
+                    }
+                    if self.expose_thinking {
+                        let index = self.ensure_thinking(&mut frames);
+                        frames.push(sse_frame(
+                            "content_block_delta",
+                            json!({"type":"content_block_delta", "index":index,
+                                "delta":{"type":"thinking_delta", "thinking":reasoning}}),
+                        ));
+                    }
                 }
                 if let Some(text) = delta
                     .get("content")
                     .and_then(Value::as_str)
                     .filter(|text| !text.is_empty())
                 {
+                    self.text_bytes = self.text_bytes.saturating_add(text.len() as u64);
+                    self.text_events = self.text_events.saturating_add(1);
+                    Self::mark_first(&mut self.first_text, self.request_started);
                     let index = self.ensure_text(&mut frames);
                     frames.push(sse_frame(
                         "content_block_delta",
@@ -1236,6 +1692,24 @@ impl StreamState {
                 }
                 if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
                     for call in calls {
+                        self.tool_call_events = self.tool_call_events.saturating_add(1);
+                        if let Some(arguments) = call
+                            .get("function")
+                            .and_then(|function| function.get("arguments"))
+                            .and_then(Value::as_str)
+                        {
+                            self.tool_call_bytes =
+                                self.tool_call_bytes.saturating_add(arguments.len() as u64);
+                        }
+                        if self.first_tool_call.is_none()
+                            && call
+                                .get("function")
+                                .and_then(|function| function.get("name"))
+                                .and_then(Value::as_str)
+                                .is_some_and(|name| !name.is_empty())
+                        {
+                            self.first_tool_call = Some(self.request_started.elapsed().as_millis());
+                        }
                         self.handle_tool(call, &mut frames);
                     }
                 }
@@ -1395,6 +1869,63 @@ impl StreamState {
     }
 }
 
+/// Extract reasoning text from an upstream (non-stream) message object.
+/// Shared with the server's reasoning shadow store; returns "" when absent.
+pub fn reasoning_text_from_message(message: &Map<String, Value>) -> String {
+    for name in ["reasoning_content", "reasoning"] {
+        if let Some(text) = message.get(name).and_then(Value::as_str) {
+            return text.to_owned();
+        }
+    }
+    let Some(details) = message.get("reasoning_details") else {
+        return String::new();
+    };
+    match details {
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| {
+                item.as_str().or_else(|| {
+                    item.get("text")
+                        .or_else(|| item.get("content"))
+                        .and_then(Value::as_str)
+                })
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+impl StreamState {
+    /// Reasoning shadow commit (issue #10): called once when the stream
+    /// ends. Responses with tool calls store their (unexposed) reasoning;
+    /// final answers clear the session's shadow state.
+    fn commit_shadow(&mut self, shadow: Option<&StreamShadowContext>) {
+        let Some(context) = shadow else {
+            return;
+        };
+        if self.tools.is_empty() {
+            context.store.clear_session(&context.session_fingerprint);
+            return;
+        }
+        if self.shadow_reasoning.is_empty() {
+            return;
+        }
+        let ids: Vec<String> = self
+            .tools
+            .values()
+            .filter_map(|tool| tool.id.clone())
+            .collect();
+        if !ids.is_empty() {
+            context
+                .store
+                .store(&context.session_fingerprint, &ids, &self.shadow_reasoning);
+        }
+        self.shadow_reasoning.clear();
+    }
+}
+
 fn reasoning_delta(object: &Map<String, Value>) -> Option<&str> {
     object
         .get("reasoning_content")
@@ -1436,13 +1967,150 @@ pub async fn parse_json_response(response: reqwest::Response) -> Result<Value, P
         .map_err(|_| ProtocolError::upstream("upstream returned invalid JSON"))
 }
 
+// --- Upstream response envelope normalization (issue #14) ---
+//
+// HTTP 200 is transport success, not semantic completion success. Cline's
+// native non-stream body shape is not reliably standard OpenAI (production
+// evidence: 34-73 s generations returned 200 with a body missing top-level
+// `choices`, which the proxy then discarded as a 502). This layer classifies
+// a 2xx JSON body strictly and normalizes the one KNOWN non-standard
+// envelope. There is deliberately no recursive `choices` search: only
+// `root.choices` or `success == true && data.choices` (one level) are
+// recognized — anything else is a distinct protocol error, never a guess.
+
+/// Classification of a non-stream upstream JSON body. Logged as shape
+/// metadata only (never the body itself — it may contain model output).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamBodyShape {
+    /// Standard OpenAI Chat Completions response: root `choices` non-empty.
+    StandardOpenAi,
+    /// Known Cline envelope: `success: true` with the OpenAI payload under
+    /// `data` (one level; strict).
+    ClineDataEnvelope,
+    /// `success: false` — upstream application error, never a completion.
+    ApplicationError,
+    /// No `choices` field and no known envelope markers.
+    MissingChoices,
+    /// `choices` exists but is empty in a FINAL non-stream response.
+    EmptyChoices,
+    /// `success: true` but the `data` payload is not a usable OpenAI body.
+    UnrecognizedEnvelope,
+}
+
+impl UpstreamBodyShape {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::StandardOpenAi => "openai",
+            Self::ClineDataEnvelope => "cline_data_envelope",
+            Self::ApplicationError => "upstream_application_error",
+            Self::MissingChoices => "missing_choices",
+            Self::EmptyChoices => "empty_choices",
+            Self::UnrecognizedEnvelope => "unrecognized_envelope",
+        }
+    }
+}
+
+fn choices_usable(object: &Map<String, Value>) -> bool {
+    object
+        .get("choices")
+        .and_then(Value::as_array)
+        .is_some_and(|choices| !choices.is_empty())
+}
+
+pub fn classify_nonstream_body(value: &Value) -> UpstreamBodyShape {
+    let Some(object) = value.as_object() else {
+        return UpstreamBodyShape::MissingChoices;
+    };
+    if object.contains_key("choices") {
+        return if choices_usable(object) {
+            UpstreamBodyShape::StandardOpenAi
+        } else {
+            UpstreamBodyShape::EmptyChoices
+        };
+    }
+    match object.get("success").and_then(Value::as_bool) {
+        Some(true) => {
+            if object
+                .get("data")
+                .and_then(Value::as_object)
+                .is_some_and(choices_usable)
+            {
+                UpstreamBodyShape::ClineDataEnvelope
+            } else {
+                UpstreamBodyShape::UnrecognizedEnvelope
+            }
+        }
+        Some(false) => UpstreamBodyShape::ApplicationError,
+        // `success` absent or non-boolean: not a known envelope marker.
+        None => UpstreamBodyShape::MissingChoices,
+    }
+}
+
+/// Normalize a 2xx non-stream JSON body into a standard OpenAI payload.
+/// Returns the payload plus the observed shape (for telemetry). Fails with
+/// a distinct, content-free protocol error for every non-usable shape.
+pub fn normalize_nonstream_body(value: Value) -> Result<(Value, UpstreamBodyShape), ProtocolError> {
+    let shape = classify_nonstream_body(&value);
+    match shape {
+        UpstreamBodyShape::StandardOpenAi => Ok((value, shape)),
+        UpstreamBodyShape::ClineDataEnvelope => {
+            // Strict one-level unwrap; `data` was verified above.
+            let data = value.get("data").cloned().unwrap_or(Value::Null);
+            Ok((data, shape))
+        }
+        UpstreamBodyShape::ApplicationError => Err(ProtocolError::upstream(
+            "upstream reported an application error for this request",
+        )),
+        UpstreamBodyShape::MissingChoices => Err(ProtocolError::upstream(
+            "upstream response did not contain the choices field",
+        )),
+        UpstreamBodyShape::EmptyChoices => Err(ProtocolError::upstream(
+            "upstream response contained an empty choices array",
+        )),
+        UpstreamBodyShape::UnrecognizedEnvelope => Err(ProtocolError::upstream(
+            "upstream response envelope was not recognized",
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Glm53Config;
+    use crate::optimize::optimize_request;
+    use std::time::Instant;
+
+    fn test_glm_config() -> Glm53Config {
+        Glm53Config::default()
+    }
+
+    /// Convert + apply the GLM policy exactly as the server does, including
+    /// alias resolution (claude-* ids map to the GLM upstream model).
+    fn convert_and_optimize(
+        bytes: &[u8],
+    ) -> Result<(ConvertedRequest, crate::optimize::RequestOptimization), ProtocolError> {
+        let mut converted = convert_request(bytes)?;
+        // Mirror the server: the alias "claude-sonnet-4-6" -> GLM upstream
+        // model is applied before the policy step.
+        if converted.model == "claude-sonnet-4-6" {
+            converted.body["model"] = Value::String("z-ai/glm-5.3-flash".into());
+        }
+        let optimization = optimize_request(
+            &mut converted.body,
+            &test_glm_config(),
+            crate::optimize::Origin::Anthropic {
+                thinking: converted.thinking.as_ref(),
+                output_effort: converted.output_effort.as_deref(),
+            },
+        )
+        .map_err(ProtocolError::invalid)?;
+        converted.expose_thinking = optimization.expose_thinking;
+        Ok((converted, optimization))
+    }
 
     #[test]
     fn request_converts_multimodal_tools_and_tool_result() {
-        let converted = convert_request(
+        let (converted, optimization) = convert_and_optimize(
             serde_json::to_vec(&json!({
                 "model":"claude-sonnet-4-6", "max_tokens":256,
                 "system":[{"type":"text","text":"system","cache_control":{"type":"ephemeral"}}],
@@ -1474,32 +2142,122 @@ mod tests {
         );
         assert_eq!(converted.body["messages"][3]["role"], "tool");
         assert_eq!(converted.body["parallel_tool_calls"], true);
+        // Small thinking budget -> low effort, explicitly on the wire.
         assert_eq!(converted.body["reasoning_effort"], "low");
+        assert_eq!(optimization.reasoning_effort, "low");
+        // thinking blocks never cross to the OpenAI wire as blocks; the
+        // historical reasoning_content is stripped before the last user turn.
+        assert!(converted.body["messages"][1]
+            .get("reasoning_content")
+            .is_none());
+        assert!(converted.body.get("thinking").is_none());
+        assert!(converted.body.get("metadata").is_none());
     }
 
     #[test]
-    fn nonstream_response_converts_reasoning_usage_and_parallel_tools() {
-        let converted = convert_response(
-            &json!({
-                "id":"chat_1","model":"upstream-model",
-                "choices":[{"message":{
-                    "content":"answer","reasoning":"think","tool_calls":[
-                        {"id":"call_1","function":{"name":"Read","arguments":"{\"file_path\":\"/tmp/é\"}"}},
-                        {"id":"call_2","function":{"name":"Write","arguments":"{}"}}
-                    ]
-                },"finish_reason":"tool_calls"}],
-                "usage":{"prompt_tokens":12,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":5}}
-            }),
-            "req_1",
-            "fallback",
+    fn request_without_thinking_defaults_to_explicit_high() {
+        let (converted, optimization) = convert_and_optimize(
+            serde_json::to_vec(&json!({
+                "model":"claude-sonnet-4-6", "max_tokens":64_000,
+                "messages":[{"role":"user","content":"hello"}]
+            }))
+            .unwrap()
+            .as_slice(),
         )
         .unwrap();
-        assert_eq!(converted["content"][0]["type"], "thinking");
-        assert_eq!(converted["content"][2]["input"]["file_path"], "/tmp/é");
-        assert_eq!(converted["content"][3]["name"], "Write");
-        assert_eq!(converted["stop_reason"], "tool_use");
-        assert_eq!(converted["usage"]["input_tokens"], 7);
-        assert_eq!(converted["usage"]["output_tokens"], 3);
+        // The critical unset->max regression: the effort must be explicit.
+        assert_eq!(converted.body["reasoning_effort"], "high");
+        assert_eq!(converted.body["max_tokens"], 16_384);
+        assert_eq!(optimization.client_max_tokens, Some(64_000));
+        assert_eq!(optimization.effective_max_tokens, Some(16_384));
+        assert!(!converted.expose_thinking);
+    }
+
+    #[test]
+    fn requested_thinking_is_exposed_and_unrequested_reasoning_is_not() {
+        let requested = convert_and_optimize(
+            serde_json::to_vec(&json!({
+                "model":"z-ai/glm-5.3-flash", "max_tokens":4_096,
+                "thinking":{"type":"adaptive"},
+                "messages":[{"role":"user","content":"hi"}]
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap()
+        .0;
+        assert!(requested.expose_thinking);
+        assert_eq!(requested.body["reasoning_effort"], "high");
+
+        let unrequested = convert_and_optimize(
+            serde_json::to_vec(&json!({
+                "model":"z-ai/glm-5.3-flash", "max_tokens":4_096,
+                "messages":[{"role":"user","content":"hi"}]
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap()
+        .0;
+        assert!(!unrequested.expose_thinking);
+
+        let disabled = convert_and_optimize(
+            serde_json::to_vec(&json!({
+                "model":"z-ai/glm-5.3-flash", "max_tokens":4_096,
+                "thinking":{"type":"disabled"},
+                "messages":[{"role":"user","content":"hi"}]
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap()
+        .0;
+        assert!(!disabled.expose_thinking);
+        assert_eq!(disabled.body["reasoning_effort"], "low");
+    }
+
+    #[test]
+    fn invalid_thinking_budgets_are_rejected_by_the_policy_step() {
+        let result = convert_and_optimize(
+            serde_json::to_vec(&json!({
+                "model":"z-ai/glm-5.3-flash", "max_tokens":256,
+                "thinking":{"type":"enabled","budget_tokens":4_096},
+                "messages":[{"role":"user","content":"hi"}]
+            }))
+            .unwrap()
+            .as_slice(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn nonstream_response_exposure_gates_thinking_blocks() {
+        let upstream = json!({
+            "id":"chat_1","model":"upstream-model",
+            "choices":[{"message":{
+                "content":"answer","reasoning":"think","tool_calls":[
+                    {"id":"call_1","function":{"name":"Read","arguments":"{\"file_path\":\"/tmp/é\"}"}},
+                    {"id":"call_2","function":{"name":"Write","arguments":"{}"}}
+                ]
+            },"finish_reason":"tool_calls"}],
+            "usage":{"prompt_tokens":12,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":5}}
+        });
+        let exposed = convert_response(&upstream, "req_1", "fallback", true).unwrap();
+        assert_eq!(exposed["content"][0]["type"], "thinking");
+        assert_eq!(exposed["content"][2]["input"]["file_path"], "/tmp/é");
+        assert_eq!(exposed["content"][3]["name"], "Write");
+        assert_eq!(exposed["stop_reason"], "tool_use");
+        assert_eq!(exposed["usage"]["input_tokens"], 7);
+        assert_eq!(exposed["usage"]["output_tokens"], 3);
+
+        let unexposed = convert_response(&upstream, "req_1", "fallback", false).unwrap();
+        assert!(unexposed["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|block| block["type"] != "thinking"));
+        assert_eq!(unexposed["content"][0]["type"], "text");
+        assert_eq!(unexposed["content"][1]["type"], "tool_use");
     }
 
     #[test]
@@ -1510,8 +2268,262 @@ mod tests {
             ]},"finish_reason":"tool_calls"}]}),
             "req",
             "model",
+            true,
         );
         assert!(result.is_err());
+    }
+
+    // --- envelope normalization (issue #14, fixtures §78-85) ---
+
+    fn standard_body() -> Value {
+        json!({
+            "id": "chatcmpl-1", "model": "m",
+            "choices":[{"index":0, "message":{"role":"assistant","content":"hello"},
+                        "finish_reason":"stop"}],
+            "usage":{"prompt_tokens":10,"completion_tokens":2}
+        })
+    }
+
+    #[test]
+    fn normalize_accepts_standard_openai_body() {
+        let (normalized, shape) = normalize_nonstream_body(standard_body()).unwrap();
+        assert_eq!(shape, UpstreamBodyShape::StandardOpenAi);
+        assert_eq!(normalized["choices"][0]["message"]["content"], "hello");
+    }
+
+    #[test]
+    fn normalize_unwraps_known_cline_data_envelope_strictly() {
+        let wrapped = json!({"success": true, "data": standard_body()});
+        let (normalized, shape) = normalize_nonstream_body(wrapped).unwrap();
+        assert_eq!(shape, UpstreamBodyShape::ClineDataEnvelope);
+        assert_eq!(normalized["choices"][0]["message"]["content"], "hello");
+    }
+
+    #[test]
+    fn normalize_wrapped_tool_call_body_yields_openai_shape() {
+        let wrapped = json!({
+            "success": true,
+            "data": {
+                "id":"chat", "choices":[{"message":{
+                    "content":"", "tool_calls":[{"id":"call_9","type":"function",
+                    "function":{"name":"Edit","arguments":"{\"path\":\"a\"}"}}]
+                },"finish_reason":"tool_calls"}],
+                "usage":{"prompt_tokens":3,"completion_tokens":1}
+            }
+        });
+        let (normalized, _) = normalize_nonstream_body(wrapped).unwrap();
+        assert_eq!(
+            normalized["choices"][0]["message"]["tool_calls"][0]["id"],
+            "call_9"
+        );
+        // The unwrapped body must flow through the SAME convert path.
+        let anthropic = convert_response(&normalized, "req", "model", false).unwrap();
+        assert_eq!(anthropic["stop_reason"], "tool_use");
+        assert_eq!(anthropic["content"][0]["type"], "tool_use");
+    }
+
+    #[test]
+    fn normalize_wrapped_reasoning_respects_exposure_downstream() {
+        let wrapped = json!({
+            "success": true,
+            "data": {"choices":[{"message":{"reasoning_content":"secret thoughts",
+                "content":"answer"},"finish_reason":"stop"}]}
+        });
+        let (normalized, _) = normalize_nonstream_body(wrapped).unwrap();
+        let unexposed = convert_response(&normalized, "req", "model", false).unwrap();
+        assert!(unexposed["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|b| b["type"] != "thinking"));
+        let exposed = convert_response(&normalized, "req", "model", true).unwrap();
+        assert_eq!(exposed["content"][0]["type"], "thinking");
+    }
+
+    #[test]
+    fn normalize_success_false_is_an_application_error_not_missing_choices() {
+        let error = normalize_nonstream_body(json!({"success": false, "data": null})).unwrap_err();
+        assert!(error.message.contains("application error"));
+    }
+
+    #[test]
+    fn normalize_missing_choices_is_a_distinct_error() {
+        let error = normalize_nonstream_body(json!({"id":"x","usage":{}})).unwrap_err();
+        assert!(error.message.contains("did not contain the choices field"));
+    }
+
+    #[test]
+    fn normalize_empty_choices_is_a_distinct_error() {
+        let error = normalize_nonstream_body(json!({"choices":[],"usage":{}})).unwrap_err();
+        assert!(error.message.contains("empty choices array"));
+    }
+
+    #[test]
+    fn normalize_never_searches_nested_unrelated_choices() {
+        // `choices` buried under an unrelated key must NOT be unwrapped.
+        let error = normalize_nonstream_body(json!({"foo":{"choices":[
+            {"message":{"content":"x"}}]}}))
+        .unwrap_err();
+        assert!(error.message.contains("did not contain the choices field"));
+    }
+
+    #[test]
+    fn normalize_success_true_without_usable_data_is_unrecognized() {
+        let error =
+            normalize_nonstream_body(json!({"success": true, "data": {"id": "x"}})).unwrap_err();
+        assert!(error.message.contains("envelope was not recognized"));
+    }
+
+    // --- non-stream accumulator (issue #14) ---
+
+    fn sse_data(value: &Value) -> String {
+        format!("data: {value}\n\n")
+    }
+
+    fn feed(accumulator: &mut NonStreamAccumulator, sse: &str) {
+        let mut decoder = SseDecoder::default();
+        for event in decoder.push(sse.as_bytes()).unwrap() {
+            accumulator.handle(&event.data).unwrap();
+        }
+        for event in decoder.finish().unwrap() {
+            accumulator.handle(&event.data).unwrap();
+        }
+    }
+
+    #[test]
+    fn accumulator_aggregates_text_in_order_without_trimming() {
+        let mut accumulator = NonStreamAccumulator::new();
+        feed(
+            &mut accumulator,
+            &format!(
+                "{}{}{}",
+                sse_data(&json!({"id":"c1","choices":[{"delta":{"content":"Hello  "}}]})),
+                sse_data(&json!({"choices":[{"delta":{"content":"wo rld\n"}}]})),
+                sse_data(&json!({"choices":[{"delta":{},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":10,"completion_tokens":3}})),
+            ),
+        );
+        let body = accumulator.into_response("req").unwrap();
+        assert_eq!(body["choices"][0]["message"]["content"], "Hello  wo rld\n");
+        assert_eq!(body["choices"][0]["finish_reason"], "stop");
+        assert_eq!(body["usage"]["completion_tokens"], 3);
+    }
+
+    #[test]
+    fn accumulator_handles_fragmented_parallel_tool_calls_in_generation_order() {
+        let mut accumulator = NonStreamAccumulator::new();
+        feed(
+            &mut accumulator,
+            &format!(
+                "{}{}{}{}",
+                sse_data(&json!({"choices":[{"delta":{"tool_calls":[
+                    {"index":0,"id":"call_a","function":{"name":"Read","arguments":"{\"pa"}},
+                    {"index":1,"id":"call_b","function":{"name":"Write","arguments":"{\"tx"}}
+                ]}}]})),
+                sse_data(&json!({"choices":[{"delta":{"tool_calls":[
+                    {"index":1,"function":{"arguments":"\":\"é\"}"}},
+                    {"index":0,"function":{"arguments":"th\":\"a.rs\"}"}}
+                ]}}]})),
+                sse_data(&json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})),
+                sse_data(&json!({"choices":[],"usage":{"prompt_tokens":8,"completion_tokens":5}})),
+            ),
+        );
+        let body = accumulator.into_response("req").unwrap();
+        let calls = body["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap();
+        assert_eq!(calls.len(), 2);
+        // Generation order (index 0 first), byte-exact fragmented arguments.
+        assert_eq!(calls[0]["id"], "call_a");
+        assert_eq!(calls[0]["function"]["arguments"], "{\"path\":\"a.rs\"}");
+        assert_eq!(calls[1]["id"], "call_b");
+        assert_eq!(calls[1]["function"]["arguments"], "{\"tx\":\"é\"}");
+        // The usage-only empty-choices chunk fed usage without erroring.
+        assert_eq!(body["usage"]["completion_tokens"], 5);
+    }
+
+    #[test]
+    fn accumulator_usage_last_write_wins_never_double_counts() {
+        let mut accumulator = NonStreamAccumulator::new();
+        feed(
+            &mut accumulator,
+            &format!(
+                "{}{}",
+                sse_data(&json!({"choices":[{"delta":{"content":"a"}}],
+                    "usage":{"prompt_tokens":5,"completion_tokens":1}})),
+                sse_data(&json!({"choices":[{"delta":{},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":9,"completion_tokens":2}})),
+            ),
+        );
+        let body = accumulator.into_response("req").unwrap();
+        assert_eq!(body["usage"]["prompt_tokens"], 9);
+        assert_eq!(body["usage"]["completion_tokens"], 2);
+    }
+
+    #[test]
+    fn accumulator_empty_stream_is_a_protocol_error() {
+        let mut accumulator = NonStreamAccumulator::new();
+        feed(&mut accumulator, "data: [DONE]\n\n");
+        let error = accumulator.into_response("req").unwrap_err();
+        assert!(error.message.contains("without any response content"));
+    }
+
+    #[test]
+    fn accumulator_reasoning_is_kept_in_order_for_downstream_exposure_gate() {
+        let mut accumulator = NonStreamAccumulator::new();
+        feed(
+            &mut accumulator,
+            &format!(
+                "{}{}",
+                sse_data(&json!({"choices":[{"delta":{"reasoning_content":"think "}}]})),
+                sse_data(
+                    &json!({"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}]})
+                ),
+            ),
+        );
+        let body = accumulator.into_response("req").unwrap();
+        assert_eq!(body["choices"][0]["message"]["reasoning_content"], "think ");
+        // Same convert semantics as every other path: exposure decides.
+        let unexposed = convert_response(&body, "req", "m", false).unwrap();
+        assert!(unexposed["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|b| b["type"] != "thinking"));
+    }
+
+    #[test]
+    fn accumulator_large_tool_arguments_stay_byte_exact() {
+        let large_value = "x".repeat(100_000);
+        let arguments = json!({ "text": large_value }).to_string();
+        let mut accumulator = NonStreamAccumulator::new();
+        // Feed in 8 KB fragments to exercise repeated appends.
+        let mut start = 0;
+        let mut first = true;
+        while start < arguments.len() {
+            let end = (start + 8192).min(arguments.len());
+            let fragment = &arguments[start..end];
+            let chunk = if first {
+                json!({"choices":[{"delta":{"tool_calls":[
+                    {"index":0,"id":"call_big","function":{"name":"Write","arguments":fragment}}]}}]})
+            } else {
+                json!({"choices":[{"delta":{"tool_calls":[
+                    {"index":0,"function":{"arguments":fragment}}]}}]})
+            };
+            feed(&mut accumulator, &sse_data(&chunk));
+            first = false;
+            start = end;
+        }
+        feed(
+            &mut accumulator,
+            &sse_data(&json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})),
+        );
+        let body = accumulator.into_response("req").unwrap();
+        let wire_arguments = body["choices"][0]["message"]["tool_calls"][0]["function"]
+            ["arguments"]
+            .as_str()
+            .unwrap();
+        assert_eq!(wire_arguments, arguments);
     }
 
     #[test]
@@ -1529,7 +2541,7 @@ mod tests {
 
     #[test]
     fn stream_lifecycle_handles_fragmented_parallel_tool_arguments() {
-        let mut state = StreamState::new("req".into(), "model".into());
+        let mut state = StreamState::new("req".into(), "model".into(), true, Instant::now());
         let mut frames = Vec::new();
         frames.extend(
             state.handle(r#"{"id":"chat","model":"m","choices":[{"delta":{"reasoning":"h"}}]}"#),
@@ -1547,28 +2559,48 @@ mod tests {
         assert!(text.contains("1}"));
         assert!(text.contains("thinking_delta"));
         assert!(text.ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
+        assert_eq!(state.reasoning_bytes, 1);
+        assert_eq!(state.text_bytes, 2);
+        assert!(state.first_tool_call.is_some());
+    }
+
+    #[test]
+    fn unrequested_reasoning_is_counted_but_never_emitted() {
+        let mut state = StreamState::new("req".into(), "model".into(), false, Instant::now());
+        let frames = state.handle(
+            r#"{"id":"chat","model":"m","choices":[{"delta":{"reasoning":"secret thinking"}}]}"#,
+        );
+        // message_start is emitted; no thinking block frames are.
+        let text = frames
+            .iter()
+            .map(|frame| String::from_utf8(frame.to_vec()).unwrap())
+            .collect::<String>();
+        assert!(text.contains("message_start"));
+        assert!(!text.contains("thinking"));
+        assert_eq!(state.reasoning_bytes, "secret thinking".len() as u64);
+        assert!(state.thinking_index.is_none());
+
+        // And a later text delta still produces a correct (index 0) text block.
+        let frames = state.handle(r#"{"choices":[{"delta":{"content":"ok"}}]}"#);
+        assert_eq!(frames.len(), 2); // content_block_start + text_delta
+        let text = frames
+            .iter()
+            .map(|frame| String::from_utf8(frame.to_vec()).unwrap())
+            .collect::<String>();
+        assert!(text.contains("\"index\":0"));
+        assert!(text.contains("text_delta"));
     }
 
     #[test]
     fn malformed_and_truncated_streams_are_terminal_errors() {
-        let mut malformed = StreamState::new("req".into(), "model".into());
+        let mut malformed = StreamState::new("req".into(), "model".into(), true, Instant::now());
         let text = String::from_utf8(malformed.handle("not json")[0].to_vec()).unwrap();
         assert!(text.starts_with("event: error"));
         assert!(malformed.terminal);
 
-        let mut truncated = StreamState::new("req".into(), "model".into());
+        let mut truncated = StreamState::new("req".into(), "model".into(), true, Instant::now());
         let frames = truncated.handle(r#"{"choices":[{"delta":{"content":"partial"}}]}"#);
         assert!(!frames.is_empty());
         assert!(truncated.finish_reason.is_none());
-    }
-
-    #[test]
-    fn token_count_is_explicitly_byte_based_and_robust() {
-        let count = approximate_input_tokens(
-            br#"{"model":"x","messages":[{"role":"user","content":"hello"}]}"#,
-        )
-        .unwrap();
-        assert!(count > 0);
-        assert!(approximate_input_tokens(b"not json").is_err());
     }
 }

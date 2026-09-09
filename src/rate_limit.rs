@@ -7,6 +7,52 @@ use serde_json::Value;
 
 const MAX_PARSED_COOLDOWN: Duration = Duration::from_secs(366 * 24 * 60 * 60);
 
+/// Sub-classification applied only AFTER an effective upstream HTTP 429 has
+/// already been confirmed. Kind names must never be used as failover
+/// triggers; they only describe how the confirmed 429 should be treated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RateLimitKind {
+    /// Daily (or otherwise long-lived) free-quota exhaustion. Strong retry
+    /// deadline, persistent until the quota window resets.
+    DailyQuota,
+    /// Short-lived request-rate limiting (e.g. "too many requests, retry in
+    /// 10s"). Expected to clear quickly.
+    Transient,
+    /// Confirmed 429 that cannot be confidently sub-classified.
+    Unknown,
+}
+
+impl RateLimitKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DailyQuota => "daily_quota",
+            Self::Transient => "transient",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Classify a confirmed effective 429 into a rate-limit kind. Classification
+/// is deliberately conservative: only the explicit daily-free-limit wording
+/// used by Cline quota errors yields DailyQuota, short retry windows yield
+/// Transient, and everything else stays Unknown rather than guessed.
+pub fn classify_rate_limit_kind(message: Option<&str>, duration: Duration) -> RateLimitKind {
+    const TRANSIENT_WINDOW: Duration = Duration::from_secs(60);
+    if let Some(message) = message {
+        let lower = message.to_ascii_lowercase();
+        if lower.contains("daily free limit")
+            || (lower.contains("daily") && lower.contains("limit"))
+        {
+            return RateLimitKind::DailyQuota;
+        }
+    }
+    if duration <= TRANSIENT_WINDOW {
+        return RateLimitKind::Transient;
+    }
+    RateLimitKind::Unknown
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetryHintSource {
     RetryAfter,
@@ -406,6 +452,40 @@ mod tests {
     use super::*;
     use axum::http::HeaderValue;
     use proptest::prelude::*;
+
+    #[test]
+    fn rate_limit_kind_classification_is_conservative() {
+        assert_eq!(
+            classify_rate_limit_kind(
+                Some("Daily free limit reached on model z-ai/glm-5.3-flash. Try again in 8h 37m"),
+                Duration::from_secs(31_020),
+            ),
+            RateLimitKind::DailyQuota
+        );
+        assert_eq!(
+            classify_rate_limit_kind(Some("daily limit exceeded"), Duration::from_secs(60)),
+            RateLimitKind::DailyQuota
+        );
+        assert_eq!(
+            classify_rate_limit_kind(Some("too many requests"), Duration::from_secs(10)),
+            RateLimitKind::Transient
+        );
+        assert_eq!(
+            classify_rate_limit_kind(None, Duration::from_secs(5)),
+            RateLimitKind::Transient
+        );
+        // Long cooldown without explicit daily wording must not be guessed.
+        assert_eq!(
+            classify_rate_limit_kind(Some("quota exhausted"), Duration::from_secs(83_820)),
+            RateLimitKind::Unknown
+        );
+        assert_eq!(
+            classify_rate_limit_kind(None, Duration::from_secs(83_820)),
+            RateLimitKind::Unknown
+        );
+        // Kind words alone are only consulted after a confirmed 429; the
+        // classifier itself never returns a disposition.
+    }
 
     #[test]
     fn parses_required_human_formats() {

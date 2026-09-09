@@ -1,0 +1,76 @@
+{
+ "name": "emoji_unicode",
+ "anthropic_request": {
+  "model": "z-ai/glm-5.3-flash",
+  "max_tokens": 128,
+  "messages": [
+   {
+    "role": "user",
+    "content": "Flags 🇨🇳🇺🇸 math ∑∫√∞ accents café naïve — Ünïcödé ✓ 汉字 Arabic العربية"
+   }
+  ]
+ },
+ "glm_messages": [
+  {
+   "role": "user",
+   "content": "Flags 🇨🇳🇺🇸 math ∑∫√∞ accents café naïve — Ünïcödé ✓ 汉字 Arabic العربية"
+  }
+ ],
+ "glm_tools": [],
+ "reasoning_effort": null,
+ "clear_thinking": false,
+ "add_generation_prompt": true,
+ "rendered_prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Flags 🇨🇳🇺🇸 math ∑∫√∞ accents café naïve — Ünïcödé ✓ 汉字 Arabic العربية<|assistant|><think>",
+ "token_ids": [
+  154822,
+  154824,
+  154826,
+  25062,
+  287,
+  29905,
+  371,
+  25,
+  7487,
+  154827,
+  9192,
+  11157,
+  229,
+  101,
+  9281,
+  229,
+  111,
+  9281,
+  229,
+  118,
+  9281,
+  229,
+  116,
+  6888,
+  11989,
+  239,
+  153417,
+  153400,
+  153404,
+  58068,
+  51609,
+  94083,
+  586,
+  1959,
+  30394,
+  77,
+  37377,
+  66,
+  133324,
+  963,
+  52031,
+  6567,
+  109,
+  231,
+  98845,
+  33952,
+  137930,
+  154828,
+  154841
+ ],
+ "token_count": 49
+}
