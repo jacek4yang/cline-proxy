@@ -6,3 +6,4 @@ target/
 runtime-state.json
 p0-smoke-config.json
 logs/
+axum-smoke-config.json
