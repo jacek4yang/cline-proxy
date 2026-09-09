@@ -137,7 +137,7 @@ fn optimize_generic(object: &mut Map<String, Value>) -> Result<RequestOptimizati
     let mut optimization = RequestOptimization {
         model_family: ModelFamily::GenericOpenAi,
         reasoning_effort: "",
-        before_bytes: serialized_len(&Value::Object(object.clone())),
+        before_bytes: serialized_object_len(object),
         ..RequestOptimization::default()
     };
     optimization.after_bytes = optimization.before_bytes;
@@ -153,7 +153,7 @@ fn optimize_glm(
 ) -> Result<RequestOptimization, String> {
     let mut optimization = RequestOptimization {
         model_family: ModelFamily::Glm53,
-        before_bytes: serialized_len(&Value::Object(object.clone())),
+        before_bytes: serialized_object_len(object),
         ..RequestOptimization::default()
     };
 
@@ -219,7 +219,7 @@ fn optimize_glm(
         object.remove("metadata");
     }
 
-    optimization.after_bytes = serialized_len(&Value::Object(object.clone()));
+    optimization.after_bytes = serialized_object_len(object);
     compute_breakdown(object, &mut optimization);
     Ok(optimization)
 }
@@ -320,6 +320,15 @@ fn compute_breakdown(object: &Map<String, Value>, optimization: &mut RequestOpti
 
 fn serialized_len(value: &Value) -> usize {
     serde_json::to_vec(value)
+        .map(|bytes| bytes.len())
+        .unwrap_or(0)
+}
+
+/// Serialized length of a request-level object without cloning the map
+/// into a temporary `Value` (a 1 MB request would otherwise be copied for
+/// every size probe).
+fn serialized_object_len(object: &Map<String, Value>) -> usize {
+    serde_json::to_vec(object)
         .map(|bytes| bytes.len())
         .unwrap_or(0)
 }
