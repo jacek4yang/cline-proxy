@@ -210,12 +210,25 @@ pub struct Glm53ContextConfig {
     /// `metadata` is not forwarded. Never truncates tool results or edits
     /// tool schemas.
     pub safe_compaction: bool,
+    /// Remove a *leading* `x-anthropic-billing-header: ...` line from the
+    /// system text. Its dynamic attribution metadata changes between
+    /// requests and would break the system prefix (and upstream prompt
+    /// cache locality) every turn. Start-anchored only: a header mentioned
+    /// later in the text is never touched.
+    pub strip_volatile_billing_header: bool,
+    /// Deterministic key order for historical assistant tool-call argument
+    /// JSON strings. Equivalent semantics then serialize to identical
+    /// bytes, preserving upstream prefix-cache locality. Arrays keep their
+    /// order; plain-text tool results are never parsed or rewritten.
+    pub canonical_tool_json: bool,
 }
 
 impl Default for Glm53ContextConfig {
     fn default() -> Self {
         Self {
             safe_compaction: true,
+            strip_volatile_billing_header: true,
+            canonical_tool_json: true,
         }
     }
 }
@@ -233,6 +246,14 @@ pub struct Glm53TelemetryConfig {
     /// raise on high-core machines, set `exact_input_tokens: false` (or 0)
     /// to disable.
     pub max_concurrent_token_counts: u32,
+    /// Stable-prefix hash telemetry per request (`prefix_hash` +
+    /// `prefix_bytes`): a local byte-stability metric, never a proof of an
+    /// upstream cache hit. Also enables session fingerprint extraction.
+    pub prefix_hash: bool,
+    /// Cache metrics from upstream usage when provided: `cached_tokens`,
+    /// `cache_hit_ratio`, `reasoning_ratio`. Ratios are only logged when
+    /// the upstream reports the underlying token figures.
+    pub cache_metrics: bool,
 }
 
 impl Default for Glm53TelemetryConfig {
@@ -240,6 +261,8 @@ impl Default for Glm53TelemetryConfig {
         Self {
             exact_input_tokens: true,
             max_concurrent_token_counts: 1,
+            prefix_hash: true,
+            cache_metrics: true,
         }
     }
 }
@@ -588,6 +611,10 @@ mod tests {
         );
         assert!(config.glm53.reasoning.strip_historical_thinking);
         assert!(config.glm53.context.safe_compaction);
+        assert!(config.glm53.context.strip_volatile_billing_header);
+        assert!(config.glm53.context.canonical_tool_json);
+        assert!(config.glm53.telemetry.prefix_hash);
+        assert!(config.glm53.telemetry.cache_metrics);
     }
 
     #[test]

@@ -189,6 +189,57 @@ fn convert_system(value: &Value) -> Result<Value, ProtocolError> {
         .map(Value::Array)
 }
 
+/// Normalize the converted OpenAI body's system message(s) for prefix
+/// stability: strip a *leading* `x-anthropic-billing-header:` line (its
+/// dynamic attribution metadata would otherwise change the system prefix
+/// every turn), then join consecutive system messages into one so the
+/// message order is always `system... user...` regardless of how the
+/// client split its system content (issue #8). Returns removed bytes.
+pub fn normalize_system_messages(body: &mut Value) -> u64 {
+    let Some(object) = body.as_object_mut() else {
+        return 0;
+    };
+    let Some(messages) = object.get_mut("messages").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+    // Strip a leading billing header from every system message's text.
+    let mut removed_bytes = 0u64;
+    for message in messages.iter_mut() {
+        if message.get("role").and_then(Value::as_str) != Some("system") {
+            continue;
+        }
+        let strip = |text: &str| -> String {
+            let cut = crate::cache::strip_leading_anthropic_billing_header(text);
+            if cut == 0 {
+                return text.to_owned();
+            }
+            text[cut..].to_owned()
+        };
+        match message.get_mut("content") {
+            Some(Value::String(text)) => {
+                let stripped = strip(text);
+                removed_bytes =
+                    removed_bytes.saturating_add(text.len().saturating_sub(stripped.len()) as u64);
+                message["content"] = Value::String(stripped);
+            }
+            Some(Value::Array(blocks)) => {
+                for block in blocks.iter_mut() {
+                    if block.get("type").and_then(Value::as_str) == Some("text") {
+                        if let Some(Value::String(text)) = block.get_mut("text") {
+                            let stripped = strip(text);
+                            removed_bytes = removed_bytes
+                                .saturating_add(text.len().saturating_sub(stripped.len()) as u64);
+                            *text = stripped;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    removed_bytes
+}
+
 fn convert_message(
     value: &Value,
     message_index: usize,
@@ -986,6 +1037,23 @@ impl StreamTelemetry {
             .and_then(|usage| usage.get("completion_tokens_details"))
             .and_then(|details| details.get("reasoning_tokens"))
             .and_then(Value::as_u64);
+        // Ratios (issue #8): only computed from figures the upstream
+        // actually reported. OpenAI semantics: `prompt_tokens` INCLUDES
+        // `cached_tokens` (cached is a subset, reported in
+        // prompt_tokens_details), so hit ratio = cached/prompt. If a future
+        // upstream reports them as disjoint, this must be revisited.
+        let cache_hit_ratio = match (cached_tokens, prompt_tokens) {
+            (Some(cached), Some(prompt)) if prompt > 0 => {
+                Some((cached.min(prompt) as f64 / prompt as f64 * 1000.0).round() / 10.0)
+            }
+            _ => None,
+        };
+        let reasoning_ratio = match (reasoning_tokens, completion_tokens) {
+            (Some(reasoning), Some(completion)) if completion > 0 => {
+                Some((reasoning.min(completion) as f64 / completion as f64 * 1000.0).round() / 10.0)
+            }
+            _ => None,
+        };
         tracing::info!(
             request_id = %self.request_id,
             selected_key_name = %self.key_name,
@@ -1008,6 +1076,8 @@ impl StreamTelemetry {
             completion_tokens = completion_tokens.unwrap_or(0),
             cached_tokens = cached_tokens.unwrap_or(0),
             reasoning_tokens = reasoning_tokens.unwrap_or(0),
+            cache_hit_ratio = cache_hit_ratio,
+            reasoning_ratio = reasoning_ratio,
             usage_present = usage.is_some(),
             "Anthropic stream closed"
         );

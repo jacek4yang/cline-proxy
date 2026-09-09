@@ -89,11 +89,14 @@ fn bench(name: &str, request_bytes: usize, turns: usize, token_count: bool) {
 
     let mut convert_total = 0u128;
     let mut optimize_total = 0u128;
+    let mut cache_total = 0u128;
     let mut serialize_total = 0u128;
     let mut count_total = 0u128;
     let mut after_bytes = 0usize;
     let mut removed_bytes = 0u64;
     let mut tokens = 0u32;
+    let mut prefix_hash = String::new();
+    let mut prefix_bytes = 0usize;
     for _ in 0..rounds {
         let t0 = Instant::now();
         let mut converted = convert_request(&raw).unwrap();
@@ -108,6 +111,22 @@ fn bench(name: &str, request_bytes: usize, turns: usize, token_count: bool) {
         )
         .unwrap();
         let t2 = Instant::now();
+        // Cache-locality pass (issue #8): billing-header strip +
+        // canonicalization + prefix hash. Tracing is disabled here, so the
+        // hash is computed but not logged.
+        cline_proxy::anthropic::normalize_system_messages(&mut converted.body);
+        if let Some(object) = converted.body.as_object_mut() {
+            cline_proxy::cache::canonicalize_tool_arguments(object);
+        }
+        let (hash, bytes) = cline_proxy::cache::stable_prefix_hash(
+            converted
+                .body
+                .as_object()
+                .unwrap_or(&serde_json::Map::new()),
+        );
+        prefix_hash = hash;
+        prefix_bytes = bytes;
+        let t25 = Instant::now();
         let body_bytes = serde_json::to_vec(&converted.body).unwrap();
         let t3 = Instant::now();
         if token_count {
@@ -119,21 +138,25 @@ fn bench(name: &str, request_bytes: usize, turns: usize, token_count: bool) {
         let t4 = Instant::now();
         convert_total += (t1 - t0).as_micros();
         optimize_total += (t2 - t1).as_micros();
-        serialize_total += (t3 - t2).as_micros();
+        cache_total += (t25 - t2).as_micros();
+        serialize_total += (t3 - t25).as_micros();
         count_total += (t4 - t3).as_micros();
         after_bytes = body_bytes.len();
         removed_bytes = optimization.historical_reasoning_bytes_removed;
     }
     let rounds_f = rounds as f64;
+    let _ = &prefix_hash;
     println!(
-        "{name:<14} raw={:>8}B after={:>8}B removed_reasoning={:>7}B tokens={:>7} | \
-         convert={:>7.1}ms optimize={:>7.1}ms serialize={:>7.1}ms count={:>7.1}ms",
+        "{name:<14} raw={:>8}B after={:>8}B removed_reasoning={:>7}B prefix={:>7}B tokens={:>7} | \
+         convert={:>7.1}ms optimize={:>7.1}ms cache={:>6.1}ms serialize={:>7.1}ms count={:>7.1}ms",
         raw.len(),
         after_bytes,
         removed_bytes,
+        prefix_bytes,
         tokens,
         convert_total as f64 / rounds_f / 1000.0,
         optimize_total as f64 / rounds_f / 1000.0,
+        cache_total as f64 / rounds_f / 1000.0,
         serialize_total as f64 / rounds_f / 1000.0,
         count_total as f64 / rounds_f / 1000.0,
     );

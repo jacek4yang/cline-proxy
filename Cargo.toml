@@ -34,6 +34,10 @@ serde = { version = "1", features = ["derive"] }
 # locality (docs/GLM53_FLASH.md).
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
+# Session fingerprints (HMAC over raw Claude Code session ids so raw ids are
+# never logged or forwarded) and stable-prefix hashing (issue #8).
+hmac = "0.12"
+sha2 = "0.10"
 # Exact in-process GLM-5.3-Flash token counting: the official tokenizer.json
 # is HF `tokenizers` format. fancy-regex keeps the build pure-Rust (no ONIG
 # C library); progressbar/http features are not needed. See
