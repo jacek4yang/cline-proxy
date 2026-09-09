@@ -2,6 +2,24 @@
 
 > Agent recovery file. If context is compacted or a session ends, read this
 > file and continue from "Next task".
+>
+> NOTE: this file still has historical append-only sections below. The
+> authoritative rewrite lands in the development-state-refresh phase; the
+> "Current" section immediately below is the only up-to-date part.
+
+## Current (authoritative as of 2026-09-09)
+
+- main: adaptive observability branch `perf/adaptive-observability`
+  (issue #16). Previously merged: P0 Cline non-stream fix (PR #15,
+  issue #14 — downstream stream=false → upstream stream=true → local
+  aggregation), cache locality (PR #9), reasoning epochs + shadow store
+  (PR #11), bounded reasoning (PR #7).
+- Production deployed at `D:\Workspace\cline-proxy-bin` running the P0
+  build; all Cline keys in daily-quota cooldown at deploy time.
+- Open PRs after this one: #1 (actions/checkout 4→7, stale),
+  #2 (axum 0.7→0.8, stale) — planned as phases C and D.
+- Release intentionally deferred. No new concurrency load tests
+  (deferred to real production evidence).
 
 ## Current target
 

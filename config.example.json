@@ -68,5 +68,14 @@
       "prefix_hash": true,
       "cache_metrics": true
     }
+  },
+  "logging": {
+    "directory": "logs",
+    "max_file_size_mb": 64,
+    "max_total_size_mb": 1024,
+    "cleanup_target_percent": 85,
+    "flush_interval_ms": 1000,
+    "slow_ttft_ms": 15000,
+    "slow_duration_ms": 60000
   }
 }

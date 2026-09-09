@@ -5,6 +5,7 @@ pub mod anthropic;
 pub mod cache;
 pub mod config;
 pub mod glm53;
+pub mod obs;
 pub mod optimize;
 pub mod pool;
 pub mod rate_limit;

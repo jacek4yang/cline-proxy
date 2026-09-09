@@ -5,3 +5,4 @@ target/
 /tools/glm_reference/assets/tokenizer.json
 runtime-state.json
 p0-smoke-config.json
+logs/

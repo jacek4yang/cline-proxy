@@ -187,6 +187,23 @@ Full rationale and evidence: `docs/GLM53_FLASH.md` and
   worker and never queued unboundedly; when the slot is busy the count is
   skipped and logged. Logs contain sizes/counts only, never prompt content.
 
+### Adaptive bounded observability
+
+One request = one summary. A request-local trace aggregates counters,
+timings, tokens, and routing in memory; on completion exactly one compact
+console line and one JSONL record are emitted through a **bounded queue
+→ dedicated writer thread** (disk IO never runs on a Tokio worker, a
+full queue drops the record instead of ever slowing a request). Detailed
+lifecycle events live in a request-local RAM flight recorder and are
+attached only to anomalous requests (errors, 429, transport failures,
+TTFT/duration over `logging.slow_ttft_ms`/`slow_duration_ms`).
+File logging has a hard disk quota (`max_total_size_mb`, default 1 GB)
+with 85% cleanup watermark and 64 MB rotation; there is no fsync;
+failures degrade file logging to disabled — the proxy never fails a
+request because of logs. Logs carry names, counts, sizes, timings, and
+fingerprints only, never prompts, reasoning, tool output, or raw session
+ids. See `docs/OBSERVABILITY.md`, `docs/PERFORMANCE.md`, and ADR 0007.
+
 ### Prompt-prefix stability (cache locality)
 
 Upstream prompt caches key on byte-exact prefixes, so per-turn byte drift
