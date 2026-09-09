@@ -1,176 +1,146 @@
 # Development State
 
-> Agent recovery file. If context is compacted or a session ends, read this
-> file and continue from "Next task".
->
-> NOTE: this file still has historical append-only sections below. The
-> authoritative rewrite lands in the development-state-refresh phase; the
-> "Current" section immediately below is the only up-to-date part.
+Last updated: 2026-09-09
+Main SHA: 72c4426 (feat(obs): adaptive bounded observability #17)
+Repository: https://github.com/jacek4yang/cline-proxy
+Status: main green; all roadmap phases through observability merged
 
-## Current (authoritative as of 2026-09-09)
+> Agent recovery protocol — on context compaction or session end:
+> 1. Read this file top to bottom.
+> 2. `git status && git branch --show-current && git pull --ff-only`.
+> 3. Verify main SHA above against `git log --oneline -1`.
+> 4. `gh pr list --state open && gh issue list --state open`.
+> 5. Continue from "Current target". NEVER trust branch names or
+>    "pending merge" phrases from anything below the Historical record.
 
-- main: adaptive observability branch `perf/adaptive-observability`
-  (issue #16). Previously merged: P0 Cline non-stream fix (PR #15,
-  issue #14 — downstream stream=false → upstream stream=true → local
-  aggregation), cache locality (PR #9), reasoning epochs + shadow store
-  (PR #11), bounded reasoning (PR #7).
-- Production deployed at `D:\Workspace\cline-proxy-bin` running the P0
-  build; all Cline keys in daily-quota cooldown at deploy time.
-- Open PRs after this one: #1 (actions/checkout 4→7, stale),
-  #2 (axum 0.7→0.8, stale) — planned as phases C and D.
-- Release intentionally deferred. No new concurrency load tests
-  (deferred to real production evidence).
+## Current production baseline
+
+- main SHA `72c4426`; 186 tests green (debug + release); fmt/clippy
+  `-D warnings` clean.
+- Real E2E (2026-09-09, live Cline + Claude Code, ~300 K-token session):
+  99.8–100.0% warm cache hit ratio, TTFT ≈ first-tool-call, cold prefill
+  ~89 s → cached turns ~10 s, reasoning tokens 0–436/turn under `high`
+  effort. Table in the historical record below and issue #8.
+- Proxy hot path (release, 1.3 MB request): convert 0.9 ms, optimize
+  1.2 ms, cache pass 1.2 ms, serialize 0.5 ms. Exact tokenizer (≈400 ms)
+  runs spawn_blocking + semaphore(1) + busy-skip, off the request path.
+- Production deployment: `D:\Workspace\cline-proxy-bin` (binary updated
+  per release; config with explicit glm53 policy + logging block).
+- Release: INTENTIONALLY DEFERRED (no tags, no GitHub Release, no
+  binaries published).
+
+## Current architecture
+
+```text
+Claude Code
+  → Anthropic Frontend (anthropic.rs)
+      volatile billing-header strip · session fingerprint (HMAC)
+      reasoning-shadow restore (epoch-aware)
+  → GLM policy (optimize.rs; ModelFamily-scoped)
+      explicit reasoning_effort (never unset→max) · output cap 16384
+      historical-thinking strip (epoch boundary = newest HUMAN turn)
+      safe compaction · canonical tool JSON
+  → Cline upstream (upstream.rs; strict sticky keys, effective-429 only)
+      downstream stream=true  → upstream stream=true → SSE translate
+      downstream stream=false → upstream stream=true → local aggregation
+        (strict envelope normalizer; issue #14)
+  → SSE exposure gate (requested_only) · shadow store commit
+  → Adaptive observability (obs.rs): ONE summary/request
+      bounded queue → dedicated writer thread → JSONL (1 GB quota)
+      RAM flight recorder attached to anomalies only
+```
+
+Modules: `anthropic.rs` (protocol), `cache.rs` (prefix stability),
+`optimize.rs` (model policy), `reasoning_shadow.rs` (ephemeral reasoning),
+`obs.rs` (summaries/writer), `pool.rs`+`state.rs` (keys), `glm53/*`
+(exact tokenizer/template).
+
+## Completed milestones
+
+| PR | Milestone |
+|---|---|
+| #4 | Persistent key runtime state (atomic JSON, restart skips cooling keys) |
+| #5 | Exact GLM-5.3-Flash tokenizer (official assets, Rust==oracle parity) |
+| #7 | Bounded reasoning (high default, never unset→max), model-scoped policy, bounded spawn_blocking token telemetry |
+| #9 | Prompt-prefix stability (billing-header strip, canonical tool JSON, prefix hash, session fingerprint) |
+| #11 | Reasoning epochs (human-turn boundary) + bounded reasoning shadow store |
+| #12 | Real E2E cache baseline (99.8–100% warm hits) |
+| #15 | P0 Cline non-stream fix (stream-and-aggregate; strict envelope normalizer; malformed-200 never rotates keys) |
+| #17 | Adaptive bounded observability (one summary/request, dedicated JSONL writer, disk quota, flight recorder) |
+
+Issues #3, #6, #8, #10, #13, #14, #16 closed with their PRs.
+
+## Open PRs / issues
+
+- PR #1 (dependabot): actions/checkout 4→7 — STALE (BEHIND), handled in
+  the checkout phase (merge or supersede via fresh branch).
+- PR #2 (dependabot): axum 0.7.9→0.8.9 — STALE (BEHIND), must NOT be
+  merged directly; dedicated migration branch planned.
+- No open issues.
+
+## Known limitations
+
+- Cline native non-stream bodies are not reliably standard OpenAI
+  (production evidence); the proxy therefore always streams upstream and
+  aggregates locally for non-stream clients. The strict envelope
+  normalizer covers root-`choices` and the known `success/data` envelope;
+  unknown shapes are a safe 502 (no key rotation), not a guess.
+- The reasoning shadow store is memory-only: a proxy restart drops
+  in-epoch reasoning continuity (accepted; reasoning is ephemeral).
+- All Cline keys share daily quotas; when every key is cooling the proxy
+  returns a semantic 429 with Retry-After (by design).
+- No formal Release yet; release workflow does not exist. Deferred on
+  purpose.
+- Real multi-agent concurrency/resource load analysis intentionally
+  deferred: production traffic + JSONL summaries are the evidence source.
 
 ## Current target
 
-Landed (pending PR merge): persistent key runtime state. Next P0: exact
-GLM-5.3-Flash tokenizer for `/v1/messages/count_tokens`, then reasoning
-parity, tool semantics, and large-context low-copy optimization.
+System-hardening sequence, in order (each phase: issue → branch → PR →
+CI → self-review → merge → pull main):
 
-## Repository facts
+1. ✅ P0 Cline non-stream correctness (PR #15).
+2. ✅ Phase A adaptive observability + CPU/RAM bounds (PR #17).
+3. ✅ Phase B: DEVELOPMENT_STATE normalization (this PR).
+4. Phase C: actions/checkout v4→v7 (merge PR #1 after rebase or
+   supersede via `ci/checkout-v7`).
+5. Phase D: axum 0.7→0.8 migration (`chore/axum-0.8-migration`), minimum
+   diff, full regression on streaming/auth/429/shutdown, then supersede
+   PR #2.
+6. STOP (release deferred).
 
-- Repo: https://github.com/jacek4yang/cline-proxy
-- Baseline commit audited: `a73fd75` (main) — 58 tests green, fmt/clippy clean
-- MSRV 1.88, edition 2021, release binary ~7.9 MB (thin LTO, opt-level 3, strip)
-- CI: fmt / check / test / clippy -D warnings (ubuntu, `.github/workflows/ci.yml`)
-- Open PRs (dependabot, untouched): #1 actions/checkout 4→7, #2 axum 0.7.9→0.8.9
-  (axum 0.8 is an API-breaking bump; do NOT merge without a migration pass)
-- Open issues: #3 = umbrella roadmap issue
-- Production observation (9 keys, ~155 KB requests): restart caused
-  key0→key4 serial 429 probes ≈ 3747 ms wasted ≈ 42% of ~9 s TTFT.
+## Next tasks (after Phase D)
 
-## Completed work
+- Observe real production logs (`logs/events-*.jsonl`); analyze only
+  when evidence shows a problem.
+- Do NOT proactively redesign the model path (feature freeze on
+  reasoning/cache/prefix/routing semantics — all verified).
 
-- Full baseline audit (all 8 source files), quality gates green.
-- GLM-5.3-Flash official asset provenance confirmed:
-  - Source: https://huggingface.co/zai-org/GLM-5.3-Flash
-  - Revision SHA: `eb9eb208eb0d988989d07a6a12d0fdeb5f52574a`
-  - Last modified: 2026-09-07; License: MIT
-  - Files present: `tokenizer.json`, `tokenizer_config.json`,
-    `chat_template.jinja`, `config.json`, `generation_config.json`,
-    `processor_config.json`
-  - Local cache of the API metadata: `tools/glm_reference/assets/model_api.json`
-  - Tokenizer asset download + fixture generation NOT yet done.
-- P0 persistent key runtime state IMPLEMENTED on `feat/persistent-key-state`:
-  - `src/state.rs`: versioned schema v1, atomic tmp+rename IO, corrupt-tolerant load
-  - `src/pool.rs`: Healthy/Cooling/HalfOpen/Probing state machine, single-flight
-    HalfOpen probe with drop-safe lease, per-key counters, name-keyed restore,
-    strict sticky select, KeySwitchReason logging
-  - `src/rate_limit.rs`: `RateLimitKind` (DailyQuota/Transient/Unknown), classified
-    only after effective-429 confirmation
-  - `src/upstream.rs`: mark_success on 2xx, probe lease integration, failover
-    latency decomposition (`failed_key_probe_ms`, `successful_upstream_headers_ms`)
-  - `src/server.rs`: authenticated `GET /admin/status`, startup restore in
-    `AppState::new`, debounced writer task in `serve()`, final flush on shutdown
-  - `src/config.rs`: `runtime.state_file` (default `runtime-state.json`, null/"" disables)
-  - Tests: 79 total. Production regression:
-    `restart_with_persisted_state_skips_known_cooling_keys`
-    (5×429 → key6 → persist → restart → attempts=1, failed_probes=0).
-  - Docs: ADR `docs/adr/0001-persistent-key-runtime-state-and-stickiness.md`,
-    README sections "Key stickiness and persisted quota state" + `/admin/status`.
-- MERGED as `838fa3c` (PR #4, CI green).
-- P0 exact GLM-5.3-Flash tokenizer IMPLEMENTED on `feat/glm53-tokenizer`:
-  - Official assets pinned @ `eb9eb20` (MIT): `tokenizer.json` embedded gzip
-    (20.2 MB → 3.0 MB), `chat_template.jinja` unmodified; provenance in
-    `docs/GLM53_FLASH.md`; ADR `docs/adr/0003-glm53-exact-tokenizer.md`.
-  - `src/glm53/{count,messages,reasoning,template,tokenizer}.rs`; lib/bin
-    split (`src/lib.rs`) so benches exercise production code.
-  - Rust == official Python oracle EXACTLY: byte-identical template rendering
-    (minijinja with trim/lstrip_blocks, preserve_order, pycompat, custom
-    Python-style tojson) + identical token counts across 15 golden fixtures
-    (`tests/fixtures/glm53/`, generated by
-    `tools/glm_reference/generate_fixtures.py`, dev-only Python).
-  - `/v1/messages/count_tokens` now exact (`x-cline-proxy-token-count:
-    exact_glm53`); approximate path deleted.
-  - reasoning mapping fixed: GLM has no `medium` — the official template
-    coerced it to `max`. New policy: disabled→low, adaptive→high,
-    budget<8192→low else high; output_config effort low→low,
-    medium/high/xhigh→high, max→max.
-  - Benchmarks (`cargo bench`, release): 1.7 KB→0.6 ms, 16 KB→5.1 ms,
-    62 KB→21 ms, 247 KB→89 ms, 1.3 MB (256k tokens)→503 ms per call.
-    Release binary 7.9 MB → 15.7 MB (accepted, ADR 0003).
-  - Optimization opportunity (not blocking): parallelize BPE encoding for
-    >1 MB prompts (~0.5 s per count at 1.3 MB).
+## Explicitly deferred
 
-## Current branch
+- Release/tags/binaries (intentionally).
+- New concurrency/multi-agent load tests (intentionally).
+- prompt_cache_key (unnecessary: 99.8–100% hits without it).
+- Request gzip, deferred tools, adaptive effort heuristics (no evidence).
 
-`feat/glm53-tokenizer` — exact GLM-5.3-Flash tokenizer implemented; PR opened.
-After merge, re-baseline and pick the next P1 from "Next task".
+## Agent recovery protocol
 
-## Architecture decisions (enforced invariants)
+See the blockquote at the top. In short: this file's top section is the
+only authoritative state; everything under "Historical record" is
+append-only archaeology and must not drive decisions.
 
-- Only effective upstream HTTP 429 (direct, or high-confidence proxy-wrapped)
-  triggers key failover. `src/rate_limit.rs` classification is the sole gate.
-- No committed-stream replay, ever (`src/anthropic.rs` stream body; no retry
-  code is reachable from the body stream).
-- Strict sticky sequential routing: active key is used until it confirms an
-  effective 429; success/5xx/timeout/reset never rotate; an old key whose
-  cooldown expires must NOT steal active back from a healthy key; HalfOpen
-  probing must not preempt the healthy active key.
-- Secrets never appear in logs, Debug impls, state files, or error bodies
-  (`src/redaction.rs`, redacted Debug impls in `config.rs`/`pool.rs`).
-- No Python in the production runtime (tokenizer will be Rust in-process;
-  Python allowed only under `tools/glm_reference/` for oracle fixtures).
+## Historical record (NOT CURRENT STATE)
 
-## Key design (this branch)
+Everything below predates the normalization. Kept for provenance only.
 
-- Runtime state file: `runtime.state_file` in config (default
-  `./runtime-state.json`; explicit `null`/`""` disables persistence).
-- Schema version 1: `{ version, updated_at_unix_ms, active_key, keys: {
-  <key-name>: { cooldown_until_unix_ms, rate_limit_kind, model,
-  last_429_at_unix_ms, last_success_at_unix_ms } } }`. Name-keyed identity
-  (never Vec index). Wall-clock deadlines only (no `Instant` serialized).
-  No secrets, no raw 429 message text.
-- Persistence: in-memory mutation → `Notify` → debounced writer task
-  (~150 ms coalesce) → serialize → tmp file → atomic rename. Health flag
-  exposed in `/admin/status` when persistence fails.
-- Key state machine: Healthy → (effective 429) → Cooling → (deadline
-  expires) → HalfOpen → single-flight probe → success=2xx headers → Healthy
-  / 429 → Cooling / other failure → lease released, stays HalfOpen.
-- HalfOpen is single-flight; requests without alternatives may fall back to
-  a probed HalfOpen key (no worse than pre-existing behavior).
+---
 
-## Completed (perf/glm53-efficient-reasoning, issue #6)
+### Real E2E baseline (2026-09-09, live Cline + Claude Code)
 
-- Root causes confirmed on main: (a) unset `thinking` -> no
-  `reasoning_effort` -> official template coerces unset to `max` (the
-  multi-minute runaway); (b) historical `thinking` re-emitted as
-  `reasoning_content` + unconditional thinking exposure ->
-  per-turn context snowball; (c) unbounded `max_tokens`; (d) Windows CRLF
-  checkout of `chat_template.jinja` broke exact-count fixture parity (+5
-  tokens).
-- `src/glm53/reasoning.rs`: `resolve_reasoning_policy` = single source of
-  truth (effort + `ThinkingExposure`). Precedence fixed+tested:
-  output_config.effort > thinking > default (`high`; `max` rejected as a
-  configured default at startup).
-- `src/optimize.rs` (new): per-request policy — explicit effort, output cap
-  (`min(client, glm53.limits.max_output_tokens)`, default 16384),
-  historical-reasoning strip before last user/tool turn (tool-call chain
-  preserved), safe compaction (single text block -> string, empty blocks
-  dropped, Anthropic `metadata` dropped). Byte-breakdown telemetry.
-- `src/anthropic.rs`: exposure gate on stream + nonstream; stream
-  telemetry (reasoning/text/tool bytes+events, first_*_ms, upstream usage
-  tokens incl. cached/reasoning when present).
-- `src/server.rs`: policy wired into both protocols; background exact
-  token accounting of the optimized request (never on TTFT path);
-  `count_tokens` counts the optimized request
-  (`x-cline-proxy-token-count: exact_glm53_optimized`).
-- Config: `glm53.{reasoning,limits,context,telemetry}` (serde defaults,
-  deny_unknown_fields, startup validation). `.gitattributes` + CRLF
-  normalization in `template.rs`. ADR 0004; README + docs/GLM53_FLASH.md
-  updated; `tests/glm53_policy.rs` (Case A/B/C + escape hatch);
-  `benches/request_optimization.rs` (convert+optimize+serialize ~ms-scale
-  at 1 MB; exact count ~350 ms background).
-
-## Real E2E baseline (2026-09-09, live Cline + Claude Code)
-
-Observed on the production proxy running the merged main build
-(`954c59a`), serving a real Claude Code session with ~300 K-token
-context. Upstream **does** report usage with `cached_tokens` — the
-capability previously marked unverified in ADR 0005 is now confirmed;
-semantics confirmed as `cached_tokens ⊆ prompt_tokens` (subset), so
-`cache_hit_ratio = cached_tokens / prompt_tokens` is correct as
-implemented.
+Observed on the production proxy running main `954c59a`, serving a real
+Claude Code session with ~300 K-token context. Upstream **does** report
+usage with `cached_tokens`; semantics confirmed as
+`cached_tokens ⊆ prompt_tokens`.
 
 | turn | prompt_tokens | cached_tokens | cache_hit_ratio | duration_ms | first_tool_call_ms | reasoning_tokens |
 |------|--------------:|--------------:|----------------:|------------:|-------------------:|-----------------:|
@@ -181,141 +151,33 @@ implemented.
 | 5 | 309,463 | 308,736 | 99.8% | 9,973 | 9,973 | 0 |
 | 6 | 309,587 | 309,440 | 100.0% | 10,312 | 10,312 | 0 |
 
-Findings:
+- Prefix stability works at production scale; `prompt_cache_key` is
+  unnecessary and stays unsent.
+- reasoning_tokens bounded under `high` effort — no runaway.
+- Non-stream upstream quirk [observed, resolved by PR #15]: Cline
+  returned 200 with a non-choices body; now aggregated via upstream
+  streaming.
 
-- **Prefix stability works at production scale**: after the cold turn,
-  consecutive 300 K-token turns hit 99.8–100.0% upstream cache. The
-  small per-turn delta (~400–900 tokens) matches actual new context.
-- TTFT ≈ first_tool_call_ms on tool turns (tool calls come first);
-  cold-start prefill of 307 K tokens took ~89 s upstream — cache hits
-  cut turns 5–6 to ~10 s total, an ~9× improvement vs. the cold turn.
-- reasoning_tokens stay bounded (0–436 per turn) under `high` effort —
-  no runaway.
-- Non-stream upstream quirk **[observed]**: Cline returned 200 with a
-  non-choices body on a non-stream probe (and proxy-wrapped 429s on
-  exhausted keys). Claude Code always streams; non-stream clients may
-  see "upstream response did not contain a choice" when the upstream
-  declines. Streaming E2E fully verified (SSE lifecycle, usage,
-  suppression of unrequested thinking).
-- `prompt_cache_key`: NOT needed for high cache hits — the stable
-  prefix + sticky keys achieve 99.8–100% without it. The probe is
-  unnecessary; the parameter stays unsent (capability marked
-  supported-but-unneeded in practice).
+### Historical milestones (pre-normalization, for provenance)
 
-## Current branch (turn-scoped reasoning + shadow store, issue #10)
-
-`perf/turn-scoped-reasoning` — implemented:
-
-- `optimize.rs`: reasoning-epoch boundary = newest HUMAN user message
-  (Anthropic: user msg with non-tool_result content; OpenAI: newest
-  plain `user` msg). Assistant reasoning before the boundary stripped;
-  current-epoch reasoning preserved (in-epoch tool-loop continuity).
-  `strip_anthropic_thinking`, `collect_anthropic_thinking`,
-  `optimize_messages` all share the boundary.
-- `src/reasoning_shadow.rs`: bounded memory-only shadow store
-  (HMAC-fingerprint + tool-call-id keyed; 256 sessions / 64 MiB total /
-  1 MiB per entry / 10 min TTL; oversized skipped never truncated;
-  no session identity → disabled, no fallback; Arc<str> shared across
-  call groups; LRU + byte eviction; lazy TTL). `restore_into` attaches
-  shadow reasoning to assistant messages after the epoch boundary that
-  carry tool_calls and lack reasoning_content.
-- `server.rs`: AppState.reasoning_shadow; restore before the GLM
-  policy strip (restored reasoning is current-epoch); new-human-turn
-  requests clear the session shadow; non-stream store via
-  `store_reasoning_shadow` (final answer = no tool calls = clear);
-  stream store via `StreamShadowContext` + unexposed reasoning
-  accumulation in StreamState + `commit_shadow` at completion.
-- `anthropic.rs`: `reasoning_text_from_message` (shared extraction);
-  `StreamOptions` bundles stream params; StreamState.shadow_reasoning
-  accumulates when thinking NOT exposed.
-- Config: `glm53.reasoning.shadow_current_turn` (default true).
-- Tests: 9 unit (roundtrip, isolation, clear, oversized, byte/session
-  limits, TTL, stress 300 sessions) + 4 e2e (restore within epoch,
-  multi-agent isolation + clear-on-final, no-identity fail-safe,
-  new-epoch clear) + integration cases A/B/C rewritten for epoch
-  semantics (case C: previous-epoch reasoning contributes exactly 0
-  tokens across 24 human turns).
-- ADR 0006.
-
-Pending: real E2E validation with live Claude Code; cache A/B (issue #8
-follow-up); prompt_cache_key probe.
-
-## Current branch (cache locality, issue #8) — MERGED via PR #9
-
-`perf/claude-code-cache-locality` — implemented so far:
-
-- `src/cache.rs`: `strip_leading_anthropic_billing_header` (LF/CRLF/CR,
-  start-anchored only), `strip_billing_header_in_anthropic_system`
-  (count_tokens parity), `canonical_json_string` +
-  `canonicalize_tool_arguments` (historical turns only, malformed args
-  untouched), `stable_prefix_hash` (SHA-256, sizes+hash only),
-  `session_fingerprint` (HMAC-SHA256, 16 hex chars) +
-  `extract_session_fingerprint` (metadata.user_id/session_id, None =
-  unstable), `log_prefix_telemetry`.
-- `anthropic.rs::normalize_system_messages` wired into the Anthropic
-  handler before the GLM policy (billing header stripped once, shared by
-  wire + count_tokens + telemetry).
-- `optimize`/`openai_chat` paths: canonicalization + prefix telemetry.
-- Stream telemetry: `cache_hit_ratio` (cached/prompt; OpenAI semantics:
-  cached ⊆ prompt — annotated in code, to verify against real Cline
-  usage) and `reasoning_ratio`.
-- Config: `glm53.context.{strip_volatile_billing_header,canonical_tool_json}`,
-  `glm53.telemetry.{prefix_hash,cache_metrics}` (defaults on).
-- Tests: billing-header variants (§47-50), canonical JSON (§48),
-  prefix-hash stability, session fingerprint privacy, end-to-end router
-  test: dynamic billing header + argument order → identical stripped
-  system + canonical arguments.
-- ADR 0005; README section.
-
-Pending on this branch: real E2E A/B (billing header strip on/off vs
-cached_tokens on live Cline), prompt_cache_key probe (explicit test
-script, not production), request-gzip probe (low priority), PR.
-
-## Next task
-
-1. Land the glm53-efficient-reasoning PR (review closeout commit: bounded
-   spawn_blocking tokenizer telemetry, model-scoped GLM policy, estimate
-   naming); re-baseline on main.
-2. Real E2E before/after against live Cline + Claude Code (TTFT, input/
-   output/reasoning tokens, first-tool-call latency, task success) using
-   the new telemetry fields; record numbers in issue #6.
-3. P1 queue: turn-scoped reasoning (Anthropic `role=user` +
-   `tool_result` must NOT end a reasoning epoch — current strip boundary
-   uses the last user/tool turn which is correct for Claude Code's shape
-   but should be expressed as human-turn vs tool-result semantics);
-   session/branch identity + reasoning shadow store; prompt prefix
-   stability (billing-header strip, canonical tool JSON, prefix hash);
-   Claude Code tool semantics matrix; request-gzip compatibility probe
-   (low priority).
-
-## Review closeout (PR #7, this branch)
-
-- `optimize.rs`: new `ModelFamily` (Glm53 vs GenericOpenAi) resolved from
-  the upstream model id (segment match: `glm` or `glm<digit>`);
-  `optimize_request` dispatches — GLM gets the full policy, all other
-  models are a strict byte-passthrough (no effort injection, no cap, no
-  strip, no metadata removal). Tests: family detection edges
-  (`aglm-4`, `kaggle`), generic passthrough byte-equality.
-- `server.rs`: exact token telemetry moved from `tokio::spawn` (async
-  workers) to `tokio::task::spawn_blocking` bounded by a semaphore
-  (`glm53.telemetry.max_concurrent_token_counts`, default 1,
-  `try_acquire_owned` — busy slot = skip + log, never queue).
-  Saturation test: 10 concurrent requests + liveness ticker (max sleep
-  gap < 500 ms proves no worker stall). Telemetry naming fixed: removed
-  chunk tokenization is now logged as
-  `estimated_tokens_removed_historical_reasoning` (exact before/after
-  would need a second full tokenization; not paid in production).
-  GLM-only: `count_tokens` rejects non-GLM upstream models with an
-  explicit error instead of a wrong-template count.
-- Tests must resolve the `claude-sonnet-4-6` alias before the policy step
-  (mirrors the server); helpers in `anthropic.rs` tests and
-  `tests/glm53_policy.rs` updated.
-
-## Commands
-
-```bash
-cargo fmt --all -- --check
-cargo check --all-targets
-cargo test --all-targets
-cargo clippy --all-targets --all-features -- -D warnings
-```
+- PR #4 persistent key runtime state: `state.rs` v1 schema, atomic
+  tmp+rename, `pool.rs` Healthy/Cooling/HalfOpen single-flight probe,
+  debounced writer, restart regression test (5×429 → key6 → restart →
+  first-attempt success). ADR 0001.
+- PR #5 exact tokenizer: official assets pinned @ `eb9eb20` (MIT),
+  Rust == Python oracle byte-for-byte across 15 golden fixtures,
+  `/v1/messages/count_tokens` exact, CRLF parity via `.gitattributes`
+  + include-time normalization. ADR 0003.
+- PR #7 bounded reasoning: `resolve_reasoning_policy` single source,
+  safe compaction, output cap, Windows CRLF fixture fix. ADR 0004.
+- PR #9 prefix stability: `cache.rs` (billing-header strip LF/CRLF/CR,
+  canonical JSON, SHA-256 prefix hash, HMAC session fingerprint).
+  ADR 0005.
+- PR #11 reasoning epochs + shadow store: human-turn boundary, bounded
+  memory-only store (256 sessions / 64 MiB / 1 MiB / 10 min TTL),
+  multi-agent isolation tests. ADR 0006.
+- PR #15 non-stream fix: `NonStreamAccumulator` (byte-exact aggregation,
+  parallel tool calls, usage last-write-wins, 16 MiB bound), strict
+  envelope normalizer, transport-vs-logical log fix.
+- PR #17 adaptive observability: `obs.rs` summary pipeline, writer
+  thread, quotas, flight recorder. ADR 0007.
