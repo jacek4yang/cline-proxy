@@ -119,7 +119,10 @@ fn bench(name: &str, request_bytes: usize, turns: usize, token_count: bool) {
             cline_proxy::cache::canonicalize_tool_arguments(object);
         }
         let (hash, bytes) = cline_proxy::cache::stable_prefix_hash(
-            converted.body.as_object().unwrap_or(&serde_json::Map::new()),
+            converted
+                .body
+                .as_object()
+                .unwrap_or(&serde_json::Map::new()),
         );
         prefix_hash = hash;
         prefix_bytes = bytes;
