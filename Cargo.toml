@@ -10,7 +10,7 @@ license = "MIT"
 [dependencies]
 anyhow = "1"
 async-stream = "0.3"
-axum = { version = "0.7", features = ["macros"] }
+axum = { version = "0.8", features = ["macros"] }
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
