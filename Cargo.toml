@@ -42,7 +42,7 @@ sha2 = "0.10"
 # is HF `tokenizers` format. fancy-regex keeps the build pure-Rust (no ONIG
 # C library); progressbar/http features are not needed. See
 # docs/GLM53_FLASH.md and ADR 0003.
-tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
 tokio = { version = "1", features = ["full"] }
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
