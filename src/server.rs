@@ -605,6 +605,7 @@ async fn anthropic_messages(
         } else {
             "stream_and_aggregate"
         },
+        route: state.upstream.route().kind(),
         started,
         slow_ttft_ms: state.config.logging.slow_ttft_ms,
         slow_duration_ms: state.config.logging.slow_duration_ms,
@@ -3257,6 +3258,39 @@ mod tests {
             0
         );
         task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn socks5_connect_failure_does_not_switch_key_or_replay() {
+        let (base, mock, task) = start_mock().await;
+        mock.set(
+            "cline-key-1",
+            vec![Spec::json(200, successful_json("must-not-run"))],
+        )
+        .await;
+        mock.set(
+            "cline-key-2",
+            vec![Spec::json(200, successful_json("must-not-run"))],
+        )
+        .await;
+        let mut config = test_config(base, 2);
+        config.upstream.proxy = Some("socks5://127.0.0.1:59999".into());
+        config.upstream.connect_timeout_secs = 1;
+        config.upstream.timeout_secs = 2;
+        let state = AppState::new(config).unwrap();
+        assert_eq!(state.upstream.route().kind(), "socks5");
+        let app = router(state.clone());
+        let response = app
+            .oneshot(gateway_request("/v1/chat/completions", chat_body(false)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(mock.seen().await.is_empty());
+        assert_eq!(
+            state.upstream.pool().select(&HashSet::new()).unwrap().index,
+            0
+        );
+        task.abort();
     }
 
     fn unique_state_path(name: &str) -> std::path::PathBuf {

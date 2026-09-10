@@ -25,7 +25,7 @@ minijinja = { version = "2", default-features = false, features = ["builtins", "
 # (dict.items(), str.strip(), str.split()); pycompat supplies them without
 # modifying the official template file.
 minijinja-contrib = { version = "2", default-features = false, features = ["pycompat"] }
-reqwest = { version = "0.12", default-features = false, features = ["gzip", "http2", "json", "rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["gzip", "http2", "json", "rustls-tls", "socks", "stream"] }
 serde = { version = "1", features = ["derive"] }
 # preserve_order: GLM-5.3-Flash's official chat template serializes tool
 # schemas with insertion-ordered JSON; sorted keys would change the exact

@@ -28,7 +28,7 @@ use std::time::Duration;
 use crate::console::{format_duration_ms, format_tokens};
 
 /// JSONL schema for `RequestSummary`. Bump when field meaning changes.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Approximate upper bound of one summary's serialized size, used to
 /// document queue memory: 8192 × ~1 KiB ≈ 8 MiB worst case, typically
@@ -156,6 +156,8 @@ pub struct RequestSummary {
     pub session: Option<String>,
     pub downstream_stream: bool,
     pub upstream_strategy: &'static str,
+    /// `direct`, `socks5`, or `socks5h`. Never includes proxy credentials.
+    pub route: &'static str,
     pub selected_key_name: String,
     pub attempts: u64,
     pub failover_count: u64,
@@ -609,6 +611,7 @@ impl SummaryBuilder {
             session: self.session.clone(),
             downstream_stream: self.downstream_stream,
             upstream_strategy: self.upstream_strategy,
+            route: facts.route,
             selected_key_name: facts.selected_key_name.to_owned(),
             attempts: facts.attempts,
             failover_count: facts.failover_count,
@@ -728,9 +731,10 @@ fn compact_request_line(summary: &RequestSummary, session: Option<&str>) -> Stri
         .map(|kind| format!(" err={kind}"))
         .unwrap_or_default();
     format!(
-        "{symbol} {family} agent={} key={} in={input}{budget} cache={cache} out={out} ttft={ttft}{tool} dur={}{err}",
+        "{symbol} {family} agent={} key={} route={} in={input}{budget} cache={cache} out={out} ttft={ttft}{tool} dur={}{err}",
         session.unwrap_or("-"),
         summary.selected_key_name,
+        summary.route,
         format_duration_ms(summary.duration_ms),
     )
 }
@@ -740,6 +744,7 @@ fn compact_request_line(summary: &RequestSummary, session: Option<&str>) -> Stri
 pub struct SummaryEmit<'a> {
     pub sink: Option<&'a LogSink>,
     pub selected_key_name: &'a str,
+    pub route: &'static str,
     pub attempts: u64,
     pub failover_count: u64,
     pub reasoning_effort: &'static str,
@@ -800,6 +805,7 @@ pub struct StreamSummary {
     pub model_family: &'static str,
     pub downstream_stream: bool,
     pub upstream_strategy: &'static str,
+    pub route: &'static str,
     pub started: Instant,
     pub slow_ttft_ms: u64,
     pub slow_duration_ms: u64,
@@ -875,6 +881,7 @@ impl StreamSummary {
         builder.emit(SummaryEmit {
             sink: self.sink.as_ref(),
             selected_key_name: snap.key_name,
+            route: self.route,
             attempts: 1,
             failover_count: 0,
             reasoning_effort: self.reasoning_effort,
@@ -949,6 +956,7 @@ impl StreamSummary {
         builder.emit(SummaryEmit {
             sink: self.sink.as_ref(),
             selected_key_name: key_name,
+            route: self.route,
             attempts,
             failover_count,
             reasoning_effort: self.reasoning_effort,
@@ -1157,6 +1165,7 @@ mod tests {
             session: Some("ab12cd34ef56ab12".into()),
             downstream_stream: false,
             upstream_strategy: "stream_and_aggregate",
+            route: "direct",
             selected_key_name: "key-1".into(),
             attempts: 1,
             failover_count: 0,
@@ -1227,6 +1236,7 @@ mod tests {
         assert!(value.get("flight").is_none());
         // Sensible serialized size (bounded queue math).
         assert_eq!(value["schema_version"], SCHEMA_VERSION);
+        assert_eq!(value["route"], "direct");
         assert!(value.get("prompt").is_none());
         assert!(
             bytes.len() < 4096,
@@ -1356,6 +1366,7 @@ mod tests {
         record.tool_call_events = 0;
         let line = compact_request_line(&record, Some("abcd"));
         assert!(line.contains("in=199.6K"), "{line}");
+        assert!(line.contains("route=direct"), "{line}");
         assert!(line.contains("budget=216.0K"), "{line}");
         assert!(line.contains("out=t2+r4+k0"), "{line}");
         assert!(!line.contains("in=?"), "{line}");
@@ -1388,6 +1399,7 @@ mod tests {
         builder.emit(SummaryEmit {
             sink: Some(&sink),
             selected_key_name: "k",
+            route: "direct",
             attempts: 1,
             failover_count: 0,
             reasoning_effort: "high",
@@ -1466,6 +1478,7 @@ mod tests {
         builder.emit(SummaryEmit {
             sink: Some(&sink),
             selected_key_name: "k",
+            route: "direct",
             attempts: 1,
             failover_count: 0,
             reasoning_effort: "high",
