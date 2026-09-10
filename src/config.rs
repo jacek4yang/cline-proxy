@@ -319,7 +319,8 @@ pub struct Glm53TelemetryConfig {
     pub max_concurrent_token_counts: u32,
     /// Stable-prefix hash telemetry per request (`prefix_hash` +
     /// `prefix_bytes`): a local byte-stability metric, never a proof of an
-    /// upstream cache hit. Also enables session fingerprint extraction.
+    /// upstream cache hit. Purely observational: session identity (X-Task-ID,
+    /// reasoning shadow) is extracted independently of this flag.
     pub prefix_hash: bool,
     /// Cache metrics from upstream usage when provided: `cached_tokens`,
     /// `cache_hit_ratio`, `reasoning_ratio`. Ratios are only logged when
@@ -609,6 +610,10 @@ fn validate_headers(headers: &BTreeMap<String, String>) -> Result<()> {
         "accept-encoding",
         "cookie",
         "x-api-key",
+        // Session affinity is server-controlled: the dynamic X-Task-ID must
+        // never be overridden (or spoofed) by a statically configured header.
+        "x-task-id",
+        "x-request-id",
     ];
     for (name, value) in headers {
         let parsed_name = HeaderName::try_from(name.as_str())
@@ -679,6 +684,19 @@ mod tests {
             .upstream
             .headers
             .insert("Authorization".into(), "secret".into());
+        assert!(config.validate().is_err());
+        // Session affinity is server-controlled and cannot be configured.
+        let mut config = valid_config();
+        config
+            .upstream
+            .headers
+            .insert("x-task-id".into(), "static".into());
+        assert!(config.validate().is_err());
+        let mut config = valid_config();
+        config
+            .upstream
+            .headers
+            .insert("x-request-id".into(), "static".into());
         assert!(config.validate().is_err());
     }
 

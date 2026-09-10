@@ -20,6 +20,17 @@ use crate::redaction::sanitize_text;
 
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 
+/// Per-logical-request data shared by every failover attempt: the body,
+/// protocol flags, and session-affinity header must be byte-identical for
+/// key A and key B; only Authorization rotates between attempts.
+struct LogicalRequest<'a> {
+    body: &'a Bytes,
+    stream: bool,
+    request_id: &'a str,
+    model: &'a str,
+    task_id: Option<&'a str>,
+}
+
 #[derive(Clone)]
 pub struct ClineUpstream {
     inner: Arc<Inner>,
@@ -147,13 +158,29 @@ impl ClineUpstream {
     /// Send one logical chat request. Only a classified effective HTTP 429 can
     /// enter the retry branch. Transport errors return before response-body
     /// classification, and successful responses retain streaming ownership.
+    ///
+    /// `task_id` is the server-derived session fingerprint (X-Task-ID). It is
+    /// computed ONCE per logical request and passed unchanged through every
+    /// failover attempt, so key A and key B observe the same body, the same
+    /// X-Task-ID, and differ only in Authorization. `None` sends no header —
+    /// without a reliable session identity affinity is never faked.
     pub async fn send_chat(
         &self,
         body: Bytes,
         stream: bool,
         request_id: &str,
         model: &str,
+        task_id: Option<&str>,
     ) -> std::result::Result<UpstreamResult, UpstreamError> {
+        // Everything a failover attempt needs that must stay byte-identical
+        // across attempts lives here; only Authorization rotates.
+        let logical = LogicalRequest {
+            body: &body,
+            stream,
+            request_id,
+            model,
+            task_id,
+        };
         let mut attempted = HashSet::with_capacity(self.inner.pool.len());
         let mut failed_probes_ms = 0u128;
         loop {
@@ -171,7 +198,7 @@ impl ClineUpstream {
                 .is_probe
                 .then(|| self.inner.pool.probe_lease(selected.index));
             let (response, attempt_elapsed) = self
-                .send_once(&selected, body.clone(), stream, request_id, model, attempt)
+                .send_once(&selected, &logical, attempt)
                 .await
                 .map_err(UpstreamError::Transport)?;
 
@@ -288,25 +315,40 @@ impl ClineUpstream {
         }
     }
 
+    /// One failover attempt. `request` carries everything that must stay
+    /// byte-identical across attempts; only Authorization rotates here.
     async fn send_once(
         &self,
         selected: &SelectedKey,
-        body: Bytes,
-        stream: bool,
-        request_id: &str,
-        model: &str,
+        request: &LogicalRequest<'_>,
         attempt: usize,
     ) -> std::result::Result<(reqwest::Response, Duration), reqwest::Error> {
+        let LogicalRequest {
+            body,
+            stream,
+            request_id,
+            model,
+            task_id,
+        } = request;
         let started = Instant::now();
         let mut headers = self.inner.headers.clone();
         headers.insert(
             header::ACCEPT,
-            HeaderValue::from_static(if stream {
+            HeaderValue::from_static(if *stream {
                 "text/event-stream"
             } else {
                 "application/json"
             }),
         );
+        // Dynamic session affinity (X-Task-ID): inserted after the configured
+        // static headers so the per-session fingerprint always wins over any
+        // user-configured value (config validation also rejects a configured
+        // `x-task-id`). Identical for every attempt of one logical request.
+        if let Some(task_id) = task_id {
+            if let Ok(value) = HeaderValue::try_from(*task_id) {
+                headers.insert("x-task-id", value);
+            }
+        }
         // Construct authorization last and never copy caller headers. Config
         // validation also forbids every authentication/framing override.
         let authorization = format!("Bearer {}", selected.api_key());
@@ -328,7 +370,7 @@ impl ClineUpstream {
                     .map(|response| (response, started.elapsed()));
             }
         }
-        if let Ok(value) = HeaderValue::try_from(request_id) {
+        if let Ok(value) = HeaderValue::try_from(*request_id) {
             headers.insert("x-request-id", value);
         }
         let result = self
@@ -336,14 +378,14 @@ impl ClineUpstream {
             .http
             .post(self.inner.chat_url.clone())
             .headers(headers)
-            .body(body)
+            .body((*body).clone())
             .send()
             .await;
         let elapsed = started.elapsed();
         match &result {
             Ok(response) => tracing::debug!(
                 request_id,
-                requested_model = model,
+                requested_model = *model,
                 selected_key_name = %selected.name,
                 selected_key_index = selected.configured_index,
                 attempt,
@@ -355,7 +397,7 @@ impl ClineUpstream {
             ),
             Err(error) => tracing::warn!(
                 request_id,
-                requested_model = model,
+                requested_model = *model,
                 selected_key_name = %selected.name,
                 selected_key_index = selected.configured_index,
                 attempt,

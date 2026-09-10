@@ -83,6 +83,13 @@ pub struct ConvertedRequest {
 pub fn convert_request(bytes: &[u8]) -> Result<ConvertedRequest, ProtocolError> {
     let input: Value = serde_json::from_slice(bytes)
         .map_err(|error| ProtocolError::invalid(format!("invalid JSON: {error}")))?;
+    convert_request_value(input)
+}
+
+/// Value-based conversion for handlers that already parsed the request
+/// (the server extracts session identity from the same parsed value, so
+/// megabyte-scale bodies are never parsed twice).
+pub fn convert_request_value(input: Value) -> Result<ConvertedRequest, ProtocolError> {
     let object = input
         .as_object()
         .ok_or_else(|| ProtocolError::invalid("request body must be a JSON object"))?;
@@ -2109,30 +2116,11 @@ impl StreamState {
 
 /// Extract reasoning text from an upstream (non-stream) message object.
 /// Shared with the server's reasoning shadow store; returns "" when absent.
+/// Thin alias over [`reasoning_text`] so the shadow store and the response
+/// converter cannot drift apart (one extraction rule, borrowed from the
+/// deepseek-recipe adapter layout: a single typed extraction per concept).
 pub fn reasoning_text_from_message(message: &Map<String, Value>) -> String {
-    for name in ["reasoning_content", "reasoning"] {
-        if let Some(text) = message.get(name).and_then(Value::as_str) {
-            return text.to_owned();
-        }
-    }
-    let Some(details) = message.get("reasoning_details") else {
-        return String::new();
-    };
-    match details {
-        Value::String(text) => text.clone(),
-        Value::Array(items) => items
-            .iter()
-            .filter_map(|item| {
-                item.as_str().or_else(|| {
-                    item.get("text")
-                        .or_else(|| item.get("content"))
-                        .and_then(Value::as_str)
-                })
-            })
-            .collect::<Vec<_>>()
-            .join(""),
-        _ => String::new(),
-    }
+    reasoning_text(message)
 }
 
 impl StreamState {
