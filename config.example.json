@@ -8,6 +8,10 @@
     "chat_path": "/chat/completions",
     "timeout_secs": 600,
     "connect_timeout_secs": 20,
+    "first_event_timeout_secs": 180,
+    "first_semantic_timeout_secs": 180,
+    "stream_idle_timeout_secs": 120,
+    "semantic_idle_timeout_secs": 180,
     "fallback_429_cooldown_secs": 3600,
     "headers": {
       "http-referer": "https://cline.bot",
@@ -42,6 +46,7 @@
     "max_request_bytes": 33554432,
     "log_level": "info",
     "log_format": "pretty",
+    "log_color": "auto",
     "stream_progress_secs": 30,
     "shutdown_timeout_secs": 30,
     "state_file": "runtime-state.json"
@@ -60,7 +65,10 @@
     "context": {
       "safe_compaction": true,
       "strip_volatile_billing_header": true,
-      "canonical_tool_json": true
+      "canonical_tool_json": true,
+      "upstream_context_window_tokens": null,
+      "context_safety_margin_tokens": 1024,
+      "min_output_tokens": 256
     },
     "telemetry": {
       "exact_input_tokens": true,

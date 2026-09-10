@@ -13,6 +13,9 @@ use axum::http::header;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::{json, Map, Value};
+use tokio::time::Instant as TokioInstant;
+
+use crate::stream_watch::{StallKind, StreamTimeouts, StreamWatch};
 
 const MAX_UPSTREAM_JSON_BYTES: usize = 16 * 1024 * 1024;
 const MAX_UPSTREAM_SSE_EVENT_BYTES: usize = 8 * 1024 * 1024;
@@ -25,6 +28,7 @@ const STREAM_PING_INTERVAL: Duration = Duration::from_millis(25);
 pub struct ProtocolError {
     pub error_type: &'static str,
     pub message: String,
+    pub stall_kind: Option<&'static str>,
 }
 
 impl ProtocolError {
@@ -32,6 +36,7 @@ impl ProtocolError {
         Self {
             error_type: "invalid_request_error",
             message: message.into(),
+            stall_kind: None,
         }
     }
 
@@ -39,6 +44,15 @@ impl ProtocolError {
         Self {
             error_type: "api_error",
             message: message.into(),
+            stall_kind: None,
+        }
+    }
+
+    pub fn stall(kind: StallKind) -> Self {
+        Self {
+            error_type: "api_error",
+            message: kind.message().into(),
+            stall_kind: Some(kind.as_str()),
         }
     }
 }
@@ -824,7 +838,19 @@ struct NonStreamAccumulator {
     aggregated_bytes: usize,
     saw_event: bool,
     first_event_ms: Option<u128>,
+    first_byte_ms: Option<u128>,
+    first_reasoning_ms: Option<u128>,
+    first_text_ms: Option<u128>,
     first_tool_call_ms: Option<u128>,
+    first_semantic_ms: Option<u128>,
+    last_semantic_ms: Option<u128>,
+    last_byte_ms: Option<u128>,
+    reasoning_bytes: u64,
+    text_bytes: u64,
+    tool_call_bytes: u64,
+    reasoning_events: u64,
+    text_events: u64,
+    tool_call_events: u64,
     started: Option<Instant>,
 }
 
@@ -841,6 +867,24 @@ impl NonStreamAccumulator {
         self.started
             .map(|started| started.elapsed().as_millis())
             .unwrap_or(0)
+    }
+
+    fn mark_semantic(&mut self, at: u128) {
+        if self.first_semantic_ms.is_none() {
+            self.first_semantic_ms = Some(at);
+        }
+        self.last_semantic_ms = Some(at);
+    }
+
+    fn note_bytes(&mut self, chunk_len: usize) {
+        let at = self.elapsed_ms();
+        if chunk_len == 0 {
+            return;
+        }
+        if self.first_byte_ms.is_none() {
+            self.first_byte_ms = Some(at);
+        }
+        self.last_byte_ms = Some(at);
     }
 
     /// Handle one SSE `data:` payload from the upstream OpenAI-shaped
@@ -888,6 +932,13 @@ impl NonStreamAccumulator {
         };
         if let Some(reasoning) = reasoning_delta(delta).filter(|text| !text.is_empty()) {
             self.reasoning.push_str(reasoning);
+            self.reasoning_bytes = self.reasoning_bytes.saturating_add(reasoning.len() as u64);
+            self.reasoning_events = self.reasoning_events.saturating_add(1);
+            let at = self.elapsed_ms();
+            if self.first_reasoning_ms.is_none() {
+                self.first_reasoning_ms = Some(at);
+            }
+            self.mark_semantic(at);
         }
         if let Some(text) = delta
             .get("content")
@@ -895,11 +946,20 @@ impl NonStreamAccumulator {
             .filter(|text| !text.is_empty())
         {
             self.text.push_str(text);
+            self.text_bytes = self.text_bytes.saturating_add(text.len() as u64);
+            self.text_events = self.text_events.saturating_add(1);
+            let at = self.elapsed_ms();
+            if self.first_text_ms.is_none() {
+                self.first_text_ms = Some(at);
+            }
+            self.mark_semantic(at);
         }
         if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
             if self.first_tool_call_ms.is_none() {
                 self.first_tool_call_ms = Some(self.elapsed_ms());
             }
+            self.tool_call_events = self.tool_call_events.saturating_add(1);
+            self.mark_semantic(self.elapsed_ms());
             for call in calls {
                 let index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
                 let tool = self.tools.entry(index).or_default();
@@ -923,6 +983,8 @@ impl NonStreamAccumulator {
                     }
                     if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
                         tool.arguments.push_str(arguments);
+                        self.tool_call_bytes =
+                            self.tool_call_bytes.saturating_add(arguments.len() as u64);
                     }
                 }
             }
@@ -990,10 +1052,31 @@ impl NonStreamAccumulator {
 /// despite a stream request (defensive), the body is normalized through
 /// the strict envelope layer instead. Returns the body plus upstream-side
 /// timings (`first_event_ms`, `duration_ms`) — never client-facing TTFT.
+pub struct AggregatedUpstream {
+    pub body: Value,
+    pub shape: UpstreamBodyShape,
+    pub first_event_ms: Option<u128>,
+    pub first_semantic_ms: Option<u128>,
+    pub first_byte_ms: Option<u128>,
+    pub first_reasoning_ms: Option<u128>,
+    pub first_text_ms: Option<u128>,
+    pub first_tool_call_ms: Option<u128>,
+    pub last_semantic_ms: Option<u128>,
+    pub last_byte_ms: Option<u128>,
+    pub duration_ms: u128,
+    pub text_bytes: u64,
+    pub reasoning_bytes: u64,
+    pub tool_call_bytes: u64,
+    pub text_events: u64,
+    pub reasoning_events: u64,
+    pub tool_call_events: u64,
+}
+
 pub async fn aggregate_stream_response(
     response: reqwest::Response,
     request_id: &str,
-) -> Result<(Value, UpstreamBodyShape, Option<u128>, u128), ProtocolError> {
+    timeouts: StreamTimeouts,
+) -> Result<AggregatedUpstream, ProtocolError> {
     let started = Instant::now();
     let is_json = response
         .headers()
@@ -1005,28 +1088,72 @@ pub async fn aggregate_stream_response(
         // JSON body. Normalize the known envelopes strictly.
         let value = parse_json_response(response).await?;
         let (normalized, shape) = normalize_nonstream_body(value)?;
-        return Ok((normalized, shape, None, started.elapsed().as_millis()));
+        return Ok(AggregatedUpstream {
+            body: normalized,
+            shape,
+            first_event_ms: None,
+            first_semantic_ms: None,
+            first_byte_ms: None,
+            first_reasoning_ms: None,
+            first_text_ms: None,
+            first_tool_call_ms: None,
+            last_semantic_ms: None,
+            last_byte_ms: None,
+            duration_ms: started.elapsed().as_millis(),
+            text_bytes: 0,
+            reasoning_bytes: 0,
+            tool_call_bytes: 0,
+            text_events: 0,
+            reasoning_events: 0,
+            tool_call_events: 0,
+        });
     }
     let mut upstream = response.bytes_stream();
     let mut decoder = SseDecoder::default();
     let mut accumulator = NonStreamAccumulator::new();
+    let watch_start = TokioInstant::now();
+    let mut watch = StreamWatch::new(timeouts, watch_start);
+    let stall = tokio::time::sleep_until(watch.next_deadline());
+    tokio::pin!(stall);
     loop {
-        let Some(chunk) = upstream.next().await else {
-            break;
-        };
-        let chunk =
-            chunk.map_err(|_| ProtocolError::upstream("upstream stream was interrupted"))?;
-        accumulator.aggregated_bytes = accumulator.aggregated_bytes.saturating_add(chunk.len());
-        if accumulator.aggregated_bytes > MAX_AGGREGATED_RESPONSE_BYTES {
-            return Err(ProtocolError::upstream(
-                "upstream response exceeded the safe aggregation limit",
-            ));
-        }
-        let events = decoder.push(&chunk).map_err(|_| {
-            ProtocolError::upstream("upstream SSE event exceeded the gateway limit")
-        })?;
-        for event in events {
-            accumulator.handle(&event.data)?;
+        tokio::select! {
+            biased;
+            chunk = upstream.next() => {
+                let Some(chunk) = chunk else {
+                    break;
+                };
+                let chunk = chunk.map_err(|_| {
+                    ProtocolError::upstream("upstream stream was interrupted")
+                })?;
+                let now = TokioInstant::now();
+                watch.on_upstream_bytes(now);
+                accumulator.note_bytes(chunk.len());
+                accumulator.aggregated_bytes = accumulator.aggregated_bytes.saturating_add(chunk.len());
+                if accumulator.aggregated_bytes > MAX_AGGREGATED_RESPONSE_BYTES {
+                    return Err(ProtocolError::upstream(
+                        "upstream response exceeded the safe aggregation limit",
+                    ));
+                }
+                let events = decoder.push(&chunk).map_err(|_| {
+                    ProtocolError::upstream("upstream SSE event exceeded the gateway limit")
+                })?;
+                for event in events {
+                    watch.on_sse_event();
+                    let semantic_before = accumulator.last_semantic_ms;
+                    accumulator.handle(&event.data)?;
+                    if accumulator.last_semantic_ms != semantic_before {
+                        watch.on_semantic(now);
+                    }
+                }
+                stall.as_mut().reset(watch.next_deadline());
+            }
+            _ = &mut stall => {
+                let now = TokioInstant::now();
+                if let Some(kind) = watch.check(now) {
+                    return Err(ProtocolError::stall(kind));
+                }
+                stall.as_mut().reset(watch.next_deadline());
+            }
         }
     }
     for event in decoder
@@ -1035,14 +1162,40 @@ pub async fn aggregate_stream_response(
     {
         accumulator.handle(&event.data)?;
     }
-    let timings = (accumulator.first_event_ms, started.elapsed().as_millis());
+    let first_event_ms = accumulator.first_event_ms;
+    let first_semantic_ms = accumulator.first_semantic_ms;
+    let first_byte_ms = accumulator.first_byte_ms;
+    let first_reasoning_ms = accumulator.first_reasoning_ms;
+    let first_text_ms = accumulator.first_text_ms;
+    let first_tool_call_ms = accumulator.first_tool_call_ms;
+    let last_semantic_ms = accumulator.last_semantic_ms;
+    let last_byte_ms = accumulator.last_byte_ms;
+    let text_bytes = accumulator.text_bytes;
+    let reasoning_bytes = accumulator.reasoning_bytes;
+    let tool_call_bytes = accumulator.tool_call_bytes;
+    let text_events = accumulator.text_events;
+    let reasoning_events = accumulator.reasoning_events;
+    let tool_call_events = accumulator.tool_call_events;
     let body = accumulator.into_response(request_id)?;
-    Ok((
+    Ok(AggregatedUpstream {
+        first_event_ms,
+        first_semantic_ms,
+        first_byte_ms,
+        first_reasoning_ms,
+        first_text_ms,
+        first_tool_call_ms,
+        last_semantic_ms,
+        last_byte_ms,
+        duration_ms: started.elapsed().as_millis(),
+        text_bytes,
+        reasoning_bytes,
+        tool_call_bytes,
+        text_events,
+        reasoning_events,
+        tool_call_events,
         body,
-        UpstreamBodyShape::StandardOpenAi,
-        timings.0,
-        timings.1,
-    ))
+        shape: UpstreamBodyShape::StandardOpenAi,
+    })
 }
 
 /// Options for [`stream_body`] beyond the response itself.
@@ -1057,6 +1210,7 @@ pub struct StreamOptions {
     /// Adaptive observability (issue #16): static summary context; the
     /// stream emits the single RequestSummary at close.
     pub summary: Option<crate::obs::StreamSummary>,
+    pub timeouts: StreamTimeouts,
 }
 
 pub fn stream_body(response: reqwest::Response, options: StreamOptions) -> Body {
@@ -1069,6 +1223,7 @@ pub fn stream_body(response: reqwest::Response, options: StreamOptions) -> Body 
         expose_thinking,
         shadow,
         summary,
+        timeouts,
     } = options;
     let output = async_stream::stream! {
         let mut upstream = response.bytes_stream();
@@ -1085,11 +1240,18 @@ pub fn stream_body(response: reqwest::Response, options: StreamOptions) -> Body 
             request_started,
             summary,
         );
+        let watch_start = TokioInstant::now();
+        let mut watch = StreamWatch::new(timeouts, watch_start);
+        let stall = tokio::time::sleep_until(watch.next_deadline());
+        tokio::pin!(stall);
         loop {
             tokio::select! {
                 biased;
                 chunk = upstream.next() => match chunk {
                     Some(Ok(chunk)) => {
+                        let now = TokioInstant::now();
+                        watch.on_upstream_bytes(now);
+                        telemetry.note_byte(request_started);
                         telemetry.upstream_chunks = telemetry.upstream_chunks.saturating_add(1);
                         telemetry.upstream_bytes = telemetry.upstream_bytes.saturating_add(chunk.len() as u64);
                         let events = match decoder.push(&chunk) {
@@ -1108,10 +1270,24 @@ pub fn stream_body(response: reqwest::Response, options: StreamOptions) -> Body 
                         for event in events {
                             telemetry.upstream_events = telemetry.upstream_events.saturating_add(1);
                             telemetry.first_event();
+                            watch.on_sse_event();
+                            let semantic_before = (
+                                state.reasoning_events,
+                                state.text_events,
+                                state.tool_call_events,
+                            );
                             for frame in state.handle(&event.data) {
                                 idle.as_mut().reset(tokio::time::Instant::now() + STREAM_PING_INTERVAL);
                                 telemetry.commit(frame.len());
                                 yield Ok::<Bytes, std::io::Error>(frame);
+                            }
+                            if (
+                                state.reasoning_events,
+                                state.text_events,
+                                state.tool_call_events,
+                            ) != semantic_before
+                            {
+                                watch.on_semantic(now);
                             }
                             if state.terminal {
                                 state.commit_shadow(shadow.as_ref());
@@ -1120,11 +1296,17 @@ pub fn stream_body(response: reqwest::Response, options: StreamOptions) -> Body 
                                 return;
                             }
                         }
+                        stall.as_mut().reset(watch.next_deadline());
                     }
                     Some(Err(error)) => {
+                        let error_class = if error.is_timeout() {
+                            "timeout"
+                        } else {
+                            "stream_transport"
+                        };
                         tracing::warn!(
                             request_id = %state.request_id,
-                            error_class = if error.is_timeout() { "timeout" } else { "stream_transport" },
+                            error_class,
                             committed_to_client = telemetry.committed_to_client,
                             "upstream Anthropic stream interrupted; request will not be replayed"
                         );
@@ -1134,11 +1316,31 @@ pub fn stream_body(response: reqwest::Response, options: StreamOptions) -> Body 
                         telemetry.commit(frame.len());
                         yield Ok(frame);
                         telemetry.absorb(&state);
-                        telemetry.finish("upstream_error");
+                        telemetry.finish(error_class);
                         return;
                     }
                     None => break,
                 },
+                _ = &mut stall => {
+                    let now = TokioInstant::now();
+                    if let Some(kind) = watch.check(now) {
+                        tracing::warn!(
+                            request_id = %state.request_id,
+                            error_class = kind.as_str(),
+                            committed_to_client = telemetry.committed_to_client,
+                            "upstream Anthropic stream stalled; request will not be replayed"
+                        );
+                        let frame = sse_frame("error", error_envelope(
+                            "api_error", kind.message(), &state.request_id,
+                        ));
+                        telemetry.commit(frame.len());
+                        yield Ok(frame);
+                        telemetry.absorb(&state);
+                        telemetry.finish(kind.as_str());
+                        return;
+                    }
+                    stall.as_mut().reset(watch.next_deadline());
+                }
                 _ = &mut idle => {
                     let frame = sse_frame("ping", json!({"type":"ping"}));
                     telemetry.commit(frame.len());
@@ -1223,6 +1425,9 @@ struct StreamTelemetry {
     first_reasoning_ms: Option<u128>,
     first_text_ms: Option<u128>,
     first_tool_call_ms: Option<u128>,
+    first_byte_ms: Option<u128>,
+    last_byte_ms: Option<u128>,
+    last_semantic_ms: Option<u128>,
     usage: Option<Value>,
 }
 
@@ -1256,8 +1461,19 @@ impl StreamTelemetry {
             first_reasoning_ms: None,
             first_text_ms: None,
             first_tool_call_ms: None,
+            first_byte_ms: None,
+            last_byte_ms: None,
+            last_semantic_ms: None,
             usage: None,
         }
+    }
+
+    fn note_byte(&mut self, request_started: Instant) {
+        let at = request_started.elapsed().as_millis();
+        if self.first_byte_ms.is_none() {
+            self.first_byte_ms = Some(at);
+        }
+        self.last_byte_ms = Some(at);
     }
 
     /// Copy the output-composition counters the stream state collected.
@@ -1271,6 +1487,15 @@ impl StreamTelemetry {
         self.first_reasoning_ms = state.first_reasoning;
         self.first_text_ms = state.first_text;
         self.first_tool_call_ms = state.first_tool_call;
+        self.last_semantic_ms = state
+            .first_reasoning
+            .into_iter()
+            .chain(state.first_text)
+            .chain(state.first_tool_call)
+            .max();
+        if state.reasoning_events + state.text_events + state.tool_call_events > 0 {
+            self.last_semantic_ms = Some(state.request_started.elapsed().as_millis());
+        }
         if state.usage.is_object() && !state.usage.as_object().is_some_and(Map::is_empty) {
             self.usage = Some(state.usage.clone());
         }
@@ -1357,11 +1582,24 @@ impl StreamTelemetry {
                 crate::obs::StreamSnap {
                     request_id: &self.request_id,
                     key_name: &self.key_name,
-                    ttft_ms: self.first_event_ms,
                     first_reasoning_ms: self.first_reasoning_ms,
                     first_text_ms: self.first_text_ms,
                     first_tool_call_ms: self.first_tool_call_ms,
+                    first_sse_event_ms: self.first_event_ms,
+                    first_semantic_ms: self
+                        .first_reasoning_ms
+                        .or(self.first_text_ms)
+                        .or(self.first_tool_call_ms),
+                    first_upstream_byte_ms: self.first_byte_ms,
+                    last_upstream_progress_ms: self.last_byte_ms,
+                    last_semantic_progress_ms: self.last_semantic_ms,
                     usage,
+                    text_bytes: self.text_bytes,
+                    reasoning_bytes: self.reasoning_bytes,
+                    tool_call_bytes: self.tool_call_bytes,
+                    text_events: self.text_events,
+                    reasoning_events: self.reasoning_events,
+                    tool_call_events: self.tool_call_events,
                 },
                 outcome,
             );

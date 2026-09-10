@@ -44,6 +44,20 @@ install -m 0755 target/release/cline-proxy ~/.local/bin/cline-proxy
 
 The binary can also be run directly with `cargo run --release`.
 
+Safe local overrides (the binary reads the config file; flags never echo secrets):
+
+```bash
+./target/release/cline-proxy \
+  --config /path/to/config.json \
+  --bind 127.0.0.1:8799 \
+  --state-file /tmp/cline-proxy-state.json \
+  --log-directory /tmp/cline-proxy-logs \
+  --no-color
+```
+
+`--color auto|always|never` controls ANSI on stderr. Default `auto`: color
+only when stderr is a terminal and `NO_COLOR` is unset.
+
 ## Configuration
 
 Copy the example and replace every placeholder locally:
@@ -276,6 +290,22 @@ cargo run --release -- --config config.json
 # or
 ./target/release/cline-proxy --config config.json
 ```
+
+Upstream stall detection (issue #24) is separate from the Reqwest read
+timeout (`upstream.timeout_secs`, default 600, last-resort inactivity
+backstop). Defaults:
+
+```text
+first_event_timeout_secs      = 180   # headers → first SSE/data
+first_semantic_timeout_secs   = 180   # headers → reasoning/text/tool
+stream_idle_timeout_secs      = 120   # max gap between upstream bytes
+semantic_idle_timeout_secs    = 180   # max gap between semantic deltas
+```
+
+`0` disables an individual timer. Downstream Anthropic pings do not reset
+these. A stalled committed stream emits one Anthropic error and is never
+replayed. Optional `glm53.context.upstream_context_window_tokens` is unset
+by default — do not guess a Cline serving limit.
 
 `SIGINT` and `SIGTERM` stop new accepts and allow active requests to drain for
 `runtime.shutdown_timeout_secs` before remaining connections are aborted.

@@ -8,7 +8,9 @@ use anyhow::{bail, Context, Result};
 use axum::http::{HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 
+use crate::console::ColorMode;
 use crate::glm53::reasoning::ThinkingExposure;
+use crate::stream_watch::StreamTimeouts;
 
 pub mod defaults {
     pub const BIND: &str = "127.0.0.1:8788";
@@ -16,6 +18,16 @@ pub mod defaults {
     pub const CHAT_PATH: &str = "/chat/completions";
     pub const TIMEOUT_SECS: u64 = 600;
     pub const CONNECT_TIMEOUT_SECS: u64 = 20;
+    /// Time after HTTP headers to the first upstream SSE/data event.
+    pub const FIRST_EVENT_TIMEOUT_SECS: u64 = 180;
+    /// Time after HTTP headers to the first reasoning/text/tool delta.
+    pub const FIRST_SEMANTIC_TIMEOUT_SECS: u64 = 180;
+    /// Max gap between upstream body bytes once the stream is established.
+    pub const STREAM_IDLE_TIMEOUT_SECS: u64 = 120;
+    /// Max gap between reasoning/text/tool progress after the first semantic event.
+    pub const SEMANTIC_IDLE_TIMEOUT_SECS: u64 = 180;
+    pub const CONTEXT_SAFETY_MARGIN_TOKENS: u64 = 1_024;
+    pub const MIN_OUTPUT_TOKENS: u32 = 256;
     pub const FALLBACK_COOLDOWN_SECS: u64 = 3_600;
     pub const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
     pub const STREAM_PROGRESS_SECS: u64 = 30;
@@ -74,6 +86,10 @@ pub struct UpstreamConfig {
     pub chat_path: String,
     pub timeout_secs: u64,
     pub connect_timeout_secs: u64,
+    pub first_event_timeout_secs: u64,
+    pub first_semantic_timeout_secs: u64,
+    pub stream_idle_timeout_secs: u64,
+    pub semantic_idle_timeout_secs: u64,
     pub fallback_429_cooldown_secs: u64,
     pub headers: BTreeMap<String, String>,
 }
@@ -85,9 +101,24 @@ impl Default for UpstreamConfig {
             chat_path: defaults::CHAT_PATH.into(),
             timeout_secs: defaults::TIMEOUT_SECS,
             connect_timeout_secs: defaults::CONNECT_TIMEOUT_SECS,
+            first_event_timeout_secs: defaults::FIRST_EVENT_TIMEOUT_SECS,
+            first_semantic_timeout_secs: defaults::FIRST_SEMANTIC_TIMEOUT_SECS,
+            stream_idle_timeout_secs: defaults::STREAM_IDLE_TIMEOUT_SECS,
+            semantic_idle_timeout_secs: defaults::SEMANTIC_IDLE_TIMEOUT_SECS,
             fallback_429_cooldown_secs: defaults::FALLBACK_COOLDOWN_SECS,
             headers: default_cline_headers(),
         }
+    }
+}
+
+impl UpstreamConfig {
+    pub fn stream_timeouts(&self) -> StreamTimeouts {
+        StreamTimeouts::from_secs(
+            self.first_event_timeout_secs,
+            self.first_semantic_timeout_secs,
+            self.stream_idle_timeout_secs,
+            self.semantic_idle_timeout_secs,
+        )
     }
 }
 
@@ -240,6 +271,14 @@ pub struct Glm53ContextConfig {
     /// bytes, preserving upstream prefix-cache locality. Arrays keep their
     /// order; plain-text tool results are never parsed or rewritten.
     pub canonical_tool_json: bool,
+    /// Optional Cline/provider usable context window in tokens. `null`
+    /// disables the proxy-side guard — do not guess a route limit.
+    pub upstream_context_window_tokens: Option<u64>,
+    /// Subtracted from the configured window before comparing input+output.
+    pub context_safety_margin_tokens: u64,
+    /// Smallest output reserve the guard will leave. Below this the request
+    /// is rejected rather than sending a generation that cannot complete.
+    pub min_output_tokens: u32,
 }
 
 impl Default for Glm53ContextConfig {
@@ -248,6 +287,9 @@ impl Default for Glm53ContextConfig {
             safe_compaction: true,
             strip_volatile_billing_header: true,
             canonical_tool_json: true,
+            upstream_context_window_tokens: None,
+            context_safety_margin_tokens: defaults::CONTEXT_SAFETY_MARGIN_TOKENS,
+            min_output_tokens: defaults::MIN_OUTPUT_TOKENS,
         }
     }
 }
@@ -300,6 +342,9 @@ pub struct RuntimeConfig {
     pub log_format: LogFormat,
     pub stream_progress_secs: u64,
     pub shutdown_timeout_secs: u64,
+    /// ANSI color for diagnostic stderr. `auto` (default) emits color only
+    /// when stderr is a terminal and `NO_COLOR` is unset.
+    pub log_color: ColorMode,
     /// Path of the persisted key runtime state file (relative paths resolve
     /// against the working directory). `null` or an empty string disables
     /// persistence. The file never contains key material; see
@@ -315,6 +360,7 @@ impl Default for RuntimeConfig {
             log_format: LogFormat::Pretty,
             stream_progress_secs: defaults::STREAM_PROGRESS_SECS,
             shutdown_timeout_secs: defaults::SHUTDOWN_TIMEOUT_SECS,
+            log_color: ColorMode::Auto,
             state_file: Some(defaults::STATE_FILE.into()),
         }
     }
@@ -496,6 +542,18 @@ impl Config {
                 bail!("{field} must not be `max`; explicit max stays available via output_config.effort");
             }
         }
+        if self.glm53.context.min_output_tokens == 0 {
+            bail!("glm53.context.min_output_tokens must be greater than zero");
+        }
+        if let Some(window) = self.glm53.context.upstream_context_window_tokens {
+            let margin = self.glm53.context.context_safety_margin_tokens;
+            let min_out = u64::from(self.glm53.context.min_output_tokens);
+            if window <= margin.saturating_add(min_out) {
+                bail!(
+                    "glm53.context.upstream_context_window_tokens ({window}) must be greater than safety_margin ({margin}) + min_output ({min_out})"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -661,6 +719,28 @@ mod tests {
             config.upstream.connect_timeout_secs,
             defaults::CONNECT_TIMEOUT_SECS
         );
+        assert_eq!(
+            config.upstream.first_event_timeout_secs,
+            defaults::FIRST_EVENT_TIMEOUT_SECS
+        );
+        assert_eq!(
+            config.upstream.first_semantic_timeout_secs,
+            defaults::FIRST_SEMANTIC_TIMEOUT_SECS
+        );
+        assert_eq!(
+            config.upstream.stream_idle_timeout_secs,
+            defaults::STREAM_IDLE_TIMEOUT_SECS
+        );
+        assert_eq!(
+            config.upstream.semantic_idle_timeout_secs,
+            defaults::SEMANTIC_IDLE_TIMEOUT_SECS
+        );
+        assert!(config
+            .glm53
+            .context
+            .upstream_context_window_tokens
+            .is_none());
+        assert_eq!(config.runtime.log_color, ColorMode::Auto);
         assert_eq!(
             config.upstream.fallback_429_cooldown_secs,
             defaults::FALLBACK_COOLDOWN_SECS

@@ -4,6 +4,8 @@
 pub mod anthropic;
 pub mod cache;
 pub mod config;
+pub mod console;
+pub mod context_guard;
 pub mod glm53;
 pub mod obs;
 pub mod optimize;
@@ -13,4 +15,5 @@ pub mod reasoning_shadow;
 pub mod redaction;
 pub mod server;
 pub mod state;
+pub mod stream_watch;
 pub mod upstream;
