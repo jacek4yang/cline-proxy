@@ -1,9 +1,9 @@
 # Development State
 
 Last updated: 2026-09-10
-Main SHA: 1191a8a (docs snapshot #26); SOCKS5 work on `feat/upstream-socks5` (issue #27)
+Main SHA: 6a37625 (feat(upstream): SOCKS5 Cline route #28)
 Repository: https://github.com/jacek4yang/cline-proxy
-Status: SOCKS5 + deterministic direct route in progress
+Status: main green; SOCKS5 production route live
 
 > Agent recovery protocol — on context compaction or session end:
 > 1. Read this file top to bottom.
@@ -15,7 +15,7 @@ Status: SOCKS5 + deterministic direct route in progress
 
 ## Current production baseline
 
-- main `18e7dcb` (axum 0.8.9 + production recovery). Adds stall timers,
+- main `6a37625` (axum 0.8.9 + production recovery + SOCKS5). Adds stall timers,
   restart-safe JSONL writer, stderr/auto-color, JSONL schema v2, local vs
   upstream token fields, optional context guard (unset by default).
 - Tests on the recovery branch: 202 lib + 4 glm53_policy + 4
@@ -82,8 +82,9 @@ Modules: `anthropic.rs` (protocol), `cache.rs` (prefix stability),
 | #17 | Adaptive bounded observability (one summary/request, dedicated JSONL writer, disk quota, flight recorder) |
 | #20 | axum 0.7.9 → 0.8.9 |
 | #24 | Production recovery: stall timers, restart-safe writer, ANSI/INFO, schema v2 (this work) |
+| #28 | SOCKS5/socks5h outbound Cline route; deterministic direct (`no_proxy`) |
 
-Issues #3, #6, #8, #10, #13, #14, #16, #19 closed with their PRs.
+Issues #3, #6, #8, #10, #13, #14, #16, #19, #24, #27 closed with their PRs.
 
 ## Open PRs / issues
 
@@ -114,13 +115,11 @@ Issues #3, #6, #8, #10, #13, #14, #16, #19 closed with their PRs.
 
 ## Current target
 
-1. Merge issue #27 SOCKS5/direct route.
-2. Isolated A/B (n=4 tiny stream turns, real config, no secrets printed):
-   direct headers median 1284 ms (685–4887); SOCKS5 headers median 1054 ms
-   (534–1706). No transport errors. Overlap is large — do **not** claim
-   SOCKS5 is faster. Local SOCKS5 is a viable Cline path.
-3. After merge: timestamped config backup, set `upstream.proxy` to
-   `socks5://127.0.0.1:10888`, backup+replace production exe, smoke.
+Normal production observation on SOCKS5 (`socks5://127.0.0.1:10888`).
+Isolated A/B (n=4 tiny streams): direct headers median 1284 ms vs SOCKS5
+1054 ms; overlap is large — do not claim SOCKS5 is faster. Production
+smoke on :8788 completed via SOCKS5 (schema v3 JSONL). Analyze JSONL
+only if new evidence shows a bug.
 
 ## Next tasks (after this recovery)
 
