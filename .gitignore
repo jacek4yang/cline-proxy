@@ -7,3 +7,6 @@ runtime-state.json
 p0-smoke-config.json
 logs/
 axum-smoke-config.json
+*-smoke-config.json
+*-live-config.json
+*.secret.json

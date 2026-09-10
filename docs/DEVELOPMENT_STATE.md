@@ -1,9 +1,10 @@
 # Development State
 
-Last updated: 2026-09-09
-Main SHA: 72c4426 (feat(obs): adaptive bounded observability #17)
+Last updated: 2026-09-10
+Main SHA: dee77da (build: migrate axum 0.7.9 to 0.8.9 #20) — production
+recovery is on `fix/production-recovery` (issue #24) until merged.
 Repository: https://github.com/jacek4yang/cline-proxy
-Status: main green; all roadmap phases through observability merged
+Status: production-recovery implemented; awaiting PR merge
 
 > Agent recovery protocol — on context compaction or session end:
 > 1. Read this file top to bottom.
@@ -15,19 +16,29 @@ Status: main green; all roadmap phases through observability merged
 
 ## Current production baseline
 
-- main SHA `72c4426`; 186 tests green (debug + release); fmt/clippy
-  `-D warnings` clean.
-- Real E2E (2026-09-09, live Cline + Claude Code, ~300 K-token session):
-  99.8–100.0% warm cache hit ratio, TTFT ≈ first-tool-call, cold prefill
-  ~89 s → cached turns ~10 s, reasoning tokens 0–436/turn under `high`
-  effort. Table in the historical record below and issue #8.
-- Proxy hot path (release, 1.3 MB request): convert 0.9 ms, optimize
-  1.2 ms, cache pass 1.2 ms, serialize 0.5 ms. Exact tokenizer (≈400 ms)
-  runs spawn_blocking + semaphore(1) + busy-skip, off the request path.
-- Production deployment: `D:\Workspace\cline-proxy-bin` (binary updated
-  per release; config with explicit glm53 policy + logging block).
-- Release: INTENTIONALLY DEFERRED (no tags, no GitHub Release, no
-  binaries published).
+- Parent main `dee77da` (axum 0.8.9). Recovery branch adds stall timers,
+  restart-safe JSONL writer, stderr/auto-color, JSONL schema v2, local vs
+  upstream token fields, optional context guard (unset by default).
+- Tests on the recovery branch: 202 lib + 4 glm53_policy + 4
+  reasoning_shadow = **210** (debug and release); fmt/clippy `-D warnings`
+  clean.
+- Release hot path (1.3 MB): convert 1.0 ms, optimize 1.1 ms, cache 1.1 ms,
+  serialize 0.5 ms — no >5% regression vs the prior 0.9/1.2/1.2/0.5 ms
+  baseline. Exact tokenizer ~411 ms on that fixture, still spawn_blocking.
+- Isolated live Cline (2026-09-10, real `config.json`, bind 127.0.0.1:18799,
+  no secrets printed): stream 200 + deltas + stop; non-stream 200
+  `end_turn`; tool_use 200 with 2 tool-call events, thinking suppressed;
+  JSONL schema_version=2; writer restart opened a fresh segment and left
+  old records intact; redirected console CSI count = 0.
+- Context: model-native 1,048,576; Cline catalog unknown; empirical Cline
+  success ≥ 453,504 prompt tokens (production JSONL). Proxy window
+  **not configured**.
+- Timeout policy: first_event 180s, first_semantic 180s, stream_idle 120s,
+  semantic_idle 180s; Reqwest read_timeout remains 600s as backstop.
+- Production deployment: `D:\Workspace\cline-proxy-bin`. Do not overwrite
+  the production exe until this recovery is merged and the isolated live
+  binary is copied deliberately.
+- Release: INTENTIONALLY DEFERRED (no tags, no GitHub Release).
 
 ## Current architecture
 
@@ -45,14 +56,17 @@ Claude Code
       downstream stream=false → upstream stream=true → local aggregation
         (strict envelope normalizer; issue #14)
   → SSE exposure gate (requested_only) · shadow store commit
-  → Adaptive observability (obs.rs): ONE summary/request
-      bounded queue → dedicated writer thread → JSONL (1 GB quota)
+  → StreamWatch (first-event / first-semantic / stream-idle / semantic-idle)
+      committed stall → one Anthropic error, never replay
+  → Adaptive observability (obs.rs schema v2): ONE compact INFO + JSONL
+      fresh segment per process · stderr · color=auto
       RAM flight recorder attached to anomalies only
 ```
 
 Modules: `anthropic.rs` (protocol), `cache.rs` (prefix stability),
 `optimize.rs` (model policy), `reasoning_shadow.rs` (ephemeral reasoning),
-`obs.rs` (summaries/writer), `pool.rs`+`state.rs` (keys), `glm53/*`
+`obs.rs` (summaries/writer), `stream_watch.rs`, `console.rs`,
+`context_guard.rs`, `pool.rs`+`state.rs` (keys), `glm53/*`
 (exact tokenizer/template).
 
 ## Completed milestones
@@ -67,16 +81,16 @@ Modules: `anthropic.rs` (protocol), `cache.rs` (prefix stability),
 | #12 | Real E2E cache baseline (99.8–100% warm hits) |
 | #15 | P0 Cline non-stream fix (stream-and-aggregate; strict envelope normalizer; malformed-200 never rotates keys) |
 | #17 | Adaptive bounded observability (one summary/request, dedicated JSONL writer, disk quota, flight recorder) |
+| #20 | axum 0.7.9 → 0.8.9 |
+| #24 | Production recovery: stall timers, restart-safe writer, ANSI/INFO, schema v2 (this work) |
 
-Issues #3, #6, #8, #10, #13, #14, #16 closed with their PRs.
+Issues #3, #6, #8, #10, #13, #14, #16, #19 closed with their PRs.
 
 ## Open PRs / issues
 
-- PR #1 (dependabot): actions/checkout 4→7 — STALE (BEHIND), handled in
-  the checkout phase (merge or supersede via fresh branch).
-- PR #2 (dependabot): axum 0.7.9→0.8.9 — STALE (BEHIND), must NOT be
-  merged directly; dedicated migration branch planned.
-- No open issues.
+- Issue #24: production recovery (this branch).
+- Dependabot: hmac 0.13, sha2 0.11, tokenizers 0.23 — not part of this
+  recovery; leave for a later dedicated bump.
 
 ## Known limitations
 
@@ -93,28 +107,28 @@ Issues #3, #6, #8, #10, #13, #14, #16 closed with their PRs.
   purpose.
 - Real multi-agent concurrency/resource load analysis intentionally
   deferred: production traffic + JSONL summaries are the evidence source.
+- Cline serving-route context window is **not established**. Do not set
+  `upstream_context_window_tokens` until catalog/probe evidence exists.
+  Claude Code's 1M client declaration is not a Cline route guarantee.
+- Isolated live tests used HTTP against the local proxy, not an
+  interactive Claude Code TUI session.
 
 ## Current target
 
-System-hardening sequence, in order (each phase: issue → branch → PR →
-CI → self-review → merge → pull main):
+1. Merge issue #24 production recovery.
+2. Copy the merged release binary to `D:\Workspace\cline-proxy-bin`
+   when the operator chooses (do not hijack a running production process).
+3. Observe real Claude Code JSONL. Next action after merge = normal
+   production observation unless new evidence shows a bug.
 
-1. ✅ P0 Cline non-stream correctness (PR #15).
-2. ✅ Phase A adaptive observability + CPU/RAM bounds (PR #17).
-3. ✅ Phase B: DEVELOPMENT_STATE normalization (this PR).
-4. Phase C: actions/checkout v4→v7 (merge PR #1 after rebase or
-   supersede via `ci/checkout-v7`).
-5. Phase D: axum 0.7→0.8 migration (`chore/axum-0.8-migration`), minimum
-   diff, full regression on streaming/auth/429/shutdown, then supersede
-   PR #2.
-6. STOP (release deferred).
-
-## Next tasks (after Phase D)
+## Next tasks (after this recovery)
 
 - Observe real production logs (`logs/events-*.jsonl`); analyze only
   when evidence shows a problem.
 - Do NOT proactively redesign the model path (feature freeze on
   reasoning/cache/prefix/routing semantics — all verified).
+- Optional: set `glm53.context.upstream_context_window_tokens` only after
+  a real Cline route limit is measured.
 
 ## Explicitly deferred
 

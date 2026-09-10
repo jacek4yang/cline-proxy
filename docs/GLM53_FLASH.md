@@ -113,6 +113,20 @@ bounds generation: `effective_max_tokens = min(client_max_tokens, cap)`.
 (observed: 8.6-minute single turns producing 7.5 MB of SSE). When the
 client sends no bound, the configured cap becomes the bound.
 
+## Context window (native vs Cline route)
+
+GLM-5.3-Flash **model-native** `max_position_embeddings` is **1,048,576**
+(official `config.json`). Z.AI public docs advertise 1M context / 128k
+max output. That is **not** a proof that Cline's deployed
+`z-ai/glm-5.3-flash` route has 1M usable tokens.
+
+Production JSONL (2026-09-10) includes a **completed** Cline request with
+**453,504** upstream `prompt_tokens`, so the serving route is not a 200k
+hard cap. The actual Cline catalog/route limit is **not established**.
+`glm53.context.upstream_context_window_tokens` stays `null` until an
+operator sets a verified value. The proxy never truncates user/tool/source
+text to fit.
+
 ## Safe context compaction
 
 `glm53.context.safe_compaction` (default on) applies only lossless,

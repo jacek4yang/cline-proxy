@@ -1,8 +1,21 @@
 # Observability
 
-Adaptive bounded observability (issue #16, ADR 0007). Design law:
+Adaptive bounded observability (issue #16, ADR 0007; recovery issue #24,
+ADR 0008). Design law:
 
 > Observability must degrade before inference degrades.
+
+## Console destination and color
+
+Diagnostic logs go to **stderr**. `runtime.log_color` (default `auto`):
+
+| mode | ANSI |
+|---|---|
+| `auto` | only if stderr is a terminal and `NO_COLOR` is unset |
+| `always` | force ANSI (`--color always`) |
+| `never` | never (`--no-color` or `--color never`) |
+
+Redirected `proxy.log` must contain **no** CSI escape sequences under `auto`.
 
 ## Normal request = ONE summary
 
@@ -12,24 +25,32 @@ counters, timings) and emits exactly one record on completion:
 - **Console** (default): one compact line —
 
   ```text
-  11:22:08 ✓ GLM53 agent=91af/31c8 key=aromacode in=188.5K cache=99.9% out=257 ttft=18012ms tool=18090ms dur=19874ms
+  12:30:18 ✓ GLM53 agent=0feedb6e key=gxe-outlook in=199.6K budget=216.0K cache=99.8% out=312 ttft=8.4s tool=9.1s dur=11.7s
+  12:32:54 ✗ GLM53 agent=0feedb6e key=gxe-outlook in=201.2K budget=217.6K cache=n/a out=? ttft=- dur=193.4s err=upstream_semantic_idle_timeout
   ```
 
-  `✓` complete · `✗` error · `·` other. `agent` is the 16-hex HMAC
-  session fingerprint (`-` when the client sent no session identity —
-  never a raw id). Detailed lifecycle events remain available at
-  `debug` level (`runtime.log_level: "debug"`, or `RUST_LOG`).
+  `✓` complete · `✗` otherwise. `in=` prefers **local exact tokens** over
+  upstream `prompt_tokens`. `out=` is provider completion tokens when
+  present; if usage is missing but the stream produced output, it shows
+  `t{text}+r{reasoning}+k{tool}` event counts rather than `0`. `ttft` is
+  first **semantic** (reasoning/text/tool) output, not a role-only frame.
+  `agent` is the 16-hex HMAC session fingerprint (`-` when unstable).
+
+  Wide lifecycle lines (`stable prefix telemetry`, request optimization,
+  exact token accounting) are **DEBUG**.
 
 - **File** (`logging.directory`, default `./logs`): one JSONL object per
-  request in `events-NNNNNN.jsonl` segments — schema fields:
-  `request_id, protocol, requested/upstream_model, model_family, session,
-  downstream_stream, upstream_strategy, selected_key_name, attempts,
-  failover_count, reasoning_effort, thinking_exposure, *_max_tokens,
-  request/upstream_request/system/messages/tools_bytes,
-  historical_reasoning_bytes_removed, billing_header_bytes_removed,
-  canonicalized_arguments, prompt/cached/completion/reasoning_tokens,
-  cache_hit_ratio, reasoning_ratio, ttft/first_*/duration_ms,
-  upstream_*_ms, response_shape, upstream_status, outcome`.
+  request in `events-NNNNNN.jsonl` segments. **schema_version = 2**.
+  Each process opens a **fresh** segment (`create_new`); existing files
+  are counted for quota and never appended to or truncated.
+
+  Notable v2 fields: `schema_version`, `instance_id`,
+  `local_input_tokens` / `local_token_count_method` /
+  `local_token_count_duration_ms` (tokenizer; not billed usage),
+  `prompt_tokens` / `cached_tokens` / `completion_tokens` (upstream
+  usage), `reserved_output_tokens`, `total_context_budget`,
+  `first_sse_event_ms`, `first_semantic_ms` (`ttft_ms` aliases this),
+  `upstream_headers_ms`, `text/reasoning/tool_call_{bytes,events}`.
 
   jq examples:
 
@@ -64,7 +85,8 @@ retention — never routing, reasoning, or retry behavior.
 | fsync | never | a crash may lose the last buffered records — observability is not a transaction |
 
 Retention accounting scans the directory once at startup, then is
-maintained in memory (no per-record `read_dir`).
+maintained in memory (no per-record `read_dir`). A restart always
+creates a new active segment even if the last file is underfilled.
 
 ## Failure-open
 

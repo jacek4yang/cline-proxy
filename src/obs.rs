@@ -22,8 +22,13 @@ use std::collections::VecDeque;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, OnceLock};
 use std::time::Duration;
+
+use crate::console::{format_duration_ms, format_tokens};
+
+/// JSONL schema for `RequestSummary`. Bump when field meaning changes.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Approximate upper bound of one summary's serialized size, used to
 /// document queue memory: 8192 × ~1 KiB ≈ 8 MiB worst case, typically
@@ -102,10 +107,45 @@ impl FlightRecorder {
 
 // --- request summary -------------------------------------------------------
 
+/// Process-wide JSONL instance id (one UUID per process).
+pub fn process_instance_id() -> &'static str {
+    static ID: OnceLock<String> = OnceLock::new();
+    ID.get_or_init(|| uuid::Uuid::new_v4().simple().to_string())
+        .as_str()
+}
+
+/// Local GLM tokenizer result. Distinct from upstream-billed usage.
+#[derive(Debug, Clone, Copy)]
+pub struct LocalTokenCount {
+    pub tokens: u64,
+    pub method: &'static str,
+    pub duration_ms: u64,
+}
+
+/// Shared slot so a background exact count can land before the summary emits.
+#[derive(Clone, Default)]
+pub struct LocalTokenSlot {
+    inner: Arc<std::sync::Mutex<Option<LocalTokenCount>>>,
+}
+
+impl LocalTokenSlot {
+    pub fn store(&self, count: LocalTokenCount) {
+        if let Ok(mut guard) = self.inner.lock() {
+            *guard = Some(count);
+        }
+    }
+
+    pub fn get(&self) -> Option<LocalTokenCount> {
+        self.inner.lock().ok().and_then(|guard| *guard)
+    }
+}
+
 /// The single record emitted per completed request. `None` fields mean
 /// "not applicable / upstream did not report" — never zero-padding.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RequestSummary {
+    pub schema_version: u32,
+    pub instance_id: String,
     pub ts_unix_ms: u64,
     pub request_id: String,
     pub protocol: &'static str,
@@ -131,6 +171,20 @@ pub struct RequestSummary {
     pub historical_reasoning_bytes_removed: u64,
     pub billing_header_bytes_removed: u64,
     pub canonicalized_arguments: usize,
+    pub local_input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_token_count_method: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_token_count_duration_ms: Option<u64>,
+    pub reserved_output_tokens: Option<u64>,
+    pub total_context_budget: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_limit_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_utilization_ratio: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_headroom_tokens: Option<i64>,
+    /// Upstream-billed prompt tokens when the provider reported usage.
     pub prompt_tokens: Option<u64>,
     pub cached_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
@@ -139,13 +193,32 @@ pub struct RequestSummary {
     /// semantics verified against live Cline traffic; issue #8).
     pub cache_hit_ratio: Option<f64>,
     pub reasoning_ratio: Option<f64>,
+    /// First semantic (reasoning/text/tool) output. Not a role-only frame.
     pub ttft_ms: Option<u64>,
     pub first_reasoning_ms: Option<u64>,
     pub first_text_ms: Option<u64>,
     pub first_tool_call_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_semantic_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_sse_event_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_upstream_byte_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_headers_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_upstream_progress_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_semantic_progress_ms: Option<u64>,
     pub duration_ms: u64,
     pub upstream_first_event_ms: Option<u64>,
     pub upstream_duration_ms: Option<u64>,
+    pub text_bytes: u64,
+    pub reasoning_bytes: u64,
+    pub tool_call_bytes: u64,
+    pub text_events: u64,
+    pub reasoning_events: u64,
+    pub tool_call_events: u64,
     pub response_shape: Option<&'static str>,
     pub upstream_status: Option<u16>,
     pub outcome: &'static str,
@@ -261,44 +334,66 @@ impl FileWriter {
         })
     }
 
-    fn open_next_segment(&mut self) -> std::io::Result<()> {
-        let next_index = self
-            .segments
-            .back()
-            .and_then(|segment| {
+    fn next_segment_index(&self) -> u32 {
+        self.segments
+            .iter()
+            .filter_map(|segment| {
                 segment
                     .path
                     .file_stem()
                     .and_then(|stem| stem.to_str())
-                    .and_then(|stem| stem.rsplit('-').next())
+                    .and_then(|stem| stem.strip_prefix("events-"))
                     .and_then(|suffix| suffix.parse::<u32>().ok())
             })
-            .map_or(1, |last| last + 1);
-        let path = self.directory.join(format!("events-{next_index:06}.jsonl"));
-        let file = std::fs::File::options()
-            .create(true)
-            .append(true)
-            .open(&path)?;
-        self.segments.push_back(SegmentMeta {
-            bytes: 0,
-            path: path.clone(),
-        });
-        self.writer = Some(BufWriter::with_capacity(512 * 1024, file));
-        self.active_path = Some(path);
-        Ok(())
+            .max()
+            .map_or(1, |last| last.saturating_add(1).max(1))
+    }
+
+    /// Always create a new exclusive segment. Never append to a file left
+    /// by a previous process (underfilled, full, or corrupt last line).
+    fn open_fresh_segment(&mut self) -> std::io::Result<()> {
+        let mut next_index = self.next_segment_index();
+        loop {
+            let path = self.directory.join(format!("events-{next_index:06}.jsonl"));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => {
+                    self.segments.push_back(SegmentMeta {
+                        bytes: 0,
+                        path: path.clone(),
+                    });
+                    self.writer = Some(BufWriter::with_capacity(512 * 1024, file));
+                    self.active_path = Some(path);
+                    return Ok(());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    next_index = next_index.saturating_add(1);
+                    if next_index == 0 {
+                        return Err(std::io::Error::other("log segment index overflow"));
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     fn rotate_if_needed(&mut self) -> std::io::Result<()> {
-        let needs_rotation = match self.segments.back() {
-            Some(segment) => segment.bytes >= self.max_file_bytes,
-            None => true,
-        };
-        if needs_rotation {
-            // Flush + drop the writer BEFORE rename/delete (Windows keeps
-            // open handles locked).
+        let active_full = self.active_path.as_ref().is_some_and(|active| {
+            self.segments
+                .iter()
+                .find(|segment| &segment.path == active)
+                .is_some_and(|segment| segment.bytes >= self.max_file_bytes)
+        });
+        if self.writer.is_none() || active_full {
+            // Flush + drop the writer BEFORE opening the next file
+            // (Windows keeps open handles locked).
             self.writer = None;
             self.active_path = None;
-            self.open_next_segment()?;
+            self.open_fresh_segment()?;
         }
         Ok(())
     }
@@ -441,45 +536,22 @@ impl SummaryBuilder {
 
     /// Compose the summary from everything learned during the request and
     /// emit it. `usage` is the upstream OpenAI usage value (may be partial).
-    #[allow(clippy::too_many_arguments)]
-    pub fn emit(
-        mut self,
-        sink: Option<&LogSink>,
-        selected_key_name: &str,
-        attempts: u64,
-        failover_count: u64,
-        reasoning_effort: &'static str,
-        expose_thinking: bool,
-        client_max_tokens: Option<u64>,
-        effective_max_tokens: Option<u64>,
-        request_bytes: usize,
-        upstream_request_bytes: usize,
-        system_bytes: usize,
-        messages_bytes: usize,
-        tools_bytes: usize,
-        historical_reasoning_bytes_removed: u64,
-        billing_header_bytes_removed: u64,
-        canonicalized_arguments: usize,
-        usage: Option<&serde_json::Value>,
-        ttft_ms: Option<u128>,
-        first_reasoning_ms: Option<u128>,
-        first_text_ms: Option<u128>,
-        first_tool_call_ms: Option<u128>,
-        upstream_first_event_ms: Option<u128>,
-        upstream_duration_ms: Option<u128>,
-        response_shape: Option<&'static str>,
-        upstream_status: Option<u16>,
-        outcome: &'static str,
-    ) {
+    pub fn emit(mut self, facts: SummaryEmit<'_>) {
         let extract = |usage: Option<&serde_json::Value>, path: &[&str]| -> Option<u64> {
             usage
                 .and_then(|usage| value_at(usage, path))
                 .and_then(serde_json::Value::as_u64)
         };
-        let prompt_tokens = extract(usage, &["prompt_tokens"]);
-        let cached_tokens = extract(usage, &["prompt_tokens_details", "cached_tokens"]);
-        let completion_tokens = extract(usage, &["completion_tokens"]);
-        let reasoning_tokens = extract(usage, &["completion_tokens_details", "reasoning_tokens"]);
+        let prompt_tokens = extract(facts.usage, &["prompt_tokens"])
+            .or_else(|| extract(facts.usage, &["input_tokens"]));
+        let cached_tokens = extract(facts.usage, &["prompt_tokens_details", "cached_tokens"])
+            .or_else(|| extract(facts.usage, &["cache_read_input_tokens"]));
+        let completion_tokens = extract(facts.usage, &["completion_tokens"])
+            .or_else(|| extract(facts.usage, &["output_tokens"]));
+        let reasoning_tokens = extract(
+            facts.usage,
+            &["completion_tokens_details", "reasoning_tokens"],
+        );
         let cache_hit_ratio = match (cached_tokens, prompt_tokens) {
             (Some(cached), Some(prompt)) if prompt > 0 => {
                 Some((cached.min(prompt) as f64 / prompt as f64 * 1000.0).round() / 10.0)
@@ -492,7 +564,12 @@ impl SummaryBuilder {
             }
             _ => None,
         };
-        // Adaptive anomaly detection: slow requests attach their trace.
+        let first_semantic_ms = facts
+            .first_semantic_ms
+            .or(facts.first_reasoning_ms)
+            .or(facts.first_text_ms)
+            .or(facts.first_tool_call_ms);
+        let ttft_ms = first_semantic_ms;
         let elapsed = self.started.elapsed();
         if elapsed.as_millis() > u128::from(self.slow_duration_ms) {
             self.mark_anomalous("slow_duration");
@@ -505,7 +582,24 @@ impl SummaryBuilder {
         } else {
             (None, None)
         };
+        let local_input_tokens = facts.local_tokens.map(|count| count.tokens);
+        let reserved_output_tokens = facts.effective_max_tokens;
+        let total_context_budget = match (local_input_tokens, reserved_output_tokens) {
+            (Some(input), Some(output)) => Some(input.saturating_add(output)),
+            _ => None,
+        };
+        let (context_utilization_ratio, context_headroom_tokens) =
+            match (total_context_budget, facts.context_limit_tokens) {
+                (Some(budget), Some(limit)) if limit > 0 => {
+                    let ratio = (budget as f64 / limit as f64 * 1000.0).round() / 10.0;
+                    let headroom = limit as i64 - budget as i64;
+                    (Some(ratio), Some(headroom))
+                }
+                _ => (None, None),
+            };
         let summary = RequestSummary {
+            schema_version: SCHEMA_VERSION,
+            instance_id: process_instance_id().to_owned(),
             ts_unix_ms: self.ts_unix_ms,
             request_id: self.request_id.clone(),
             protocol: self.protocol,
@@ -515,95 +609,174 @@ impl SummaryBuilder {
             session: self.session.clone(),
             downstream_stream: self.downstream_stream,
             upstream_strategy: self.upstream_strategy,
-            selected_key_name: selected_key_name.to_owned(),
-            attempts,
-            failover_count,
-            reasoning_effort,
-            thinking_exposure: if expose_thinking {
+            selected_key_name: facts.selected_key_name.to_owned(),
+            attempts: facts.attempts,
+            failover_count: facts.failover_count,
+            reasoning_effort: facts.reasoning_effort,
+            thinking_exposure: if facts.expose_thinking {
                 "exposed"
             } else {
                 "suppressed"
             },
-            client_max_tokens,
-            effective_max_tokens,
-            request_bytes,
-            upstream_request_bytes,
-            system_bytes,
-            messages_bytes,
-            tools_bytes,
-            historical_reasoning_bytes_removed,
-            billing_header_bytes_removed,
-            canonicalized_arguments,
+            client_max_tokens: facts.client_max_tokens,
+            effective_max_tokens: facts.effective_max_tokens,
+            request_bytes: facts.request_bytes,
+            upstream_request_bytes: facts.upstream_request_bytes,
+            system_bytes: facts.system_bytes,
+            messages_bytes: facts.messages_bytes,
+            tools_bytes: facts.tools_bytes,
+            historical_reasoning_bytes_removed: facts.historical_reasoning_bytes_removed,
+            billing_header_bytes_removed: facts.billing_header_bytes_removed,
+            canonicalized_arguments: facts.canonicalized_arguments,
+            local_input_tokens,
+            local_token_count_method: facts.local_tokens.map(|count| count.method),
+            local_token_count_duration_ms: facts.local_tokens.map(|count| count.duration_ms),
+            reserved_output_tokens,
+            total_context_budget,
+            context_limit_tokens: facts.context_limit_tokens,
+            context_utilization_ratio,
+            context_headroom_tokens,
             prompt_tokens,
             cached_tokens,
             completion_tokens,
             reasoning_tokens,
             cache_hit_ratio,
             reasoning_ratio,
-            ttft_ms: ttft_ms.map(|value| value.min(u64::MAX as u128) as u64),
-            first_reasoning_ms: first_reasoning_ms.map(|v| v.min(u64::MAX as u128) as u64),
-            first_text_ms: first_text_ms.map(|v| v.min(u64::MAX as u128) as u64),
-            first_tool_call_ms: first_tool_call_ms.map(|v| v.min(u64::MAX as u128) as u64),
+            ttft_ms: cap_ms(ttft_ms),
+            first_reasoning_ms: cap_ms(facts.first_reasoning_ms),
+            first_text_ms: cap_ms(facts.first_text_ms),
+            first_tool_call_ms: cap_ms(facts.first_tool_call_ms),
+            first_semantic_ms: cap_ms(first_semantic_ms),
+            first_sse_event_ms: cap_ms(facts.first_sse_event_ms),
+            first_upstream_byte_ms: cap_ms(facts.first_upstream_byte_ms),
+            upstream_headers_ms: cap_ms(facts.upstream_headers_ms),
+            last_upstream_progress_ms: cap_ms(facts.last_upstream_progress_ms),
+            last_semantic_progress_ms: cap_ms(facts.last_semantic_progress_ms),
             duration_ms: elapsed.as_millis().min(u64::MAX as u128) as u64,
-            upstream_first_event_ms: upstream_first_event_ms
-                .map(|v| v.min(u64::MAX as u128) as u64),
-            upstream_duration_ms: upstream_duration_ms.map(|v| v.min(u64::MAX as u128) as u64),
-            response_shape,
-            upstream_status,
-            outcome,
+            upstream_first_event_ms: cap_ms(
+                facts.first_sse_event_ms.or(facts.upstream_first_event_ms),
+            ),
+            upstream_duration_ms: cap_ms(facts.upstream_duration_ms),
+            text_bytes: facts.text_bytes,
+            reasoning_bytes: facts.reasoning_bytes,
+            tool_call_bytes: facts.tool_call_bytes,
+            text_events: facts.text_events,
+            reasoning_events: facts.reasoning_events,
+            tool_call_events: facts.tool_call_events,
+            response_shape: facts.response_shape,
+            upstream_status: facts.upstream_status,
+            outcome: facts.outcome,
             flight,
             flight_dropped,
             error_kind: self.error_kind,
         };
-        // One compact console line (the default console surface).
-        let cache_display = cache_hit_ratio
-            .map(|ratio| format!("{ratio}%"))
-            .unwrap_or_else(|| "n/a".to_string());
-        let tokens_display = prompt_tokens
-            .map(format_tokens)
-            .unwrap_or_else(|| "?".to_string());
-        let symbol = match outcome {
-            "complete" => "\u{2713}",
-            "error"
-            | "protocol_error"
-            | "upstream_error"
-            | "unexpected_eof"
-            | "decode_error"
-            | "client_disconnected" => "\u{2717}",
-            _ => "\u{b7}",
-        };
-        tracing::info!(
-            request_id = %self.request_id,
-            "{} {} agent={} key={} in={} cache={} out={} ttft={}ms tool={}ms dur={}ms{}",
-            symbol,
-            if self.model_family == "glm53" { "GLM53" } else { "GENERIC" },
-            self.session.as_deref().unwrap_or("-"),
-            selected_key_name,
-            tokens_display,
-            cache_display,
-            completion_tokens.unwrap_or(0),
-            ttft_ms.unwrap_or(0),
-            first_tool_call_ms.unwrap_or(0),
-            elapsed.as_millis(),
-            self.error_kind
-                .map(|kind| format!(" ({kind})"))
-                .unwrap_or_default(),
-        );
-        if let Some(sink) = sink {
+        let line = compact_request_line(&summary, self.session.as_deref());
+        tracing::info!("{line}");
+        if let Some(sink) = facts.sink {
             sink.emit(LogRecord::Request(Box::new(summary)));
         }
     }
 }
 
-/// Compact human token figure: 307678 -> "307.7K".
-pub fn format_tokens(tokens: u64) -> String {
-    if tokens >= 1_000_000 {
-        format!("{:.1}M", tokens as f64 / 1_000_000.0)
-    } else if tokens >= 1_000 {
-        format!("{:.1}K", tokens as f64 / 1_000.0)
+fn cap_ms(value: Option<u128>) -> Option<u64> {
+    value.map(|value| value.min(u64::MAX as u128) as u64)
+}
+
+fn compact_request_line(summary: &RequestSummary, session: Option<&str>) -> String {
+    let symbol = match summary.outcome {
+        "complete" => "\u{2713}",
+        _ => "\u{2717}",
+    };
+    let family = if summary.model_family == "glm53" {
+        "GLM53"
     } else {
-        tokens.to_string()
-    }
+        "GENERIC"
+    };
+    let input = summary
+        .local_input_tokens
+        .or(summary.prompt_tokens)
+        .map(format_tokens)
+        .unwrap_or_else(|| "?".to_string());
+    let budget = summary
+        .total_context_budget
+        .map(|tokens| format!(" budget={}", format_tokens(tokens)))
+        .unwrap_or_default();
+    let cache = summary
+        .cache_hit_ratio
+        .map(|ratio| format!("{ratio}%"))
+        .unwrap_or_else(|| "n/a".to_string());
+    let out = match summary.completion_tokens {
+        Some(tokens) => tokens.to_string(),
+        None if summary.text_events + summary.reasoning_events + summary.tool_call_events > 0 => {
+            format!(
+                "t{}+r{}+k{}",
+                summary.text_events, summary.reasoning_events, summary.tool_call_events
+            )
+        }
+        None => "?".to_string(),
+    };
+    let ttft = summary
+        .ttft_ms
+        .map(format_duration_ms)
+        .unwrap_or_else(|| "-".to_string());
+    let tool = summary
+        .first_tool_call_ms
+        .map(|ms| format!(" tool={}", format_duration_ms(ms)))
+        .unwrap_or_default();
+    let err = summary
+        .error_kind
+        .map(|kind| format!(" err={kind}"))
+        .unwrap_or_default();
+    format!(
+        "{symbol} {family} agent={} key={} in={input}{budget} cache={cache} out={out} ttft={ttft}{tool} dur={}{err}",
+        session.unwrap_or("-"),
+        summary.selected_key_name,
+        format_duration_ms(summary.duration_ms),
+    )
+}
+
+/// Facts supplied at summary emission. Named so new diagnostic fields do
+/// not explode positional argument lists.
+pub struct SummaryEmit<'a> {
+    pub sink: Option<&'a LogSink>,
+    pub selected_key_name: &'a str,
+    pub attempts: u64,
+    pub failover_count: u64,
+    pub reasoning_effort: &'static str,
+    pub expose_thinking: bool,
+    pub client_max_tokens: Option<u64>,
+    pub effective_max_tokens: Option<u64>,
+    pub request_bytes: usize,
+    pub upstream_request_bytes: usize,
+    pub system_bytes: usize,
+    pub messages_bytes: usize,
+    pub tools_bytes: usize,
+    pub historical_reasoning_bytes_removed: u64,
+    pub billing_header_bytes_removed: u64,
+    pub canonicalized_arguments: usize,
+    pub usage: Option<&'a serde_json::Value>,
+    pub local_tokens: Option<LocalTokenCount>,
+    pub context_limit_tokens: Option<u64>,
+    pub first_reasoning_ms: Option<u128>,
+    pub first_text_ms: Option<u128>,
+    pub first_tool_call_ms: Option<u128>,
+    pub first_semantic_ms: Option<u128>,
+    pub first_sse_event_ms: Option<u128>,
+    pub first_upstream_byte_ms: Option<u128>,
+    pub upstream_headers_ms: Option<u128>,
+    pub last_upstream_progress_ms: Option<u128>,
+    pub last_semantic_progress_ms: Option<u128>,
+    pub upstream_first_event_ms: Option<u128>,
+    pub upstream_duration_ms: Option<u128>,
+    pub text_bytes: u64,
+    pub reasoning_bytes: u64,
+    pub tool_call_bytes: u64,
+    pub text_events: u64,
+    pub reasoning_events: u64,
+    pub tool_call_events: u64,
+    pub response_shape: Option<&'static str>,
+    pub upstream_status: Option<u16>,
+    pub outcome: &'static str,
 }
 
 /// Walk a path into a JSON value (tiny helper for usage fields).
@@ -643,17 +816,30 @@ pub struct StreamSummary {
     pub historical_reasoning_bytes_removed: u64,
     pub billing_header_bytes_removed: u64,
     pub canonicalized_arguments: usize,
+    pub local_tokens: LocalTokenSlot,
+    pub context_limit_tokens: Option<u64>,
+    pub upstream_headers_ms: Option<u128>,
 }
 
 /// Dynamic per-stream data at close.
 pub struct StreamSnap<'a> {
     pub request_id: &'a str,
     pub key_name: &'a str,
-    pub ttft_ms: Option<u128>,
     pub first_reasoning_ms: Option<u128>,
     pub first_text_ms: Option<u128>,
     pub first_tool_call_ms: Option<u128>,
+    pub first_sse_event_ms: Option<u128>,
+    pub first_semantic_ms: Option<u128>,
+    pub first_upstream_byte_ms: Option<u128>,
+    pub last_upstream_progress_ms: Option<u128>,
+    pub last_semantic_progress_ms: Option<u128>,
     pub usage: Option<&'a serde_json::Value>,
+    pub text_bytes: u64,
+    pub reasoning_bytes: u64,
+    pub tool_call_bytes: u64,
+    pub text_events: u64,
+    pub reasoning_events: u64,
+    pub tool_call_events: u64,
 }
 
 impl StreamSummary {
@@ -686,35 +872,144 @@ impl StreamSummary {
         if snap.usage.is_some() {
             builder.record(FlightEventKind::UsageObserved);
         }
-        builder.emit(
-            self.sink.as_ref(),
-            snap.key_name,
-            1,
-            0,
-            self.reasoning_effort,
-            self.expose_thinking,
-            self.client_max_tokens,
-            self.effective_max_tokens,
-            self.request_bytes,
-            self.upstream_request_bytes,
-            self.system_bytes,
-            self.messages_bytes,
-            self.tools_bytes,
-            self.historical_reasoning_bytes_removed,
-            self.billing_header_bytes_removed,
-            self.canonicalized_arguments,
-            snap.usage,
-            snap.ttft_ms,
-            snap.first_reasoning_ms,
-            snap.first_text_ms,
-            snap.first_tool_call_ms,
-            snap.ttft_ms,
-            Some(self.started.elapsed().as_millis()),
-            None,
-            Some(200),
+        builder.emit(SummaryEmit {
+            sink: self.sink.as_ref(),
+            selected_key_name: snap.key_name,
+            attempts: 1,
+            failover_count: 0,
+            reasoning_effort: self.reasoning_effort,
+            expose_thinking: self.expose_thinking,
+            client_max_tokens: self.client_max_tokens,
+            effective_max_tokens: self.effective_max_tokens,
+            request_bytes: self.request_bytes,
+            upstream_request_bytes: self.upstream_request_bytes,
+            system_bytes: self.system_bytes,
+            messages_bytes: self.messages_bytes,
+            tools_bytes: self.tools_bytes,
+            historical_reasoning_bytes_removed: self.historical_reasoning_bytes_removed,
+            billing_header_bytes_removed: self.billing_header_bytes_removed,
+            canonicalized_arguments: self.canonicalized_arguments,
+            usage: snap.usage,
+            local_tokens: self.local_tokens.get(),
+            context_limit_tokens: self.context_limit_tokens,
+            first_reasoning_ms: snap.first_reasoning_ms,
+            first_text_ms: snap.first_text_ms,
+            first_tool_call_ms: snap.first_tool_call_ms,
+            first_semantic_ms: snap.first_semantic_ms,
+            first_sse_event_ms: snap.first_sse_event_ms,
+            first_upstream_byte_ms: snap.first_upstream_byte_ms,
+            upstream_headers_ms: self.upstream_headers_ms,
+            last_upstream_progress_ms: snap.last_upstream_progress_ms,
+            last_semantic_progress_ms: snap.last_semantic_progress_ms,
+            upstream_first_event_ms: snap.first_sse_event_ms,
+            upstream_duration_ms: Some(self.started.elapsed().as_millis()),
+            text_bytes: snap.text_bytes,
+            reasoning_bytes: snap.reasoning_bytes,
+            tool_call_bytes: snap.tool_call_bytes,
+            text_events: snap.text_events,
+            reasoning_events: snap.reasoning_events,
+            tool_call_events: snap.tool_call_events,
+            response_shape: None,
+            upstream_status: Some(200),
             outcome,
-        );
+        });
     }
+
+    /// Emit a summary when the stream never started (transport / pre-body).
+    #[allow(clippy::too_many_arguments)]
+    pub fn emit_outcome(
+        &self,
+        request_id: &str,
+        key_name: &str,
+        attempts: u64,
+        failover_count: u64,
+        usage: Option<&serde_json::Value>,
+        outcome: &'static str,
+        error_kind: Option<&'static str>,
+        timings: OutcomeTimings,
+    ) {
+        let mut builder = SummaryBuilder::new(
+            request_id,
+            "anthropic",
+            self.requested_model.clone(),
+            self.upstream_model.clone(),
+            self.model_family,
+            self.session.clone(),
+            self.downstream_stream,
+            self.upstream_strategy,
+            self.started,
+            self.slow_ttft_ms,
+            self.slow_duration_ms,
+        );
+        if let Some(kind) = error_kind {
+            builder.mark_anomalous(kind);
+        } else if outcome != "complete" {
+            builder.mark_anomalous(outcome);
+        }
+        builder.emit(SummaryEmit {
+            sink: self.sink.as_ref(),
+            selected_key_name: key_name,
+            attempts,
+            failover_count,
+            reasoning_effort: self.reasoning_effort,
+            expose_thinking: self.expose_thinking,
+            client_max_tokens: self.client_max_tokens,
+            effective_max_tokens: self.effective_max_tokens,
+            request_bytes: self.request_bytes,
+            upstream_request_bytes: self.upstream_request_bytes,
+            system_bytes: self.system_bytes,
+            messages_bytes: self.messages_bytes,
+            tools_bytes: self.tools_bytes,
+            historical_reasoning_bytes_removed: self.historical_reasoning_bytes_removed,
+            billing_header_bytes_removed: self.billing_header_bytes_removed,
+            canonicalized_arguments: self.canonicalized_arguments,
+            usage,
+            local_tokens: self.local_tokens.get(),
+            context_limit_tokens: self.context_limit_tokens,
+            first_reasoning_ms: timings.first_reasoning_ms,
+            first_text_ms: timings.first_text_ms,
+            first_tool_call_ms: timings.first_tool_call_ms,
+            first_semantic_ms: timings.first_semantic_ms,
+            first_sse_event_ms: timings.first_sse_event_ms,
+            first_upstream_byte_ms: timings.first_upstream_byte_ms,
+            upstream_headers_ms: self.upstream_headers_ms,
+            last_upstream_progress_ms: timings.last_upstream_progress_ms,
+            last_semantic_progress_ms: timings.last_semantic_progress_ms,
+            upstream_first_event_ms: timings.first_sse_event_ms,
+            upstream_duration_ms: timings.upstream_duration_ms,
+            text_bytes: timings.text_bytes,
+            reasoning_bytes: timings.reasoning_bytes,
+            tool_call_bytes: timings.tool_call_bytes,
+            text_events: timings.text_events,
+            reasoning_events: timings.reasoning_events,
+            tool_call_events: timings.tool_call_events,
+            response_shape: timings.response_shape,
+            upstream_status: timings.upstream_status,
+            outcome,
+        });
+    }
+}
+
+/// Optional timings for [`StreamSummary::emit_outcome`].
+#[derive(Default)]
+pub struct OutcomeTimings {
+    pub first_reasoning_ms: Option<u128>,
+    pub first_text_ms: Option<u128>,
+    pub first_tool_call_ms: Option<u128>,
+    pub first_semantic_ms: Option<u128>,
+    pub first_sse_event_ms: Option<u128>,
+    pub first_upstream_byte_ms: Option<u128>,
+    pub last_upstream_progress_ms: Option<u128>,
+    pub last_semantic_progress_ms: Option<u128>,
+    pub upstream_duration_ms: Option<u128>,
+    pub text_bytes: u64,
+    pub reasoning_bytes: u64,
+    pub tool_call_bytes: u64,
+    pub text_events: u64,
+    pub reasoning_events: u64,
+    pub tool_call_events: u64,
+    pub response_shape: Option<&'static str>,
+    pub upstream_status: Option<u16>,
 }
 
 // --- writer thread ---------------------------------------------------------
@@ -745,6 +1040,9 @@ pub fn spawn_writer(
         &config.directory,
         config.max_file_size_mb.saturating_mul(1024 * 1024),
     )?;
+    // Each process owns a fresh active segment. Quota accounting still
+    // includes segments discovered above.
+    file_writer.open_fresh_segment()?;
     file_writer.max_total_bytes = config.max_total_size_mb.saturating_mul(1024 * 1024);
     file_writer.cleanup_target_bytes = file_writer
         .max_total_bytes
@@ -848,6 +1146,8 @@ mod tests {
 
     fn summary(request_id: &str) -> RequestSummary {
         RequestSummary {
+            schema_version: SCHEMA_VERSION,
+            instance_id: "test-instance".into(),
             ts_unix_ms: 0,
             request_id: request_id.to_owned(),
             protocol: "anthropic",
@@ -872,6 +1172,14 @@ mod tests {
             historical_reasoning_bytes_removed: 0,
             billing_header_bytes_removed: 120,
             canonicalized_arguments: 2,
+            local_input_tokens: Some(307_678),
+            local_token_count_method: Some("exact_glm53_optimized"),
+            local_token_count_duration_ms: Some(12),
+            reserved_output_tokens: Some(16384),
+            total_context_budget: Some(324_062),
+            context_limit_tokens: None,
+            context_utilization_ratio: None,
+            context_headroom_tokens: None,
             prompt_tokens: Some(307_678),
             cached_tokens: Some(307_648),
             completion_tokens: Some(209),
@@ -882,9 +1190,21 @@ mod tests {
             first_reasoning_ms: Some(88_700),
             first_text_ms: None,
             first_tool_call_ms: Some(88_789),
+            first_semantic_ms: Some(88_700),
+            first_sse_event_ms: Some(88_650),
+            first_upstream_byte_ms: Some(88_640),
+            upstream_headers_ms: Some(1_200),
+            last_upstream_progress_ms: Some(92_300),
+            last_semantic_progress_ms: Some(92_250),
             duration_ms: 92_376,
-            upstream_first_event_ms: Some(88_700),
+            upstream_first_event_ms: Some(88_650),
             upstream_duration_ms: Some(92_300),
+            text_bytes: 400,
+            reasoning_bytes: 800,
+            tool_call_bytes: 120,
+            text_events: 3,
+            reasoning_events: 8,
+            tool_call_events: 1,
             response_shape: Some("openai"),
             upstream_status: Some(200),
             outcome: "complete",
@@ -906,11 +1226,295 @@ mod tests {
         // Flight fields omitted when absent.
         assert!(value.get("flight").is_none());
         // Sensible serialized size (bounded queue math).
+        assert_eq!(value["schema_version"], SCHEMA_VERSION);
+        assert!(value.get("prompt").is_none());
         assert!(
-            bytes.len() < 2048,
+            bytes.len() < 4096,
             "summary serialized to {} bytes",
             bytes.len()
         );
+    }
+
+    fn writer_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "cline-proxy-obs-{label}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ))
+    }
+
+    fn wait_writer(sink: LogSink, handle: std::thread::JoinHandle<()>) {
+        drop(sink);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn writer_restart_with_underfilled_segment_opens_fresh_file() {
+        let directory = writer_dir("underfilled");
+        std::fs::create_dir_all(&directory).unwrap();
+        let old_path = directory.join("events-000001.jsonl");
+        std::fs::write(&old_path, b"{\"old\":true}\n").unwrap();
+        let (sink, handle) = spawn_writer(WriterConfig {
+            directory: directory.clone(),
+            max_file_size_mb: 1,
+            max_total_size_mb: 4,
+            cleanup_target_percent: 85,
+            flush_interval_ms: 50,
+        })
+        .unwrap();
+        sink.emit(LogRecord::Request(Box::new(summary("req_restart"))));
+        wait_writer(sink, handle);
+        let old = std::fs::read(&old_path).unwrap();
+        assert_eq!(old, b"{\"old\":true}\n");
+        let names: Vec<_> = std::fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().any(|name| name != "events-000001.jsonl"));
+        let mut found = false;
+        for entry in std::fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(Result::ok)
+        {
+            if entry.path() == old_path {
+                continue;
+            }
+            let text = std::fs::read_to_string(entry.path()).unwrap();
+            for line in text.lines() {
+                let value: serde_json::Value = serde_json::from_str(line).unwrap();
+                if value["request_id"] == "req_restart" {
+                    found = true;
+                    assert_eq!(value["schema_version"], SCHEMA_VERSION);
+                }
+            }
+        }
+        assert!(found, "new segment missing restarted summary");
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn writer_restart_with_full_segment_opens_next_index() {
+        let directory = writer_dir("full");
+        std::fs::create_dir_all(&directory).unwrap();
+        let old_path = directory.join("events-000001.jsonl");
+        std::fs::write(&old_path, vec![b'x'; 64 * 1024]).unwrap();
+        let (sink, handle) = spawn_writer(WriterConfig {
+            directory: directory.clone(),
+            max_file_size_mb: 1,
+            max_total_size_mb: 8,
+            cleanup_target_percent: 85,
+            flush_interval_ms: 50,
+        })
+        .unwrap();
+        sink.emit(LogRecord::Request(Box::new(summary("req_full"))));
+        wait_writer(sink, handle);
+        assert_eq!(std::fs::read(&old_path).unwrap().len(), 64 * 1024);
+        let new_path = directory.join("events-000002.jsonl");
+        let text = std::fs::read_to_string(&new_path).unwrap();
+        assert!(text.contains("req_full"));
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn writer_restart_after_partial_final_line_does_not_truncate_old() {
+        let directory = writer_dir("partial");
+        std::fs::create_dir_all(&directory).unwrap();
+        let old_path = directory.join("events-000001.jsonl");
+        std::fs::write(&old_path, b"{\"old\":true}\n{\"partial").unwrap();
+        let (sink, handle) = spawn_writer(WriterConfig {
+            directory: directory.clone(),
+            max_file_size_mb: 1,
+            max_total_size_mb: 4,
+            cleanup_target_percent: 85,
+            flush_interval_ms: 50,
+        })
+        .unwrap();
+        sink.emit(LogRecord::Request(Box::new(summary("req_partial"))));
+        wait_writer(sink, handle);
+        let old = std::fs::read(&old_path).unwrap();
+        assert_eq!(old, b"{\"old\":true}\n{\"partial");
+        let new_text = std::fs::read_to_string(directory.join("events-000002.jsonl")).unwrap();
+        for line in new_text.lines() {
+            let _: serde_json::Value = serde_json::from_str(line).unwrap();
+        }
+        assert!(new_text.contains("req_partial"));
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn compact_info_line_uses_local_tokens_and_not_question_mark() {
+        let mut record = summary("req_fail");
+        record.prompt_tokens = None;
+        record.completion_tokens = None;
+        record.local_input_tokens = Some(199_634);
+        record.total_context_budget = Some(216_018);
+        record.outcome = "upstream_error";
+        record.error_kind = Some("upstream_stream_idle_timeout");
+        record.text_events = 2;
+        record.reasoning_events = 4;
+        record.tool_call_events = 0;
+        let line = compact_request_line(&record, Some("abcd"));
+        assert!(line.contains("in=199.6K"), "{line}");
+        assert!(line.contains("budget=216.0K"), "{line}");
+        assert!(line.contains("out=t2+r4+k0"), "{line}");
+        assert!(!line.contains("in=?"), "{line}");
+        assert!(!line.contains("out=0"), "{line}");
+        assert!(line.as_bytes().iter().all(|b| *b != 0x1b));
+    }
+
+    #[test]
+    fn local_exact_tokens_survive_missing_upstream_usage() {
+        let mut builder = SummaryBuilder::new(
+            "req",
+            "anthropic",
+            "claude-sonnet-4-6".into(),
+            "z-ai/glm-5.3-flash".into(),
+            "glm53",
+            None,
+            true,
+            "native_streaming",
+            Instant::now(),
+            15_000,
+            60_000,
+        );
+        builder.mark_anomalous("upstream_error");
+        let (tx, rx) = mpsc::sync_channel(4);
+        let sink = LogSink {
+            tx,
+            dropped: Arc::new(AtomicU64::new(0)),
+            emitted: Arc::new(AtomicU64::new(0)),
+        };
+        builder.emit(SummaryEmit {
+            sink: Some(&sink),
+            selected_key_name: "k",
+            attempts: 1,
+            failover_count: 0,
+            reasoning_effort: "high",
+            expose_thinking: false,
+            client_max_tokens: Some(32_000),
+            effective_max_tokens: Some(16_384),
+            request_bytes: 10,
+            upstream_request_bytes: 10,
+            system_bytes: 1,
+            messages_bytes: 1,
+            tools_bytes: 0,
+            historical_reasoning_bytes_removed: 0,
+            billing_header_bytes_removed: 0,
+            canonicalized_arguments: 0,
+            usage: None,
+            local_tokens: Some(LocalTokenCount {
+                tokens: 199_634,
+                method: "exact_glm53_optimized",
+                duration_ms: 40,
+            }),
+            context_limit_tokens: None,
+            first_reasoning_ms: None,
+            first_text_ms: None,
+            first_tool_call_ms: None,
+            first_semantic_ms: None,
+            first_sse_event_ms: Some(13_100),
+            first_upstream_byte_ms: Some(13_050),
+            upstream_headers_ms: Some(400),
+            last_upstream_progress_ms: Some(13_100),
+            last_semantic_progress_ms: None,
+            upstream_first_event_ms: Some(13_100),
+            upstream_duration_ms: Some(603_500),
+            text_bytes: 0,
+            reasoning_bytes: 0,
+            tool_call_bytes: 0,
+            text_events: 0,
+            reasoning_events: 0,
+            tool_call_events: 0,
+            response_shape: None,
+            upstream_status: Some(200),
+            outcome: "upstream_error",
+        });
+        let LogRecord::Request(summary) = rx.try_recv().unwrap() else {
+            panic!("expected request record");
+        };
+        assert_eq!(summary.local_input_tokens, Some(199_634));
+        assert_eq!(summary.prompt_tokens, None);
+        assert_eq!(summary.total_context_budget, Some(199_634 + 16_384));
+        assert_eq!(summary.first_sse_event_ms, Some(13_100));
+        assert_eq!(summary.ttft_ms, None);
+        assert_eq!(summary.schema_version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn anthropic_usage_fields_are_not_misread_as_missing() {
+        let usage = json!({"input_tokens":19,"output_tokens":14,"cache_read_input_tokens":0});
+        let builder = SummaryBuilder::new(
+            "req",
+            "anthropic",
+            "claude-sonnet-4-6".into(),
+            "z-ai/glm-5.3-flash".into(),
+            "glm53",
+            None,
+            false,
+            "stream_and_aggregate",
+            Instant::now(),
+            15_000,
+            60_000,
+        );
+        let (tx, rx) = mpsc::sync_channel(4);
+        let sink = LogSink {
+            tx,
+            dropped: Arc::new(AtomicU64::new(0)),
+            emitted: Arc::new(AtomicU64::new(0)),
+        };
+        builder.emit(SummaryEmit {
+            sink: Some(&sink),
+            selected_key_name: "k",
+            attempts: 1,
+            failover_count: 0,
+            reasoning_effort: "high",
+            expose_thinking: false,
+            client_max_tokens: Some(16),
+            effective_max_tokens: Some(16),
+            request_bytes: 10,
+            upstream_request_bytes: 10,
+            system_bytes: 0,
+            messages_bytes: 10,
+            tools_bytes: 0,
+            historical_reasoning_bytes_removed: 0,
+            billing_header_bytes_removed: 0,
+            canonicalized_arguments: 0,
+            usage: Some(&usage),
+            local_tokens: Some(LocalTokenCount {
+                tokens: 19,
+                method: "exact_glm53_optimized",
+                duration_ms: 2,
+            }),
+            context_limit_tokens: None,
+            first_reasoning_ms: None,
+            first_text_ms: Some(100),
+            first_tool_call_ms: None,
+            first_semantic_ms: Some(100),
+            first_sse_event_ms: Some(90),
+            first_upstream_byte_ms: Some(80),
+            upstream_headers_ms: Some(20),
+            last_upstream_progress_ms: Some(200),
+            last_semantic_progress_ms: Some(200),
+            upstream_first_event_ms: Some(90),
+            upstream_duration_ms: Some(250),
+            text_bytes: 2,
+            reasoning_bytes: 0,
+            tool_call_bytes: 0,
+            text_events: 1,
+            reasoning_events: 0,
+            tool_call_events: 0,
+            response_shape: Some("openai"),
+            upstream_status: Some(200),
+            outcome: "complete",
+        });
+        let LogRecord::Request(summary) = rx.try_recv().unwrap() else {
+            panic!("expected request record");
+        };
+        assert_eq!(summary.prompt_tokens, Some(19));
+        assert_eq!(summary.completion_tokens, Some(14));
+        assert_eq!(summary.cached_tokens, Some(0));
+        assert_eq!(summary.local_input_tokens, Some(19));
     }
 
     #[test]

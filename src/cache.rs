@@ -266,14 +266,14 @@ pub fn log_prefix_telemetry(
     let object = openai_body.as_object().unwrap_or(&default_object);
     let (prefix_hash, prefix_bytes) = stable_prefix_hash(object);
     match session_fp {
-        Some(session) => tracing::info!(
+        Some(session) => tracing::debug!(
             request_id,
             session = %session,
             prefix_hash = %prefix_hash,
             prefix_bytes,
             "stable prefix telemetry"
         ),
-        None => tracing::info!(
+        None => tracing::debug!(
             request_id,
             session = "unstable",
             prefix_hash = %prefix_hash,

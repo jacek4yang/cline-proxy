@@ -354,7 +354,7 @@ async fn openai_chat(
             )
         }
     };
-    tracing::info!(
+    tracing::debug!(
         request_id,
         protocol = "openai",
         requested_model,
@@ -480,16 +480,6 @@ async fn anthropic_messages(
         canonicalized,
         &prefix_telemetry,
     );
-    // Exact tokenizer telemetry is GLM-specific; generic-model requests have
-    // no embedded tokenizer and skip it entirely.
-    if optimization.model_family == optimize::ModelFamily::Glm53 {
-        spawn_exact_token_telemetry(
-            state.clone(),
-            body.clone(),
-            optimization.reasoning_effort,
-            request_id.clone(),
-        );
-    }
     // Cline upstream strategy (issue #14): streaming is the verified
     // canonical upstream transport. A downstream non-stream request is
     // served by ONE upstream streaming request aggregated locally — the
@@ -533,10 +523,71 @@ async fn anthropic_messages(
         "client request accepted"
     );
     let started = Instant::now();
-    // Adaptive observability (issue #16): ONE summary per request. For
-    // streams the static context moves into the stream and emits at close;
-    // for non-stream the handler emits directly after conversion.
-    let stream_summary = crate::obs::StreamSummary {
+    let local_tokens = crate::obs::LocalTokenSlot::default();
+    let mut effective_max_tokens = optimization.effective_max_tokens;
+    let mut upstream_body = upstream_body;
+    let mut upstream_request_bytes = upstream_request_bytes;
+    if let Some(window) = state.config.glm53.context.upstream_context_window_tokens {
+        let limits = crate::context_guard::ContextLimits {
+            window_tokens: window,
+            safety_margin_tokens: state.config.glm53.context.context_safety_margin_tokens,
+            min_output_tokens: u64::from(state.config.glm53.context.min_output_tokens),
+        };
+        let requested_out = effective_max_tokens.unwrap_or(0);
+        let estimate = crate::context_guard::conservative_tokens_from_bytes(upstream_request_bytes);
+        if !crate::context_guard::well_below_window(estimate, limits, requested_out) {
+            if let Some(count) =
+                count_optimized_tokens_blocking(state.clone(), upstream_body.clone(), &request_id)
+                    .await
+            {
+                local_tokens.store(count);
+                match crate::context_guard::evaluate(count.tokens, requested_out, limits) {
+                    crate::context_guard::ContextDecision::Allow { .. } => {}
+                    crate::context_guard::ContextDecision::ReduceOutput {
+                        reserved_output_tokens,
+                        ..
+                    } => {
+                        tracing::info!(
+                            request_id,
+                            reserved_output_tokens,
+                            requested_output_tokens = requested_out,
+                            "reduced output reserve to fit configured context window"
+                        );
+                        effective_max_tokens = Some(reserved_output_tokens);
+                        if let Some(object) = converted.body.as_object_mut() {
+                            object.insert("max_tokens".into(), json!(reserved_output_tokens));
+                        }
+                        if let Ok(bytes) = serde_json::to_vec(&converted.body) {
+                            upstream_body = Bytes::from(bytes);
+                            upstream_request_bytes = upstream_body.len();
+                        }
+                    }
+                    crate::context_guard::ContextDecision::RejectInput {
+                        total_needed,
+                        window,
+                    } => {
+                        return anthropic_error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_request_error",
+                            format!(
+                                "request exceeds the configured upstream context window ({window} tokens; need about {total_needed})"
+                            ),
+                            &request_id,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    if optimization.model_family == optimize::ModelFamily::Glm53 {
+        spawn_exact_token_telemetry(
+            state.clone(),
+            upstream_body.clone(),
+            request_id.clone(),
+            local_tokens.clone(),
+        );
+    }
+    let mut stream_summary = crate::obs::StreamSummary {
         sink: state.log_sink.clone(),
         session: session_fp.clone(),
         requested_model: requested_model.clone(),
@@ -560,7 +611,7 @@ async fn anthropic_messages(
         reasoning_effort: optimization.reasoning_effort,
         expose_thinking: optimization.expose_thinking,
         client_max_tokens: optimization.client_max_tokens,
-        effective_max_tokens: optimization.effective_max_tokens,
+        effective_max_tokens,
         request_bytes: body.len(),
         upstream_request_bytes,
         system_bytes: optimization.system_bytes,
@@ -569,6 +620,9 @@ async fn anthropic_messages(
         historical_reasoning_bytes_removed: optimization.historical_reasoning_bytes_removed,
         billing_header_bytes_removed,
         canonicalized_arguments: canonicalized,
+        local_tokens: local_tokens.clone(),
+        context_limit_tokens: state.config.glm53.context.upstream_context_window_tokens,
+        upstream_headers_ms: None,
     };
     let result = match state
         .upstream
@@ -577,49 +631,15 @@ async fn anthropic_messages(
     {
         Ok(result) => result,
         Err(error) => {
-            // Transport failure: emit an anomalous summary (no key selected).
-            let mut builder = crate::obs::SummaryBuilder::new(
+            stream_summary.emit_outcome(
                 &request_id,
-                "anthropic",
-                requested_model.clone(),
-                upstream_model.clone(),
-                stream_summary.model_family,
-                session_fp.clone(),
-                converted.stream,
-                stream_summary.upstream_strategy,
-                started,
-                state.config.logging.slow_ttft_ms,
-                state.config.logging.slow_duration_ms,
-            );
-            builder.record(crate::obs::FlightEventKind::UpstreamInterrupted);
-            builder.mark_anomalous("transport_error");
-            builder.emit(
-                state.log_sink.as_ref(),
                 "(no key)",
                 0,
                 0,
-                optimization.reasoning_effort,
-                optimization.expose_thinking,
-                optimization.client_max_tokens,
-                optimization.effective_max_tokens,
-                body.len(),
-                0,
-                optimization.system_bytes,
-                optimization.messages_bytes,
-                optimization.tools_bytes,
-                optimization.historical_reasoning_bytes_removed,
-                billing_header_bytes_removed,
-                canonicalized,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
                 None,
                 "upstream_error",
+                Some("transport_error"),
+                crate::obs::OutcomeTimings::default(),
             );
             return upstream_failure(&state, error, true, &request_id);
         }
@@ -634,6 +654,7 @@ async fn anthropic_messages(
         upstream_status = status.as_u16(),
         "Anthropic upstream attempt selected"
     );
+    stream_summary.upstream_headers_ms = Some(started.elapsed().as_millis());
     let response = match result.response {
         UpstreamResponse::Success(response) => response,
         UpstreamResponse::HttpError(error) => {
@@ -668,6 +689,7 @@ async fn anthropic_messages(
                     expose_thinking: converted.expose_thinking,
                     shadow: shadow_context,
                     summary: Some(stream_summary.clone()),
+                    timeouts: state.config.upstream.stream_timeouts(),
                 },
             ))
             .unwrap_or_else(|_| Response::new(Body::empty()));
@@ -675,71 +697,39 @@ async fn anthropic_messages(
         return response;
     }
     // Downstream non-stream: aggregate the upstream stream (issue #14).
-    let (value, response_shape, first_event_ms, upstream_duration_ms) =
-        match anthropic::aggregate_stream_response(response, &request_id).await {
-            Ok(parts) => parts,
-            Err(error) => {
-                // A malformed or unusable 2xx body is a provider protocol
-                // error, never a key-quota signal: 502 without rotation.
-                let mut builder = crate::obs::SummaryBuilder::new(
-                    &request_id,
-                    "anthropic",
-                    requested_model.clone(),
-                    upstream_model.clone(),
-                    stream_summary.model_family,
-                    session_fp.clone(),
-                    false,
-                    "stream_and_aggregate",
-                    started,
-                    state.config.logging.slow_ttft_ms,
-                    state.config.logging.slow_duration_ms,
-                );
-                builder.record(crate::obs::FlightEventKind::ProtocolError);
-                builder.mark_anomalous("protocol_error");
-                builder.emit(
-                    state.log_sink.as_ref(),
-                    &result.selected.name,
-                    result.attempt as u64,
-                    result.failover_count as u64,
-                    optimization.reasoning_effort,
-                    optimization.expose_thinking,
-                    optimization.client_max_tokens,
-                    optimization.effective_max_tokens,
-                    body.len(),
-                    upstream_request_bytes,
-                    optimization.system_bytes,
-                    optimization.messages_bytes,
-                    optimization.tools_bytes,
-                    optimization.historical_reasoning_bytes_removed,
-                    billing_header_bytes_removed,
-                    canonicalized,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    "protocol_error",
-                );
-                return protocol_error(error, StatusCode::BAD_GATEWAY, &request_id);
-            }
-        };
-    let aggregation_timings = (
-        first_event_ms,
-        response_shape,
-        None::<u128>,
-        upstream_duration_ms,
-    );
+    let aggregated = match anthropic::aggregate_stream_response(
+        response,
+        &request_id,
+        state.config.upstream.stream_timeouts(),
+    )
+    .await
+    {
+        Ok(parts) => parts,
+        Err(error) => {
+            let kind = error.stall_kind.unwrap_or("protocol_error");
+            stream_summary.emit_outcome(
+                &request_id,
+                &result.selected.name,
+                result.attempt as u64,
+                result.failover_count as u64,
+                None,
+                kind,
+                Some(kind),
+                crate::obs::OutcomeTimings {
+                    upstream_status: Some(200),
+                    ..crate::obs::OutcomeTimings::default()
+                },
+            );
+            return protocol_error(error, StatusCode::BAD_GATEWAY, &request_id);
+        }
+    };
     tracing::debug!(
         request_id,
         downstream_stream = false,
         upstream_strategy = "stream_and_aggregate",
-        response_shape = aggregation_timings.1.as_str(),
-        upstream_first_event_ms = first_event_ms.unwrap_or(0),
-        upstream_duration_ms,
+        response_shape = aggregated.shape.as_str(),
+        upstream_first_event_ms = aggregated.first_event_ms.unwrap_or(0),
+        upstream_duration_ms = aggregated.duration_ms,
         aggregate_ms = started.elapsed().as_millis(),
         "upstream stream aggregated for non-stream client"
     );
@@ -747,110 +737,58 @@ async fn anthropic_messages(
     // issued tool calls so the next request in this epoch can restore it.
     store_reasoning_shadow(
         &state,
-        value.as_object(),
+        aggregated.body.as_object(),
         session_fp.as_deref(),
         &request_id,
     );
-    let convert_started = std::time::Instant::now();
+    let timings = crate::obs::OutcomeTimings {
+        first_reasoning_ms: aggregated.first_reasoning_ms,
+        first_text_ms: aggregated.first_text_ms,
+        first_tool_call_ms: aggregated.first_tool_call_ms,
+        first_semantic_ms: aggregated.first_semantic_ms,
+        first_sse_event_ms: aggregated.first_event_ms,
+        first_upstream_byte_ms: aggregated.first_byte_ms,
+        last_upstream_progress_ms: aggregated.last_byte_ms,
+        last_semantic_progress_ms: aggregated.last_semantic_ms,
+        upstream_duration_ms: Some(aggregated.duration_ms),
+        text_bytes: aggregated.text_bytes,
+        reasoning_bytes: aggregated.reasoning_bytes,
+        tool_call_bytes: aggregated.tool_call_bytes,
+        text_events: aggregated.text_events,
+        reasoning_events: aggregated.reasoning_events,
+        tool_call_events: aggregated.tool_call_events,
+        response_shape: Some(aggregated.shape.as_str()),
+        upstream_status: Some(200),
+    };
     match anthropic::convert_response(
-        &value,
+        &aggregated.body,
         &request_id,
         &upstream_model,
         converted.expose_thinking,
     ) {
         Ok(value) => {
-            // Adaptive observability (issue #16): single summary emission
-            // for the non-stream path.
-            let mut builder = crate::obs::SummaryBuilder::new(
+            stream_summary.emit_outcome(
                 &request_id,
-                "anthropic",
-                requested_model.clone(),
-                upstream_model.clone(),
-                stream_summary.model_family,
-                session_fp.clone(),
-                false,
-                "stream_and_aggregate",
-                started,
-                state.config.logging.slow_ttft_ms,
-                state.config.logging.slow_duration_ms,
-            );
-            if aggregation_timings.0.is_some() {
-                builder.record(crate::obs::FlightEventKind::FirstUpstreamEvent);
-            }
-            builder.emit(
-                state.log_sink.as_ref(),
                 &result.selected.name,
                 result.attempt as u64,
                 result.failover_count as u64,
-                optimization.reasoning_effort,
-                optimization.expose_thinking,
-                optimization.client_max_tokens,
-                optimization.effective_max_tokens,
-                body.len(),
-                upstream_request_bytes,
-                optimization.system_bytes,
-                optimization.messages_bytes,
-                optimization.tools_bytes,
-                optimization.historical_reasoning_bytes_removed,
-                billing_header_bytes_removed,
-                canonicalized,
                 value.get("usage"),
-                aggregation_timings.0,
-                None,
-                None,
-                aggregation_timings.2,
-                aggregation_timings.0,
-                Some(aggregation_timings.3),
-                Some(aggregation_timings.1.as_str()),
-                Some(200),
                 "complete",
+                None,
+                timings,
             );
-            let _ = convert_started;
             json_response(StatusCode::OK, value, &request_id)
         }
         Err(error) => {
-            let mut builder = crate::obs::SummaryBuilder::new(
+            stream_summary.emit_outcome(
                 &request_id,
-                "anthropic",
-                requested_model.clone(),
-                upstream_model.clone(),
-                stream_summary.model_family,
-                session_fp.clone(),
-                false,
-                "stream_and_aggregate",
-                started,
-                state.config.logging.slow_ttft_ms,
-                state.config.logging.slow_duration_ms,
-            );
-            builder.record(crate::obs::FlightEventKind::ProtocolError);
-            builder.mark_anomalous("protocol_error");
-            builder.emit(
-                state.log_sink.as_ref(),
                 &result.selected.name,
                 result.attempt as u64,
                 result.failover_count as u64,
-                optimization.reasoning_effort,
-                optimization.expose_thinking,
-                optimization.client_max_tokens,
-                optimization.effective_max_tokens,
-                body.len(),
-                upstream_request_bytes,
-                optimization.system_bytes,
-                optimization.messages_bytes,
-                optimization.tools_bytes,
-                optimization.historical_reasoning_bytes_removed,
-                billing_header_bytes_removed,
-                canonicalized,
                 None,
-                aggregation_timings.0,
-                None,
-                None,
-                aggregation_timings.2,
-                aggregation_timings.0,
-                Some(aggregation_timings.3),
-                Some(aggregation_timings.1.as_str()),
-                Some(200),
                 "protocol_error",
+                Some("protocol_error"),
+                timings,
             );
             protocol_error(error, StatusCode::BAD_GATEWAY, &request_id)
         }
@@ -960,7 +898,7 @@ async fn anthropic_count_tokens(
             )
         }
     };
-    tracing::info!(
+    tracing::debug!(
         request_id,
         protocol = "anthropic",
         requested_model,
@@ -1106,11 +1044,45 @@ fn log_request_optimization(
 ///   would have cost (exact would require a second full pass over the
 ///   pre-strip request, which production does not pay for)
 /// - derived before/after ratio (before = after + removed estimate)
+fn count_optimized_request(request_bytes: &[u8]) -> Option<crate::obs::LocalTokenCount> {
+    let request: Value = serde_json::from_slice(request_bytes).ok()?;
+    let started = Instant::now();
+    let tokens = crate::glm53::count::count_input_tokens(&request).ok()?;
+    Some(crate::obs::LocalTokenCount {
+        tokens: u64::from(tokens),
+        method: "exact_glm53_optimized",
+        duration_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+    })
+}
+
+async fn count_optimized_tokens_blocking(
+    state: AppState,
+    request_bytes: Bytes,
+    request_id: &str,
+) -> Option<crate::obs::LocalTokenCount> {
+    if !state.config.glm53.telemetry.exact_input_tokens {
+        return None;
+    }
+    let permits = state.token_count_permits.clone()?;
+    let permit = permits.acquire_owned().await.ok()?;
+    let counted = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        count_optimized_request(&request_bytes)
+    })
+    .await
+    .ok()
+    .flatten();
+    if counted.is_none() {
+        tracing::debug!(request_id, "context-guard exact token count failed");
+    }
+    counted
+}
+
 fn spawn_exact_token_telemetry(
     state: AppState,
     request_bytes: Bytes,
-    reasoning_effort: &'static str,
     request_id: String,
+    slot: crate::obs::LocalTokenSlot,
 ) {
     if !state.config.glm53.telemetry.exact_input_tokens {
         return;
@@ -1118,12 +1090,8 @@ fn spawn_exact_token_telemetry(
     let Some(permits) = state.token_count_permits.clone() else {
         return;
     };
-    // The tokenizer is embedded and CPU-bound; one permit at a time by
-    // default. When the permit is busy, telemetry is skipped rather than
-    // queued: losing a count beats piling up megabyte-scale jobs. The owned
-    // permit keeps the semaphore alive for the count's duration.
     let Ok(permit) = permits.clone().try_acquire_owned() else {
-        tracing::info!(
+        tracing::debug!(
             request_id,
             token_telemetry_skipped_busy = true,
             "exact token telemetry skipped: another count is in flight"
@@ -1132,34 +1100,15 @@ fn spawn_exact_token_telemetry(
     };
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let started = Instant::now();
-        let Ok(mut request) = serde_json::from_slice::<Value>(&request_bytes) else {
+        let Some(count) = count_optimized_request(&request_bytes) else {
             return;
         };
-        let removed_tokens = match optimize::removed_reasoning_tokens(&request) {
-            Ok(tokens) => tokens,
-            Err(_) => return, // uncountable content; bytes telemetry still applies
-        };
-        optimize::strip_anthropic_thinking(&mut request);
-        // Align the count with the effort actually placed on the wire.
-        request["output_config"] = json!({"effort": reasoning_effort});
-        let Ok(input_tokens) = crate::glm53::count::count_input_tokens(&request) else {
-            return;
-        };
-        let before_estimate = u64::from(input_tokens).saturating_add(removed_tokens);
-        let saved_percent = if before_estimate > 0 {
-            (removed_tokens as f64 / before_estimate as f64 * 100.0 * 10.0).round() / 10.0
-        } else {
-            0.0
-        };
-        tracing::info!(
+        slot.store(count);
+        tracing::debug!(
             request_id,
-            input_tokens,
-            estimated_input_tokens_before = before_estimate,
-            estimated_tokens_removed_historical_reasoning = removed_tokens,
-            saved_percent,
-            count_method = "exact_glm53_optimized",
-            count_duration_ms = started.elapsed().as_millis(),
+            input_tokens = count.tokens,
+            count_method = count.method,
+            count_duration_ms = count.duration_ms,
             "exact GLM token accounting for optimized request"
         );
     });
@@ -1173,7 +1122,7 @@ async fn openai_upstream_response(
     started: Instant,
 ) -> Response {
     let status = result.response.status();
-    tracing::info!(
+    tracing::debug!(
         request_id,
         selected_key_name = %result.selected.name,
         selected_key_index = result.selected.configured_index,
@@ -1286,7 +1235,7 @@ fn openai_stream_body(
                 }
             }
         }
-        tracing::info!(
+        tracing::debug!(
             request_id,
             selected_key_name = key_name,
             committed_to_client,
@@ -1761,6 +1710,11 @@ mod tests {
         StreamError,
         Stall(Arc<AtomicBool>),
         Delay(Duration),
+        /// Keep sending empty-delta SSE frames so byte idle never fires
+        /// while semantic progress stays absent.
+        Heartbeat {
+            interval: Duration,
+        },
     }
 
     #[derive(Clone)]
@@ -1878,6 +1832,19 @@ mod tests {
                     let _guard = CancellationGuard(cancelled);
                     yield Ok::<Bytes, Infallible>(Bytes::from(initial));
                     std::future::pending::<()>().await;
+                };
+                Body::from_stream(stream)
+            }
+            MockBody::Heartbeat { interval } => {
+                let initial = spec.body;
+                let stream = async_stream::stream! {
+                    yield Ok::<Bytes, Infallible>(Bytes::from(initial));
+                    loop {
+                        tokio::time::sleep(interval).await;
+                        yield Ok(Bytes::from(
+                            "data: {\"choices\":[{\"index\":0,\"delta\":{}}]}\n\n",
+                        ));
+                    }
                 };
                 Body::from_stream(stream)
             }
@@ -3175,6 +3142,77 @@ mod tests {
             state.upstream.pool().select(&HashSet::new()).unwrap().index,
             0
         );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn stream_idle_timeout_does_not_replay_or_switch_key() {
+        let (base, mock, task) = start_mock().await;
+        let mut spec = Spec::sse("data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n");
+        spec.kind = MockBody::Stall(Arc::new(AtomicBool::new(false)));
+        mock.set("cline-key-1", vec![spec]).await;
+        mock.set(
+            "cline-key-2",
+            vec![Spec::sse(successful_sse("must-not-run"))],
+        )
+        .await;
+        let mut config = test_config(base, 2);
+        config.upstream.timeout_secs = 30;
+        config.upstream.stream_idle_timeout_secs = 1;
+        config.upstream.first_event_timeout_secs = 30;
+        config.upstream.first_semantic_timeout_secs = 30;
+        config.upstream.semantic_idle_timeout_secs = 30;
+        let state = AppState::new(config).unwrap();
+        let app = router(state.clone());
+        let response = app
+            .oneshot(gateway_request("/v1/messages", anthropic_body(true)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let text = response_text(response).await;
+        assert!(
+            text.contains("upstream stream was idle") || text.contains("stream_idle"),
+            "{text}"
+        );
+        assert_eq!(mock.seen().await.len(), 1);
+        assert_eq!(
+            state.upstream.pool().select(&HashSet::new()).unwrap().index,
+            0
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn first_semantic_timeout_ignores_heartbeat_frames() {
+        let (base, mock, task) = start_mock().await;
+        let mut spec = Spec::sse("data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n");
+        spec.kind = MockBody::Heartbeat {
+            interval: Duration::from_millis(80),
+        };
+        mock.set("cline-key-1", vec![spec]).await;
+        mock.set(
+            "cline-key-2",
+            vec![Spec::sse(successful_sse("must-not-run"))],
+        )
+        .await;
+        let mut config = test_config(base, 2);
+        config.upstream.timeout_secs = 30;
+        config.upstream.stream_idle_timeout_secs = 30;
+        config.upstream.first_event_timeout_secs = 30;
+        config.upstream.first_semantic_timeout_secs = 1;
+        config.upstream.semantic_idle_timeout_secs = 30;
+        let state = AppState::new(config).unwrap();
+        let app = router(state.clone());
+        let response = app
+            .oneshot(gateway_request("/v1/messages", anthropic_body(true)))
+            .await
+            .unwrap();
+        let text = response_text(response).await;
+        assert!(
+            text.contains("first-semantic") || text.contains("no reasoning/text/tool"),
+            "{text}"
+        );
+        assert_eq!(mock.seen().await.len(), 1);
         task.abort();
     }
 

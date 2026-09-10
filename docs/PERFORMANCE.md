@@ -32,6 +32,7 @@ Code-shaped fixture):
 | CPU-bound exact tokenizer | `spawn_blocking` + `Semaphore(1)` (`glm53.telemetry.max_concurrent_token_counts`) | busy → **skip** telemetry (logged), never queued |
 | log JSON serialization + disk IO | dedicated `cline-log-writer` std::thread | bounded queue 8192, `try_send` or drop |
 | request/protocol/SSE work | Tokio workers | no disk IO, no blocking calls, no per-chunk allocations beyond protocol needs |
+| stall timers (`StreamWatch`) | Tokio `select` + `Instant` | O(1) per chunk; downstream pings do not reset; no `String` formatting |
 | runtime state persistence | debounced writer task (150 ms coalesce) + final flush on shutdown | atomic tmp+rename, off request path |
 
 ## Subsystem budgets

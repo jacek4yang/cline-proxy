@@ -1,9 +1,11 @@
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::Parser;
 
 use cline_proxy::config::{default_config_path, Config, LogFormat};
+use cline_proxy::console::{enable_ansi, ColorMode};
 use cline_proxy::server;
 
 #[derive(Parser)]
@@ -16,28 +18,46 @@ struct Cli {
     /// JSON configuration path (or CLINE_PROXY_CONFIG).
     #[arg(long)]
     config: Option<PathBuf>,
+    /// Override `server.bind` without copying the config.
+    #[arg(long)]
+    bind: Option<String>,
+    /// Override `runtime.state_file`.
+    #[arg(long)]
+    state_file: Option<PathBuf>,
+    /// Override `logging.directory`.
+    #[arg(long)]
+    log_directory: Option<PathBuf>,
+    /// Disable ANSI color (same as `--color never`).
+    #[arg(long, conflicts_with = "color")]
+    no_color: bool,
+    /// ANSI color policy: auto (default), always, never.
+    #[arg(long, value_name = "MODE")]
+    color: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let config_path = cli.config.unwrap_or_else(default_config_path);
-    let config = Config::load(&config_path)?;
+    let config_path = cli.config.clone().unwrap_or_else(default_config_path);
+    let mut config = Config::load(&config_path)?;
+    apply_cli_overrides(&mut config, &cli)?;
+    config.validate()?;
     init_tracing(&config);
     let enabled_keys = config
         .cline_api_keys
         .iter()
         .filter(|key| key.enabled)
         .count();
+    let logs = if config.logging.enabled() {
+        "jsonl"
+    } else {
+        "console"
+    };
     tracing::info!(
-        config_path = %config_path.display(),
-        bind = %config.server.bind,
-        upstream = %config.upstream.base_url,
-        enabled_keys,
-        "configuration loaded"
+        "listening={} keys={enabled_keys} model={} logs={logs}",
+        config.server.bind,
+        config.models.default,
     );
-    // Adaptive bounded file logging (issue #16): a dedicated writer thread
-    // owns all disk IO; requests only try_send typed summaries.
     let (log_sink, _writer_guard) = if config.logging.enabled() {
         let directory = config.logging.directory_path().unwrap();
         match cline_proxy::obs::spawn_writer(cline_proxy::obs::WriterConfig {
@@ -51,13 +71,11 @@ async fn main() -> Result<()> {
                 tracing::info!(
                     directory = %directory.display(),
                     max_total_size_mb = config.logging.max_total_size_mb,
-                    rotation_mb = config.logging.max_file_size_mb,
-                    "adaptive JSONL logging enabled"
+                    "jsonl writer ready"
                 );
                 (Some(sink), Some(handle))
             }
             Err(error) => {
-                // Fail open: console logging still works.
                 tracing::warn!(
                     error = %error,
                     "file logging disabled (writer startup failed); proxy continues"
@@ -71,13 +89,41 @@ async fn main() -> Result<()> {
     server::serve(server::AppState::with_log_sink(config, log_sink)?).await
 }
 
+fn apply_cli_overrides(config: &mut Config, cli: &Cli) -> Result<()> {
+    if let Some(bind) = &cli.bind {
+        config.server.bind = bind.clone();
+    }
+    if let Some(path) = &cli.state_file {
+        config.runtime.state_file = Some(path.display().to_string());
+    }
+    if let Some(path) = &cli.log_directory {
+        config.logging.directory = Some(path.display().to_string());
+    }
+    if cli.no_color {
+        config.runtime.log_color = ColorMode::Never;
+    } else if let Some(value) = &cli.color {
+        let Some(mode) = ColorMode::parse(value) else {
+            bail!("--color must be auto, always, or never");
+        };
+        config.runtime.log_color = mode;
+    }
+    Ok(())
+}
+
 fn init_tracing(config: &Config) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&config.runtime.log_level));
+    let ansi = enable_ansi(
+        config.runtime.log_color,
+        std::io::stderr().is_terminal(),
+        cline_proxy::console::no_color_set(),
+    );
     match config.runtime.log_format {
         LogFormat::Pretty => {
             let _ = tracing_subscriber::fmt()
                 .with_env_filter(filter)
+                .with_writer(std::io::stderr)
+                .with_ansi(ansi)
                 .with_target(false)
                 .compact()
                 .try_init();
@@ -85,6 +131,8 @@ fn init_tracing(config: &Config) {
         LogFormat::Json => {
             let _ = tracing_subscriber::fmt()
                 .with_env_filter(filter)
+                .with_writer(std::io::stderr)
+                .with_ansi(false)
                 .with_target(false)
                 .json()
                 .try_init();
