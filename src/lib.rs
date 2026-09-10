@@ -10,6 +10,7 @@ pub mod glm53;
 pub mod obs;
 pub mod optimize;
 pub mod pool;
+pub mod proxy_route;
 pub mod rate_limit;
 pub mod reasoning_shadow;
 pub mod redaction;

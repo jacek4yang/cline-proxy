@@ -11,6 +11,7 @@ use thiserror::Error;
 
 use crate::config::Config;
 use crate::pool::{KeyPool, ProbeLease, SelectedKey};
+use crate::proxy_route::ProxyRoute;
 use crate::rate_limit::{
     classify_rate_limit_kind, classify_upstream_response, ClassifiedUpstreamResponse,
     RetryHintSource,
@@ -31,6 +32,7 @@ struct Inner {
     pool: KeyPool,
     fallback_cooldown: Duration,
     exact_secrets: Vec<String>,
+    route: ProxyRoute,
 }
 
 pub struct UpstreamResult {
@@ -70,17 +72,22 @@ pub enum UpstreamError {
 
 impl ClineUpstream {
     pub fn new(config: &Config, pool: KeyPool) -> Result<Self> {
-        let http = reqwest::Client::builder()
+        let route = config.upstream.proxy_route()?;
+        let builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(config.upstream.connect_timeout_secs))
             // Like the reference gateway, this is an inactivity timeout. A
             // healthy SSE response may live longer while chunks keep arriving.
             .read_timeout(Duration::from_secs(config.upstream.timeout_secs))
             .pool_idle_timeout(Duration::from_secs(90))
+            .tcp_nodelay(true)
             .tcp_keepalive(Duration::from_secs(60))
             .http2_keep_alive_interval(Duration::from_secs(30))
             .http2_keep_alive_timeout(Duration::from_secs(20))
             .http2_keep_alive_while_idle(true)
-            .gzip(true)
+            .gzip(true);
+        // Direct: ignore env/system proxies. SOCKS: explicit Cline-only hop.
+        let http = route
+            .apply(builder)?
             .build()
             .context("building shared Cline HTTP client")?;
         let base = config.upstream.base_url.trim_end_matches('/');
@@ -105,6 +112,9 @@ impl ClineUpstream {
             .map(|key| key.api_key.clone())
             .collect::<Vec<_>>();
         exact_secrets.push(config.server.api_key.clone());
+        if let Some(secret) = route.credential_secret() {
+            exact_secrets.push(secret.to_owned());
+        }
         Ok(Self {
             inner: Arc::new(Inner {
                 http,
@@ -113,12 +123,17 @@ impl ClineUpstream {
                 pool,
                 fallback_cooldown: Duration::from_secs(config.upstream.fallback_429_cooldown_secs),
                 exact_secrets,
+                route,
             }),
         })
     }
 
     pub fn pool(&self) -> &KeyPool {
         &self.inner.pool
+    }
+
+    pub fn route(&self) -> &ProxyRoute {
+        &self.inner.route
     }
 
     pub fn exact_secrets(&self) -> Vec<&str> {
@@ -326,12 +341,13 @@ impl ClineUpstream {
             .await;
         let elapsed = started.elapsed();
         match &result {
-            Ok(response) => tracing::info!(
+            Ok(response) => tracing::debug!(
                 request_id,
                 requested_model = model,
                 selected_key_name = %selected.name,
                 selected_key_index = selected.configured_index,
                 attempt,
+                route = self.inner.route.kind(),
                 outer_status = response.status().as_u16(),
                 duration_ms = elapsed.as_millis(),
                 stream,
@@ -343,6 +359,7 @@ impl ClineUpstream {
                 selected_key_name = %selected.name,
                 selected_key_index = selected.configured_index,
                 attempt,
+                route = self.inner.route.kind(),
                 duration_ms = elapsed.as_millis(),
                 stream,
                 error_class = transport_error_class(error),

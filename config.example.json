@@ -13,6 +13,7 @@
     "stream_idle_timeout_secs": 120,
     "semantic_idle_timeout_secs": 180,
     "fallback_429_cooldown_secs": 3600,
+    "proxy": null,
     "headers": {
       "http-referer": "https://cline.bot",
       "user-agent": "Cline/4.1.16",

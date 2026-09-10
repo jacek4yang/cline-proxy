@@ -33,6 +33,9 @@ struct Cli {
     /// ANSI color policy: auto (default), always, never.
     #[arg(long, value_name = "MODE")]
     color: Option<String>,
+    /// Override `upstream.proxy` (`direct`/`none` forces no proxy).
+    #[arg(long, value_name = "URL")]
+    upstream_proxy: Option<String>,
 }
 
 #[tokio::main]
@@ -53,8 +56,13 @@ async fn main() -> Result<()> {
     } else {
         "console"
     };
+    let route = config
+        .upstream
+        .proxy_route()
+        .map(|route| route.kind().to_owned())
+        .unwrap_or_else(|_| "direct".into());
     tracing::info!(
-        "listening={} keys={enabled_keys} model={} logs={logs}",
+        "listening={} keys={enabled_keys} model={} logs={logs} route={route}",
         config.server.bind,
         config.models.default,
     );
@@ -106,6 +114,13 @@ fn apply_cli_overrides(config: &mut Config, cli: &Cli) -> Result<()> {
             bail!("--color must be auto, always, or never");
         };
         config.runtime.log_color = mode;
+    }
+    if let Some(proxy) = &cli.upstream_proxy {
+        if proxy.eq_ignore_ascii_case("direct") || proxy.eq_ignore_ascii_case("none") {
+            config.upstream.proxy = None;
+        } else {
+            config.upstream.proxy = Some(proxy.clone());
+        }
     }
     Ok(())
 }

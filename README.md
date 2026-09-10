@@ -307,6 +307,20 @@ these. A stalled committed stream emits one Anthropic error and is never
 replayed. Optional `glm53.context.upstream_context_window_tokens` is unset
 by default — do not guess a Cline serving limit.
 
+Outbound Cline traffic uses one shared rustls HTTP/2 client. `upstream.proxy`
+is optional:
+
+```text
+null / omitted     → direct (environment HTTP(S)_PROXY is ignored)
+socks5://host:port → SOCKS5, local DNS
+socks5h://host:port → SOCKS5, proxy DNS
+```
+
+Override without copying the config: `--upstream-proxy socks5://127.0.0.1:10888`
+or `--upstream-proxy direct`. Proxy credentials, if present, are never logged.
+SOCKS/connect failures do not rotate Cline keys and never replay a committed
+stream.
+
 `SIGINT` and `SIGTERM` stop new accepts and allow active requests to drain for
 `runtime.shutdown_timeout_secs` before remaining connections are aborted.
 

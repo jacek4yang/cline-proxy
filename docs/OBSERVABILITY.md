@@ -40,11 +40,12 @@ counters, timings) and emits exactly one record on completion:
   exact token accounting) are **DEBUG**.
 
 - **File** (`logging.directory`, default `./logs`): one JSONL object per
-  request in `events-NNNNNN.jsonl` segments. **schema_version = 2**.
+  request in `events-NNNNNN.jsonl` segments. **schema_version = 3**.
   Each process opens a **fresh** segment (`create_new`); existing files
   are counted for quota and never appended to or truncated.
 
-  Notable v2 fields: `schema_version`, `instance_id`,
+  Notable fields: `schema_version`, `instance_id`, `route`
+  (`direct`/`socks5`/`socks5h`),
   `local_input_tokens` / `local_token_count_method` /
   `local_token_count_duration_ms` (tokenizer; not billed usage),
   `prompt_tokens` / `cached_tokens` / `completion_tokens` (upstream

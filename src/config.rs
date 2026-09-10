@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::console::ColorMode;
 use crate::glm53::reasoning::ThinkingExposure;
+use crate::proxy_route::ProxyRoute;
 use crate::stream_watch::StreamTimeouts;
 
 pub mod defaults {
@@ -91,6 +92,10 @@ pub struct UpstreamConfig {
     pub stream_idle_timeout_secs: u64,
     pub semantic_idle_timeout_secs: u64,
     pub fallback_429_cooldown_secs: u64,
+    /// Outbound proxy for Cline traffic only. `null`/omitted/empty is
+    /// deterministic direct (environment HTTP(S)_PROXY is ignored).
+    /// Allowed: `socks5://` (local DNS) and `socks5h://` (proxy DNS).
+    pub proxy: Option<String>,
     pub headers: BTreeMap<String, String>,
 }
 
@@ -106,12 +111,17 @@ impl Default for UpstreamConfig {
             stream_idle_timeout_secs: defaults::STREAM_IDLE_TIMEOUT_SECS,
             semantic_idle_timeout_secs: defaults::SEMANTIC_IDLE_TIMEOUT_SECS,
             fallback_429_cooldown_secs: defaults::FALLBACK_COOLDOWN_SECS,
+            proxy: None,
             headers: default_cline_headers(),
         }
     }
 }
 
 impl UpstreamConfig {
+    pub fn proxy_route(&self) -> Result<ProxyRoute> {
+        ProxyRoute::parse(self.proxy.as_deref())
+    }
+
     pub fn stream_timeouts(&self) -> StreamTimeouts {
         StreamTimeouts::from_secs(
             self.first_event_timeout_secs,
@@ -466,6 +476,7 @@ impl Config {
         {
             bail!("upstream timeout and cooldown values must be greater than zero");
         }
+        let _ = self.upstream.proxy_route()?;
         validate_headers(&self.upstream.headers)?;
 
         if self.cline_api_keys.is_empty() {
@@ -715,6 +726,8 @@ mod tests {
         assert_eq!(config.upstream.base_url, defaults::BASE_URL);
         assert_eq!(config.upstream.chat_path, defaults::CHAT_PATH);
         assert_eq!(config.upstream.timeout_secs, defaults::TIMEOUT_SECS);
+        assert!(config.upstream.proxy.is_none());
+        assert_eq!(config.upstream.proxy_route().unwrap().kind(), "direct");
         assert_eq!(
             config.upstream.connect_timeout_secs,
             defaults::CONNECT_TIMEOUT_SECS
@@ -789,6 +802,20 @@ mod tests {
         assert!(config.glm53.context.canonical_tool_json);
         assert!(config.glm53.telemetry.prefix_hash);
         assert!(config.glm53.telemetry.cache_metrics);
+        assert!(config.upstream.proxy.is_none());
+    }
+
+    #[test]
+    fn socks5_proxy_is_accepted_and_http_proxy_is_rejected() {
+        let mut config = valid_config();
+        config.upstream.proxy = Some("socks5://127.0.0.1:10888".into());
+        assert!(config.validate().is_ok());
+        config.upstream.proxy = Some("socks5h://127.0.0.1:10888".into());
+        assert!(config.validate().is_ok());
+        config.upstream.proxy = Some("http://127.0.0.1:8080".into());
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("socks5"), "{error}");
+        assert!(!error.contains("gateway-secret"));
     }
 
     #[test]

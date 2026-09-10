@@ -1,9 +1,9 @@
 # Development State
 
 Last updated: 2026-09-10
-Main SHA: 18e7dcb (fix(runtime): recover Claude Code stalls, logging, and diagnostics #25)
+Main SHA: 1191a8a (docs snapshot #26); SOCKS5 work on `feat/upstream-socks5` (issue #27)
 Repository: https://github.com/jacek4yang/cline-proxy
-Status: main green; production recovery merged (#24/#25)
+Status: SOCKS5 + deterministic direct route in progress
 
 > Agent recovery protocol — on context compaction or session end:
 > 1. Read this file top to bottom.
@@ -114,10 +114,13 @@ Issues #3, #6, #8, #10, #13, #14, #16, #19 closed with their PRs.
 
 ## Current target
 
-Normal production observation. Copy the merged release binary to
-`D:\Workspace\cline-proxy-bin` when the operator chooses (do not hijack
-a running production process). Analyze JSONL only if new evidence shows
-a bug.
+1. Merge issue #27 SOCKS5/direct route.
+2. Isolated A/B (n=4 tiny stream turns, real config, no secrets printed):
+   direct headers median 1284 ms (685–4887); SOCKS5 headers median 1054 ms
+   (534–1706). No transport errors. Overlap is large — do **not** claim
+   SOCKS5 is faster. Local SOCKS5 is a viable Cline path.
+3. After merge: timestamped config backup, set `upstream.proxy` to
+   `socks5://127.0.0.1:10888`, backup+replace production exe, smoke.
 
 ## Next tasks (after this recovery)
 
