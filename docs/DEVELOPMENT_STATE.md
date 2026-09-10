@@ -1,10 +1,9 @@
 # Development State
 
 Last updated: 2026-09-10
-Main SHA: dee77da (build: migrate axum 0.7.9 to 0.8.9 #20) — production
-recovery is on `fix/production-recovery` (issue #24) until merged.
+Main SHA: 18e7dcb (fix(runtime): recover Claude Code stalls, logging, and diagnostics #25)
 Repository: https://github.com/jacek4yang/cline-proxy
-Status: production-recovery implemented; awaiting PR merge
+Status: main green; production recovery merged (#24/#25)
 
 > Agent recovery protocol — on context compaction or session end:
 > 1. Read this file top to bottom.
@@ -16,7 +15,7 @@ Status: production-recovery implemented; awaiting PR merge
 
 ## Current production baseline
 
-- Parent main `dee77da` (axum 0.8.9). Recovery branch adds stall timers,
+- main `18e7dcb` (axum 0.8.9 + production recovery). Adds stall timers,
   restart-safe JSONL writer, stderr/auto-color, JSONL schema v2, local vs
   upstream token fields, optional context guard (unset by default).
 - Tests on the recovery branch: 202 lib + 4 glm53_policy + 4
@@ -88,9 +87,9 @@ Issues #3, #6, #8, #10, #13, #14, #16, #19 closed with their PRs.
 
 ## Open PRs / issues
 
-- Issue #24: production recovery (this branch).
 - Dependabot: hmac 0.13, sha2 0.11, tokenizers 0.23 — not part of this
   recovery; leave for a later dedicated bump.
+- No open recovery issues.
 
 ## Known limitations
 
@@ -115,11 +114,10 @@ Issues #3, #6, #8, #10, #13, #14, #16, #19 closed with their PRs.
 
 ## Current target
 
-1. Merge issue #24 production recovery.
-2. Copy the merged release binary to `D:\Workspace\cline-proxy-bin`
-   when the operator chooses (do not hijack a running production process).
-3. Observe real Claude Code JSONL. Next action after merge = normal
-   production observation unless new evidence shows a bug.
+Normal production observation. Copy the merged release binary to
+`D:\Workspace\cline-proxy-bin` when the operator chooses (do not hijack
+a running production process). Analyze JSONL only if new evidence shows
+a bug.
 
 ## Next tasks (after this recovery)
 
