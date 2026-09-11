@@ -357,8 +357,9 @@ impl ClineUpstream {
         // scoped to the actual credential: same session + same key → same
         // id; failover to a different key → different id. Inserted after the
         // configured static headers so the dynamic value always wins (config
-        // validation also rejects a configured `x-task-id`). The raw
-        // session id and the raw API key are never sent or logged.
+        // validation also rejects a configured `x-task-id`). The raw session
+        // id is never sent; the raw Cline API key is used for Authorization
+        // and as internal HMAC input, but is never embedded in X-Task-ID or logged.
         if let Some(session_fp) = session_fp {
             let task_id = crate::cache::upstream_task_id(
                 &self.inner.session_secret,
