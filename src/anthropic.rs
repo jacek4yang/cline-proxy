@@ -455,6 +455,11 @@ fn convert_user_blocks(
 ) -> Result<(), ProtocolError> {
     let mut ordinary = Vec::new();
     let mut saw_ordinary = false;
+    // Anthropic tool-result completeness: each tool_use id gets at most one
+    // result. Duplicate results for the same id are invalid in both the
+    // Anthropic and OpenAI shapes (upstream rejects them with a worse
+    // error); reject here, explicitly.
+    let mut seen_result_ids = HashSet::new();
     for block in blocks {
         let object = block
             .as_object()
@@ -481,6 +486,12 @@ fn convert_user_blocks(
                     return Err(ProtocolError::invalid(
                         "tool_result blocks must appear before text/image/document content in the same user message",
                     ));
+                }
+                let id = required_string(object, "tool_use_id")?;
+                if !seen_result_ids.insert(id.to_owned()) {
+                    return Err(ProtocolError::invalid(format!(
+                        "duplicate tool_result for tool_use id {id:?}"
+                    )));
                 }
                 output.push(convert_tool_result(object, pending_tool_ids)?);
             }
@@ -2713,6 +2724,34 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.message.contains("call_old"), "{}", error.message);
+        assert_eq!(error.error_type, "invalid_request_error");
+    }
+
+    /// Tool-result completeness: the same tool_use id may be answered at
+    /// most once per user message; a duplicate is an explicit protocol
+    /// error (both Anthropic and the OpenAI upstream reject duplicates).
+    #[test]
+    fn duplicate_tool_result_for_same_id_is_rejected() {
+        let error = convert_request(
+            serde_json::to_vec(&json!({
+                "model":"claude-sonnet-4-6", "max_tokens":256,
+                "messages":[
+                    {"role":"user","content":"go"},
+                    {"role":"assistant","content":[
+                        {"type":"tool_use","id":"call_a","name":"Read","input":{}}
+                    ]},
+                    {"role":"user","content":[
+                        {"type":"tool_result","tool_use_id":"call_a","content":"first"},
+                        {"type":"tool_result","tool_use_id":"call_a","content":"second"}
+                    ]}
+                ]
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap_err();
+        assert!(error.message.contains("duplicate"), "{}", error.message);
+        assert!(error.message.contains("call_a"), "{}", error.message);
         assert_eq!(error.error_type, "invalid_request_error");
     }
 
