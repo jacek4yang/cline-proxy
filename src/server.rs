@@ -366,7 +366,9 @@ async fn openai_chat(
     let started = Instant::now();
     match state
         .upstream
-        .send_chat(upstream_body, stream, &request_id, &upstream_model)
+        // OpenAI-protocol clients carry no reliable session identity, so no
+        // X-Task-ID is sent (affinity is never guessed).
+        .send_chat(upstream_body, stream, &request_id, &upstream_model, None)
         .await
     {
         Ok(result) => openai_upstream_response(&state, result, &request_id, stream, started).await,
@@ -384,7 +386,32 @@ async fn anthropic_messages(
         Ok(body) => body,
         Err(response) => return *response,
     };
-    let mut converted = match anthropic::convert_request(&body) {
+    // Parse once: the same parsed value feeds both session-identity
+    // extraction and protocol conversion (megabyte-scale bodies are never
+    // parsed twice on the hot path).
+    let input: Value = match serde_json::from_slice(&body) {
+        Ok(input) => input,
+        Err(error) => {
+            return protocol_error(
+                ProtocolError::invalid(format!("invalid JSON: {error}")),
+                StatusCode::BAD_REQUEST,
+                &request_id,
+            )
+        }
+    };
+    // Session identity: extracted from the Anthropic request metadata (if
+    // present) BEFORE the GLM policy drops the metadata block, and BEFORE
+    // conversion consumes the parsed value. Extraction is unconditional —
+    // it does not depend on the `prefix_hash` telemetry flag. One shared
+    // HMAC fingerprint serves X-Task-ID, the reasoning shadow store, and
+    // prefix/session telemetry; each feature stays gated only by its own
+    // config flag. Without metadata there is no identity and none is
+    // invented; only the fingerprint is ever logged or sent upstream.
+    let session_fp = {
+        let secret = &state.config.server.api_key;
+        cache::session_raw_id(&input).map(|raw| cache::session_fingerprint(secret, raw))
+    };
+    let mut converted = match anthropic::convert_request_value(input) {
         Ok(converted) => converted,
         Err(error) => return protocol_error(error, StatusCode::BAD_REQUEST, &request_id),
     };
@@ -400,15 +427,6 @@ async fn anthropic_messages(
     } else {
         0
     };
-    // Session fingerprint: extracted from metadata (if present) before the
-    // GLM policy may drop it; only the HMAC fingerprint is ever logged.
-    let session_fp = state
-        .config
-        .glm53
-        .telemetry
-        .prefix_hash
-        .then(|| cache::extract_session_fingerprint(&body, &state.config.server.api_key))
-        .flatten();
     // Reasoning shadow restore (issue #10): when the client did not request
     // thinking and a stable session identity exists, in-epoch reasoning for
     // this conversation's tool calls is restored onto the matching
@@ -627,7 +645,16 @@ async fn anthropic_messages(
     };
     let result = match state
         .upstream
-        .send_chat(upstream_body, upstream_stream, &request_id, &upstream_model)
+        // Dynamic X-Task-ID = stable session fingerprint (when one exists);
+        // byte-identical across every failover attempt, only Authorization
+        // rotates between keys.
+        .send_chat(
+            upstream_body,
+            upstream_stream,
+            &request_id,
+            &upstream_model,
+            session_fp.as_deref(),
+        )
         .await
     {
         Ok(result) => result,
@@ -2694,6 +2721,262 @@ mod tests {
             assistant["reasoning_content"].as_str().unwrap_or(""),
             "EPHEMERAL LOOP REASONING",
             "shadow continuity must survive the aggregate path (§92)"
+        );
+        task.abort();
+    }
+
+    // --- session affinity / X-Task-ID ---
+
+    fn anthropic_body_with_session(session: Option<&str>) -> String {
+        let mut body = json!({
+            "model":"claude-sonnet-4-6","max_tokens":128,"stream":false,
+            "messages":[{"role":"user","content":"hello"}]
+        });
+        if let Some(session) = session {
+            body["metadata"] = json!({"user_id": session});
+        }
+        body.to_string()
+    }
+
+    fn upstream_header<'a>(request: &'a SeenRequest, name: &str) -> Option<&'a str> {
+        request
+            .headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+    }
+
+    /// Same session → byte-identical X-Task-ID on every request; the raw
+    /// session id never reaches any upstream header.
+    #[tokio::test]
+    async fn same_session_gets_stable_task_id_and_raw_id_never_leaks() {
+        let (base, mock, task) = start_mock().await;
+        mock.set(
+            "cline-key-1",
+            vec![
+                Spec::json(200, successful_json("one")),
+                Spec::json(200, successful_json("two")),
+            ],
+        )
+        .await;
+        let app = router(AppState::new(test_config(base, 1)).unwrap());
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(gateway_request(
+                    "/v1/messages",
+                    anthropic_body_with_session(Some("user-zz-session")),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let seen = mock.seen().await;
+        assert_eq!(seen.len(), 2);
+        let first = upstream_header(&seen[0], "x-task-id").expect("x-task-id must be sent");
+        assert_eq!(upstream_header(&seen[1], "x-task-id"), Some(first));
+        // HMAC fingerprint shape: 16 lowercase hex characters.
+        assert_eq!(first.len(), 16);
+        assert!(first.chars().all(|character| character.is_ascii_hexdigit()));
+        // The raw session id cannot appear in any header: its non-hex
+        // characters (z, -, uppercase) are impossible in the fingerprint.
+        for request in &seen {
+            for (name, value) in request.headers.iter() {
+                let rendered = String::from_utf8_lossy(value.as_bytes());
+                assert!(
+                    !rendered.contains("user-zz-session"),
+                    "header {name:?} leaked the raw session id"
+                );
+            }
+        }
+        task.abort();
+    }
+
+    /// Different sessions must never share a task id.
+    #[tokio::test]
+    async fn different_sessions_get_different_task_ids() {
+        let (base, mock, task) = start_mock().await;
+        mock.set(
+            "cline-key-1",
+            vec![
+                Spec::json(200, successful_json("a")),
+                Spec::json(200, successful_json("b")),
+            ],
+        )
+        .await;
+        let app = router(AppState::new(test_config(base, 1)).unwrap());
+        for session in ["user-zz-session-A", "user-zz-session-B"] {
+            let response = app
+                .clone()
+                .oneshot(gateway_request(
+                    "/v1/messages",
+                    anthropic_body_with_session(Some(session)),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let seen = mock.seen().await;
+        assert_eq!(seen.len(), 2);
+        assert_ne!(
+            upstream_header(&seen[0], "x-task-id"),
+            upstream_header(&seen[1], "x-task-id")
+        );
+        task.abort();
+    }
+
+    /// Without session metadata no X-Task-ID is sent — affinity is never
+    /// guessed from connection, IP, key, or recent requests. The OpenAI
+    /// protocol never has one either.
+    #[tokio::test]
+    async fn no_session_metadata_sends_no_task_id() {
+        let (base, mock, task) = start_mock().await;
+        mock.set(
+            "cline-key-1",
+            vec![
+                Spec::json(200, successful_json("anthropic")),
+                Spec::json(200, successful_json("openai")),
+            ],
+        )
+        .await;
+        let app = router(AppState::new(test_config(base, 1)).unwrap());
+        let anthropic = app
+            .clone()
+            .oneshot(gateway_request(
+                "/v1/messages",
+                anthropic_body_with_session(None),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(anthropic.status(), StatusCode::OK);
+        let openai = app
+            .oneshot(gateway_request("/v1/chat/completions", chat_body(false)))
+            .await
+            .unwrap();
+        assert_eq!(openai.status(), StatusCode::OK);
+        let seen = mock.seen().await;
+        assert_eq!(seen.len(), 2);
+        assert!(seen
+            .iter()
+            .all(|request| { request.headers.get("x-task-id").is_none() }));
+        task.abort();
+    }
+
+    /// Failover invariant: one logical request retried on a second key must
+    /// carry the identical body and X-Task-ID; only Authorization changes.
+    #[tokio::test]
+    async fn effective_429_failover_keeps_body_and_task_id_identical() {
+        let (base, mock, task) = start_mock().await;
+        mock.set(
+            "cline-key-1",
+            vec![Spec::json(429, "Daily free limit reached. Try again in 9h")],
+        )
+        .await;
+        mock.set(
+            "cline-key-2",
+            vec![Spec::json(200, successful_json("after failover"))],
+        )
+        .await;
+        let app = router(AppState::new(test_config(base, 2)).unwrap());
+        let response = app
+            .oneshot(gateway_request(
+                "/v1/messages",
+                anthropic_body_with_session(Some("user-zz-session")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let seen = mock.seen().await;
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].authorization, "Bearer cline-key-1");
+        assert_eq!(seen[1].authorization, "Bearer cline-key-2");
+        assert_eq!(seen[0].body, seen[1].body);
+        assert_eq!(
+            upstream_header(&seen[0], "x-task-id"),
+            upstream_header(&seen[1], "x-task-id")
+        );
+        assert!(upstream_header(&seen[0], "x-task-id").is_some());
+        task.abort();
+    }
+
+    /// `prefix_hash=false` decouples telemetry from identity: X-Task-ID and
+    /// the reasoning shadow session identity must both keep working.
+    #[tokio::test]
+    async fn prefix_hash_disabled_keeps_task_id_and_shadow_affinity() {
+        let (base, mock, task) = start_mock().await;
+        let tool_response = json!({
+            "id":"chat","choices":[{"delta":{
+                "reasoning_content":"EPHEMERAL LOOP REASONING",
+                "tool_calls":[{"index":0,"id":"call_1",
+                    "function":{"name":"Bash","arguments":"{\"command\":\"cargo test\"}"}}]},
+                "finish_reason":"tool_calls"}],
+            "usage":{"prompt_tokens":9,"completion_tokens":6}
+        });
+        mock.set(
+            "cline-key-1",
+            vec![
+                Spec::sse(sse_chunk(&tool_response)),
+                Spec::sse(sse_chunk(&json!({
+                    "id":"chat2","choices":[{"delta":{"content":"done"},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":9,"completion_tokens":2}
+                }))),
+            ],
+        )
+        .await;
+        let mut config = test_config(base, 1);
+        config.glm53.telemetry.prefix_hash = false;
+        let app = router(AppState::new(config).unwrap());
+        // Turn 1: tool call with unexposed reasoning → shadow committed.
+        let response = app
+            .clone()
+            .oneshot(gateway_request(
+                "/v1/messages",
+                json!({
+                    "model":"claude-sonnet-4-6","max_tokens":128,"stream":false,
+                    "metadata":{"user_id":"user-zz-session"},
+                    "messages":[{"role":"user","content":"run tests"}]
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // Turn 2: tool result → shadow restored AND the same task id sent.
+        let response = app
+            .oneshot(gateway_request(
+                "/v1/messages",
+                json!({
+                    "model":"claude-sonnet-4-6","max_tokens":128,"stream":false,
+                    "metadata":{"user_id":"user-zz-session"},
+                    "messages":[
+                        {"role":"user","content":"run tests"},
+                        {"role":"assistant","content":[{"type":"tool_use","id":"call_1",
+                            "name":"Bash","input":{"command":"cargo test"}}]},
+                        {"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1",
+                            "content":"ok"}]}
+                    ]
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let seen = mock.seen().await;
+        assert_eq!(seen.len(), 2);
+        assert_eq!(
+            upstream_header(&seen[0], "x-task-id"),
+            upstream_header(&seen[1], "x-task-id"),
+            "session identity must survive prefix_hash=false"
+        );
+        let assistant = seen[1].body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .unwrap();
+        assert_eq!(
+            assistant["reasoning_content"].as_str().unwrap_or(""),
+            "EPHEMERAL LOOP REASONING",
+            "shadow continuity must not depend on the prefix_hash flag"
         );
         task.abort();
     }

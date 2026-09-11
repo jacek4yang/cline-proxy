@@ -232,26 +232,33 @@ pub fn session_fingerprint(secret: &str, raw_session_id: &str) -> String {
     hex[..16].to_owned()
 }
 
-/// Extract a session identity from an Anthropic request and return its
-/// HMAC fingerprint (raw ids never leave this function in logs). Sources,
-/// in priority order:
+/// Raw session identity from an Anthropic request, in priority order:
 ///
 /// 1. `metadata.user_id` — Claude Code formats it as `<user>_<account>_session_<id>`,
-///    or already opaque; any string is acceptable input to the HMAC.
+///    or already opaque; any non-empty string is acceptable input to the HMAC.
 /// 2. `metadata.session_id` when present.
 ///
 /// Returns `None` when neither is present: without a stable identity there
 /// is no session-scoped behavior (fail safe — never guess from connection
-/// state, key, or recent requests).
-pub fn extract_session_fingerprint(anthropic_request: &[u8], secret: &str) -> Option<String> {
-    let value: Value = serde_json::from_slice(anthropic_request).ok()?;
-    let metadata = value.get("metadata")?.as_object()?;
-    let raw = metadata
+/// state, IP, key, or recent requests). Takes the already-parsed request so
+/// the handler never re-parses the full body just for identity extraction.
+pub fn session_raw_id(anthropic_request: &Value) -> Option<&str> {
+    let metadata = anthropic_request.get("metadata")?.as_object()?;
+    metadata
         .get("user_id")
         .and_then(Value::as_str)
         .or_else(|| metadata.get("session_id").and_then(Value::as_str))
-        .filter(|id| !id.is_empty())?;
-    Some(session_fingerprint(secret, raw))
+        .filter(|id| !id.is_empty())
+}
+
+/// Extract a session identity from an Anthropic request and return its
+/// HMAC fingerprint (raw ids never leave this function in logs). See
+/// [`session_raw_id`] for the accepted sources.
+pub fn extract_session_fingerprint(anthropic_request: &Value, secret: &str) -> Option<String> {
+    Some(session_fingerprint(
+        secret,
+        session_raw_id(anthropic_request)?,
+    ))
 }
 
 /// Compute and log the stable-prefix telemetry for one request:
@@ -528,6 +535,23 @@ mod tests {
     }
 
     // --- session fingerprints (§64) ---
+
+    #[test]
+    fn session_raw_id_prefers_user_id_and_fails_safe_without_metadata() {
+        // user_id wins over session_id.
+        let request = json!({"metadata": {
+            "user_id": "user_x_session_a", "session_id": "sid_b"}});
+        assert_eq!(session_raw_id(&request), Some("user_x_session_a"));
+        // session_id is the fallback source.
+        let request = json!({"metadata": {"session_id": "sid_b"}});
+        assert_eq!(session_raw_id(&request), Some("sid_b"));
+        // Empty strings are not identities.
+        let request = json!({"metadata": {"user_id": ""}});
+        assert_eq!(session_raw_id(&request), None);
+        // No metadata at all: no identity is invented.
+        assert_eq!(session_raw_id(&json!({"messages": []})), None);
+        assert_eq!(session_raw_id(&json!({})), None);
+    }
 
     #[test]
     fn session_fingerprint_is_stable_secret_bound_and_truncated() {

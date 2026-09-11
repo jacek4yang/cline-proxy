@@ -4,7 +4,7 @@
 //! provider-independent adapter. Provider-specific compaction, OAuth, and
 //! strict-output repair behavior are intentionally not carried over.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
@@ -83,6 +83,13 @@ pub struct ConvertedRequest {
 pub fn convert_request(bytes: &[u8]) -> Result<ConvertedRequest, ProtocolError> {
     let input: Value = serde_json::from_slice(bytes)
         .map_err(|error| ProtocolError::invalid(format!("invalid JSON: {error}")))?;
+    convert_request_value(input)
+}
+
+/// Value-based conversion for handlers that already parsed the request
+/// (the server extracts session identity from the same parsed value, so
+/// megabyte-scale bodies are never parsed twice).
+pub fn convert_request_value(input: Value) -> Result<ConvertedRequest, ProtocolError> {
     let object = input
         .as_object()
         .ok_or_else(|| ProtocolError::invalid("request body must be a JSON object"))?;
@@ -105,17 +112,27 @@ pub fn convert_request(bytes: &[u8]) -> Result<ConvertedRequest, ProtocolError> 
     output.insert("max_tokens".into(), Value::from(max_tokens));
     output.insert("stream".into(), Value::Bool(stream));
 
-    let mut messages = Vec::new();
+    let mut messages: Vec<WireMessage> = Vec::new();
     if let Some(system) = object.get("system") {
-        messages.push(json!({"role":"system", "content":convert_system(system)?}));
+        messages.push(WireMessage::System {
+            content: convert_system(system)?,
+        });
     }
     let input_messages = object
         .get("messages")
         .and_then(Value::as_array)
         .ok_or_else(|| ProtocolError::invalid("messages must be an array"))?;
+    // Tool_use ids of the IMMEDIATELY PRECEDING assistant turn that the
+    // next user message may still reference. Anthropic tool-use adjacency:
+    // a tool_result must live in the message right after its tool_use —
+    // never later in the conversation (cleared by any user/system message,
+    // replaced by each assistant turn). Parallel results still match by ID
+    // in any order.
+    let mut pending_tool_ids = HashSet::new();
     for (index, message) in input_messages.iter().enumerate() {
-        convert_message(message, index, &mut messages)?;
+        convert_message(message, index, &mut messages, &mut pending_tool_ids)?;
     }
+    let messages = messages.into_iter().map(WireMessage::into_wire).collect();
     output.insert("messages".into(), Value::Array(messages));
 
     copy_number(object, &mut output, "temperature")?;
@@ -255,10 +272,80 @@ pub fn normalize_system_messages(body: &mut Value) -> u64 {
     removed_bytes
 }
 
+/// Typed OpenAI Chat Completions message produced by Anthropic conversion
+/// (deepseek-recipe idea, narrow cut): the four wire shapes are explicit so
+/// the assistant `tool_calls` ↔ `tool` `tool_call_id` chain has one checkable
+/// contract instead of scattered `Map` mutation. Field order in
+/// [`WireMessage::into_wire`] matches the historical wire bytes exactly —
+/// prefix stability depends on it, so it must never be reordered.
+enum WireMessage {
+    System {
+        content: Value,
+    },
+    /// `role` is `"user"` or `"assistant"` — plain-string content keeps the
+    /// originating role (assistant string content is common and must not be
+    /// relabeled).
+    User {
+        role: &'static str,
+        content: Value,
+    },
+    Assistant {
+        content: Vec<Value>,
+        tool_calls: Vec<Value>,
+        reasoning: String,
+    },
+    Tool {
+        tool_call_id: String,
+        content: Value,
+        is_error: Option<bool>,
+    },
+}
+
+impl WireMessage {
+    fn into_wire(self) -> Value {
+        match self {
+            Self::System { content } => json!({"role":"system", "content":content}),
+            Self::User { role, content } => json!({"role":role, "content":content}),
+            Self::Assistant {
+                content,
+                tool_calls,
+                reasoning,
+            } => {
+                let mut message = Map::new();
+                message.insert("role".into(), Value::String("assistant".into()));
+                message.insert("content".into(), Value::Array(content));
+                if !tool_calls.is_empty() {
+                    message.insert("tool_calls".into(), Value::Array(tool_calls));
+                }
+                if !reasoning.is_empty() {
+                    message.insert("reasoning_content".into(), Value::String(reasoning));
+                }
+                Value::Object(message)
+            }
+            Self::Tool {
+                tool_call_id,
+                content,
+                is_error,
+            } => {
+                let mut result = json!({
+                    "role":"tool",
+                    "tool_call_id":tool_call_id,
+                    "content":content
+                });
+                if let Some(is_error) = is_error {
+                    result["is_error"] = Value::Bool(is_error);
+                }
+                result
+            }
+        }
+    }
+}
+
 fn convert_message(
     value: &Value,
     message_index: usize,
-    output: &mut Vec<Value>,
+    output: &mut Vec<WireMessage>,
+    pending_tool_ids: &mut HashSet<String>,
 ) -> Result<(), ProtocolError> {
     let object = value.as_object().ok_or_else(|| {
         ProtocolError::invalid(format!("messages[{message_index}] must be an object"))
@@ -273,17 +360,36 @@ fn convert_message(
         .get("content")
         .ok_or_else(|| ProtocolError::invalid("message content is required"))?;
     if role == "system" {
-        output.push(json!({"role":"system", "content":convert_system(content)?}));
+        // Anything between the tool_use and its result breaks adjacency.
+        pending_tool_ids.clear();
+        output.push(WireMessage::System {
+            content: convert_system(content)?,
+        });
     } else if content.is_string() {
-        output.push(json!({"role":role, "content":content}));
+        // Any message between the tool_use and its result breaks adjacency:
+        // system/user close the window here; an assistant turn replaces it
+        // inside convert_assistant_blocks, or closes it here for plain
+        // string content (which declares no tool calls).
+        pending_tool_ids.clear();
+        output.push(WireMessage::User {
+            role: if role == "assistant" {
+                "assistant"
+            } else {
+                "user"
+            },
+            content: content.clone(),
+        });
     } else {
         let blocks = content
             .as_array()
             .ok_or_else(|| ProtocolError::invalid("message content must be a string or array"))?;
         if role == "assistant" {
-            convert_assistant_blocks(blocks, output)?;
+            convert_assistant_blocks(blocks, output, pending_tool_ids)?;
         } else {
-            convert_user_blocks(blocks, output)?;
+            convert_user_blocks(blocks, output, pending_tool_ids)?;
+            // The adjacency window closes after this user message either
+            // way: results were consumed here, or none were pending.
+            pending_tool_ids.clear();
         }
     }
     Ok(())
@@ -291,11 +397,14 @@ fn convert_message(
 
 fn convert_assistant_blocks(
     blocks: &[Value],
-    output: &mut Vec<Value>,
+    output: &mut Vec<WireMessage>,
+    pending_tool_ids: &mut HashSet<String>,
 ) -> Result<(), ProtocolError> {
     let mut content = Vec::new();
     let mut tool_calls = Vec::new();
     let mut reasoning = String::new();
+    // This turn's declarations replace whatever the previous turn left.
+    pending_tool_ids.clear();
     for block in blocks {
         let object = block
             .as_object()
@@ -313,8 +422,10 @@ fn convert_assistant_blocks(
                     object.get("input").unwrap_or(&Value::Object(Map::new())),
                 )
                 .map_err(|error| ProtocolError::invalid(error.to_string()))?;
+                let id = required_string(object, "id")?.to_owned();
+                pending_tool_ids.insert(id.clone());
                 tool_calls.push(json!({
-                    "id":required_string(object, "id")?,
+                    "id":id,
                     "type":"function",
                     "function":{
                         "name":required_string(object, "name")?,
@@ -329,32 +440,49 @@ fn convert_assistant_blocks(
             }
         }
     }
-    let mut message = Map::new();
-    message.insert("role".into(), Value::String("assistant".into()));
-    message.insert("content".into(), Value::Array(content));
-    if !tool_calls.is_empty() {
-        message.insert("tool_calls".into(), Value::Array(tool_calls));
-    }
-    if !reasoning.is_empty() {
-        message.insert("reasoning_content".into(), Value::String(reasoning));
-    }
-    output.push(Value::Object(message));
+    output.push(WireMessage::Assistant {
+        content,
+        tool_calls,
+        reasoning,
+    });
     Ok(())
 }
 
-fn convert_user_blocks(blocks: &[Value], output: &mut Vec<Value>) -> Result<(), ProtocolError> {
+fn convert_user_blocks(
+    blocks: &[Value],
+    output: &mut Vec<WireMessage>,
+    pending_tool_ids: &HashSet<String>,
+) -> Result<(), ProtocolError> {
     let mut ordinary = Vec::new();
+    let mut saw_ordinary = false;
     for block in blocks {
         let object = block
             .as_object()
             .ok_or_else(|| ProtocolError::invalid("user content block must be an object"))?;
         match required_string(object, "type")? {
-            "text" => ordinary.push(convert_text_block(object)?),
-            "image" => ordinary.push(convert_image_block(object)?),
-            "document" => ordinary.push(convert_document_block(object)?),
+            "text" => {
+                saw_ordinary = true;
+                ordinary.push(convert_text_block(object)?)
+            }
+            "image" => {
+                saw_ordinary = true;
+                ordinary.push(convert_image_block(object)?)
+            }
+            "document" => {
+                saw_ordinary = true;
+                ordinary.push(convert_document_block(object)?)
+            }
             "tool_result" => {
-                flush_user_content(&mut ordinary, output);
-                output.push(convert_tool_result(object)?);
+                // Anthropic ordering: tool_result blocks come FIRST in a
+                // user message. Ordinary content mixed in before them is a
+                // client-side protocol violation, not something to split
+                // around silently.
+                if saw_ordinary {
+                    return Err(ProtocolError::invalid(
+                        "tool_result blocks must appear before text/image/document content in the same user message",
+                    ));
+                }
+                output.push(convert_tool_result(object, pending_tool_ids)?);
             }
             kind => {
                 return Err(ProtocolError::invalid(format!(
@@ -363,17 +491,82 @@ fn convert_user_blocks(blocks: &[Value], output: &mut Vec<Value>) -> Result<(), 
             }
         }
     }
-    flush_user_content(&mut ordinary, output);
+    if !ordinary.is_empty() {
+        let content = ordinary;
+        output.push(WireMessage::User {
+            role: "user",
+            content: Value::Array(content),
+        });
+    }
     if blocks.is_empty() {
-        output.push(json!({"role":"user", "content":[]}));
+        output.push(WireMessage::User {
+            role: "user",
+            content: Value::Array(Vec::new()),
+        });
     }
     Ok(())
 }
 
-fn flush_user_content(content: &mut Vec<Value>, output: &mut Vec<Value>) {
-    if !content.is_empty() {
-        output.push(json!({"role":"user", "content":std::mem::take(content)}));
+fn convert_tool_result(
+    object: &Map<String, Value>,
+    pending_tool_ids: &HashSet<String>,
+) -> Result<WireMessage, ProtocolError> {
+    let content = object
+        .get("content")
+        .cloned()
+        .unwrap_or_else(|| Value::String(String::new()));
+    let content = if let Some(blocks) = content.as_array() {
+        Value::Array(
+            blocks
+                .iter()
+                .map(|block| {
+                    let object = block.as_object().ok_or_else(|| {
+                        ProtocolError::invalid("tool_result content block must be an object")
+                    })?;
+                    match required_string(object, "type")? {
+                        "text" => convert_text_block(object),
+                        "image" => convert_image_block(object),
+                        "document" => convert_document_block(object),
+                        kind => Err(ProtocolError::invalid(format!(
+                            "unsupported tool_result content type {kind:?}"
+                        ))),
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        )
+    } else if content.is_string() {
+        content
+    } else {
+        return Err(ProtocolError::invalid(
+            "tool_result content must be a string or array",
+        ));
+    };
+    let tool_call_id = required_string(object, "tool_use_id")?.to_owned();
+    if !pending_tool_ids.contains(&tool_call_id) {
+        // Anthropic adjacency: a tool_result must reference the tool_use of
+        // the immediately preceding assistant message. Dangling ids reach
+        // the upstream as protocol errors with a worse message; reject
+        // early and explicitly.
+        return Err(ProtocolError::invalid(format!(
+            "tool_result references tool_use id {tool_call_id:?} which the immediately preceding assistant message did not declare"
+        )));
     }
+    let is_error = match object.get("is_error") {
+        Some(value) => {
+            if !value.is_boolean() {
+                return Err(ProtocolError::invalid(
+                    "tool_result is_error must be boolean",
+                ));
+            }
+            Some(value.as_bool().unwrap_or_default())
+        }
+        None => None,
+    };
+    Ok(WireMessage::Tool {
+        tool_call_id,
+        content,
+        is_error,
+    })
 }
 
 fn convert_text_block(object: &Map<String, Value>) -> Result<Value, ProtocolError> {
@@ -418,53 +611,6 @@ fn convert_document_block(object: &Map<String, Value>) -> Result<Value, Protocol
             "unsupported document source {kind:?}"
         ))),
     }
-}
-
-fn convert_tool_result(object: &Map<String, Value>) -> Result<Value, ProtocolError> {
-    let content = object
-        .get("content")
-        .cloned()
-        .unwrap_or_else(|| Value::String(String::new()));
-    let content = if let Some(blocks) = content.as_array() {
-        Value::Array(
-            blocks
-                .iter()
-                .map(|block| {
-                    let object = block.as_object().ok_or_else(|| {
-                        ProtocolError::invalid("tool_result content block must be an object")
-                    })?;
-                    match required_string(object, "type")? {
-                        "text" => convert_text_block(object),
-                        "image" => convert_image_block(object),
-                        "document" => convert_document_block(object),
-                        kind => Err(ProtocolError::invalid(format!(
-                            "unsupported tool_result content type {kind:?}"
-                        ))),
-                    }
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        )
-    } else if content.is_string() {
-        content
-    } else {
-        return Err(ProtocolError::invalid(
-            "tool_result content must be a string or array",
-        ));
-    };
-    let mut result = json!({
-        "role":"tool",
-        "tool_call_id":required_string(object, "tool_use_id")?,
-        "content":content
-    });
-    if let Some(is_error) = object.get("is_error") {
-        if !is_error.is_boolean() {
-            return Err(ProtocolError::invalid(
-                "tool_result is_error must be boolean",
-            ));
-        }
-        result["is_error"] = is_error.clone();
-    }
-    Ok(result)
 }
 
 fn convert_tools(value: &Value) -> Result<Value, ProtocolError> {
@@ -2109,30 +2255,11 @@ impl StreamState {
 
 /// Extract reasoning text from an upstream (non-stream) message object.
 /// Shared with the server's reasoning shadow store; returns "" when absent.
+/// Thin alias over [`reasoning_text`] so the shadow store and the response
+/// converter cannot drift apart (one extraction rule, borrowed from the
+/// deepseek-recipe adapter layout: a single typed extraction per concept).
 pub fn reasoning_text_from_message(message: &Map<String, Value>) -> String {
-    for name in ["reasoning_content", "reasoning"] {
-        if let Some(text) = message.get(name).and_then(Value::as_str) {
-            return text.to_owned();
-        }
-    }
-    let Some(details) = message.get("reasoning_details") else {
-        return String::new();
-    };
-    match details {
-        Value::String(text) => text.clone(),
-        Value::Array(items) => items
-            .iter()
-            .filter_map(|item| {
-                item.as_str().or_else(|| {
-                    item.get("text")
-                        .or_else(|| item.get("content"))
-                        .and_then(Value::as_str)
-                })
-            })
-            .collect::<Vec<_>>()
-            .join(""),
-        _ => String::new(),
-    }
+    reasoning_text(message)
 }
 
 impl StreamState {
@@ -2466,6 +2593,209 @@ mod tests {
             .as_slice(),
         );
         assert!(result.is_err());
+    }
+
+    // --- typed wire IR: tool-call chain contract ---
+
+    /// Parallel tool calls are matched by ID, never by position: tool results
+    /// arriving in swapped order still convert with each `tool_call_id`
+    /// pointing at exactly the assistant-declared call.
+    #[test]
+    fn parallel_tool_results_match_by_id_not_position() {
+        let converted = convert_request(
+            serde_json::to_vec(&json!({
+                "model":"claude-sonnet-4-6", "max_tokens":256,
+                "messages":[
+                    {"role":"user","content":"read and edit"},
+                    {"role":"assistant","content":[
+                        {"type":"tool_use","id":"call_read","name":"Read","input":{"path":"a.rs"}},
+                        {"type":"tool_use","id":"call_edit","name":"Edit","input":{"path":"a.rs"}}
+                    ]},
+                    {"role":"user","content":[
+                        {"type":"tool_result","tool_use_id":"call_edit","content":"edited"},
+                        {"type":"tool_result","tool_use_id":"call_read","content":"contents"}
+                    ]}
+                ]
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap();
+        let messages = converted.body["messages"].as_array().unwrap();
+        assert_eq!(messages[2]["tool_call_id"], "call_edit");
+        assert_eq!(messages[2]["content"], "edited");
+        assert_eq!(messages[3]["tool_call_id"], "call_read");
+        assert_eq!(messages[3]["content"], "contents");
+    }
+
+    /// A tool_result that references an id no assistant message declared is
+    /// an explicit protocol error, not a silently dangling upstream
+    /// `tool_call_id`.
+    #[test]
+    fn orphan_tool_result_is_an_explicit_protocol_error() {
+        let error = convert_request(
+            serde_json::to_vec(&json!({
+                "model":"claude-sonnet-4-6", "max_tokens":256,
+                "messages":[
+                    {"role":"user","content":[
+                        {"type":"tool_result","tool_use_id":"toolu_ghost","content":"x"}
+                    ]}
+                ]
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap_err();
+        assert!(error.message.contains("toolu_ghost"), "{}", error.message);
+        assert!(
+            error.message.contains("immediately preceding"),
+            "{}",
+            error.message
+        );
+        assert_eq!(error.error_type, "invalid_request_error");
+    }
+
+    /// Anthropic tool-use adjacency: after a plain user turn separates a
+    /// tool_result from its assistant tool_use, the stale id is rejected —
+    /// referencing an earlier turn's tool id is NOT valid, the declaration
+    /// window is only the immediately preceding assistant message.
+    #[test]
+    fn stale_tool_result_after_intervening_turn_is_rejected() {
+        let error = convert_request(
+            serde_json::to_vec(&json!({
+                "model":"claude-sonnet-4-6", "max_tokens":256,
+                "messages":[
+                    {"role":"user","content":"first"},
+                    {"role":"assistant","content":[
+                        {"type":"tool_use","id":"call_old","name":"Read","input":{}}
+                    ]},
+                    {"role":"user","content":[{"type":"text","text":"go on"}]},
+                    {"role":"assistant","content":"done"},
+                    {"role":"user","content":[
+                        {"type":"tool_result","tool_use_id":"call_old","content":"late"}
+                    ]}
+                ]
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap_err();
+        assert!(error.message.contains("call_old"), "{}", error.message);
+        assert!(
+            error.message.contains("immediately preceding"),
+            "{}",
+            error.message
+        );
+        assert_eq!(error.error_type, "invalid_request_error");
+    }
+
+    /// The window is the immediately preceding assistant message: even a
+    /// bare assistant message between the tool_use and its result breaks
+    /// adjacency.
+    #[test]
+    fn intervening_assistant_message_breaks_tool_result_adjacency() {
+        let error = convert_request(
+            serde_json::to_vec(&json!({
+                "model":"claude-sonnet-4-6", "max_tokens":256,
+                "messages":[
+                    {"role":"user","content":"go"},
+                    {"role":"assistant","content":[
+                        {"type":"tool_use","id":"call_old","name":"Read","input":{}}
+                    ]},
+                    {"role":"assistant","content":"interlude"},
+                    {"role":"user","content":[
+                        {"type":"tool_result","tool_use_id":"call_old","content":"late"}
+                    ]}
+                ]
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap_err();
+        assert!(error.message.contains("call_old"), "{}", error.message);
+        assert_eq!(error.error_type, "invalid_request_error");
+    }
+
+    /// Anthropic ordering: tool_result blocks must come FIRST in a user
+    /// message; ordinary content before them is an explicit protocol error
+    /// (never silently split into separate wire messages).
+    #[test]
+    fn ordinary_content_before_tool_result_is_rejected() {
+        let error = convert_request(
+            serde_json::to_vec(&json!({
+                "model":"claude-sonnet-4-6", "max_tokens":256,
+                "messages":[
+                    {"role":"user","content":"read it"},
+                    {"role":"assistant","content":[
+                        {"type":"tool_use","id":"call_read","name":"Read","input":{}}
+                    ]},
+                    {"role":"user","content":[
+                        {"type":"text","text":"also look at this"},
+                        {"type":"tool_result","tool_use_id":"call_read","content":"contents"}
+                    ]}
+                ]
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap_err();
+        assert!(
+            error.message.contains("before text/image/document"),
+            "{}",
+            error.message
+        );
+        assert_eq!(error.error_type, "invalid_request_error");
+    }
+
+    /// Ordinary content AFTER the tool_result blocks in the same user
+    /// message stays valid: results first, then the text.
+    #[test]
+    fn ordinary_content_after_tool_results_is_kept() {
+        let converted = convert_request(
+            serde_json::to_vec(&json!({
+                "model":"claude-sonnet-4-6", "max_tokens":256,
+                "messages":[
+                    {"role":"user","content":"read it"},
+                    {"role":"assistant","content":[
+                        {"type":"tool_use","id":"call_read","name":"Read","input":{}}
+                    ]},
+                    {"role":"user","content":[
+                        {"type":"tool_result","tool_use_id":"call_read","content":"contents"},
+                        {"type":"text","text":"and the text answer"}
+                    ]}
+                ]
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap();
+        let messages = converted.body["messages"].as_array().unwrap();
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call_read");
+        assert_eq!(messages[3]["role"], "user");
+        assert_eq!(messages[3]["content"][0]["text"], "and the text answer");
+    }
+
+    /// Plain-string assistant content keeps the assistant role through the
+    /// typed wire IR (no relabeling drift).
+    #[test]
+    fn string_assistant_content_keeps_its_role() {
+        let converted = convert_request(
+            serde_json::to_vec(&json!({
+                "model":"claude-sonnet-4-6", "max_tokens":256,
+                "messages":[
+                    {"role":"user","content":"hi"},
+                    {"role":"assistant","content":"thinking out loud"},
+                    {"role":"user","content":"continue"}
+                ]
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap();
+        let messages = converted.body["messages"].as_array().unwrap();
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"], "thinking out loud");
     }
 
     #[test]
