@@ -245,15 +245,18 @@ addresses the drift sources it can (issue #8, ADR 0005):
   (`metadata.user_id`/`session_id`), a 16-hex-char HMAC fingerprint is
   logged (`session=...`). Raw ids are never logged; without identity the
   field is `unstable` and no session-scoped behavior is attempted.
-- **Upstream X-Task-ID**: when a session identity exists, the proxy sends
-  that same fingerprint as a dynamic `X-Task-ID` header to Cline and keeps
-  it byte-identical across credential failover (only Authorization
-  rotates on an effective 429). Raw session ids are never forwarded.
-  Without identity the header is not sent and affinity is never guessed
-  from connection, IP, key, or recent requests. Cline's official client
-  sends an equivalent per-conversation header; the proxy preserves the
-  shape, but Cline server-side routing/cache use of `X-Task-ID` is
-  undocumented and not guaranteed.
+- **Upstream X-Task-ID (credential-scoped)**: the proxy maintains one
+  internal session fingerprint across credential failover (used for the
+  reasoning shadow store and local telemetry). The upstream `X-Task-ID`
+  is derived from that internal identity AND the selected Cline API key:
+  the same Claude task gets a stable X-Task-ID while using one Cline key,
+  and a different X-Task-ID after switching to a different key. Raw
+  session ids and raw API keys are never forwarded or embedded. Without
+  session identity the header is not sent and affinity is never guessed
+  from connection, IP, key, or recent requests. This is privacy
+  minimization, not unlinkability — Cline server-side `X-Task-ID`
+  semantics are undocumented, and correlation through body, timing, IP,
+  or account ownership remains possible.
 - **Cache ratios**: `cache_hit_ratio` and `reasoning_ratio` are logged
   from upstream usage. Verified against live traffic: Cline reports
   `cached_tokens` (subset of `prompt_tokens`), and a real ~300 K-token

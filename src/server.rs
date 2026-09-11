@@ -2861,10 +2861,13 @@ mod tests {
         task.abort();
     }
 
-    /// Failover invariant: one logical request retried on a second key must
-    /// carry the identical body and X-Task-ID; only Authorization changes.
+    /// Failover invariant (credential-scoped X-Task-ID): one logical request
+    /// retried on a second key keeps the body byte-identical, but the
+    /// upstream-visible X-Task-ID is derived per credential — it CHANGES
+    /// with the key, matching (internal session identity, actual credential)
+    /// on each attempt. The internal session identity stays the same.
     #[tokio::test]
-    async fn effective_429_failover_keeps_body_and_task_id_identical() {
+    async fn effective_429_failover_scopes_task_id_by_credential() {
         let (base, mock, task) = start_mock().await;
         mock.set(
             "cline-key-1",
@@ -2889,12 +2892,32 @@ mod tests {
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[0].authorization, "Bearer cline-key-1");
         assert_eq!(seen[1].authorization, "Bearer cline-key-2");
+        // Body byte-identical across attempts.
         assert_eq!(seen[0].body, seen[1].body);
+        // Credential-scoped task id: different per key, each matching the
+        // (session, actual credential) derivation.
+        let task_a = upstream_header(&seen[0], "x-task-id").expect("x-task-id must be sent");
+        let task_b = upstream_header(&seen[1], "x-task-id").expect("x-task-id must be sent");
+        assert_ne!(task_a, task_b);
+        let session_fp = cache::session_fingerprint("gateway-secret", "user-zz-session");
         assert_eq!(
-            upstream_header(&seen[0], "x-task-id"),
-            upstream_header(&seen[1], "x-task-id")
+            task_a,
+            cache::upstream_task_id("gateway-secret", &session_fp, "cline-key-1")
         );
-        assert!(upstream_header(&seen[0], "x-task-id").is_some());
+        assert_eq!(
+            task_b,
+            cache::upstream_task_id("gateway-secret", &session_fp, "cline-key-2")
+        );
+        // The raw session id never appears in any upstream header.
+        for request in &seen {
+            for (name, value) in request.headers.iter() {
+                let rendered = String::from_utf8_lossy(value.as_bytes());
+                assert!(
+                    !rendered.contains("user-zz-session"),
+                    "header {name:?} leaked the raw session id"
+                );
+            }
+        }
         task.abort();
     }
 

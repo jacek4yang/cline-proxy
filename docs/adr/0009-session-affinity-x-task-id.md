@@ -1,9 +1,15 @@
-# ADR 0009: Session affinity via dynamic X-Task-ID
+# ADR 0009: Session affinity via credential-scoped X-Task-ID
 
 Date: 2026-09-11
-Status: Accepted
+Status: Accepted (revised during stabilization close-out)
 Scope: `src/server.rs`, `src/upstream.rs`, `src/cache.rs`, `src/config.rs`, `src/anthropic.rs`
 Related: ADR 0001 (key stickiness), ADR 0005 (prefix stability), ADR 0006 (shadow store)
+
+> Revision note: the first revision of this ADR sent the internal session
+> fingerprint unchanged as `X-Task-ID` across credential failover. The
+> final design scopes the upstream-visible task id to the selected
+> credential (see "Upstream task identity" below); the internal session
+> identity semantics are unchanged.
 
 ## Context
 
@@ -34,30 +40,66 @@ request body a second time just to read `metadata`.
    metadata → no identity; affinity is never guessed from connection, IP,
    key, request id, or recent requests.
 
-2. **Shared fingerprint, independent switches.**
+2. **Two identities: internal session identity vs upstream task identity.**
 
    ```text
-   session identity (HMAC fingerprint)
-   ├─ reasoning shadow        gated by glm53.reasoning.shadow_current_turn
-   ├─ prefix/session telemetry gated by glm53.telemetry.prefix_hash
-   │                          (now purely observational)
-   └─ upstream X-Task-ID      always, when an identity exists
+   Claude metadata (user_id/session_id)
+         ↓
+   internal session_fp = HMAC-SHA256(server_secret, raw_id)[..16 hex]
+         │  cross-credential stable; NEVER sent upstream directly
+         ├─ reasoning shadow        gated by glm53.reasoning.shadow_current_turn
+         ├─ prefix/session telemetry gated by glm53.telemetry.prefix_hash
+         │                          (purely observational)
+         │
+         └─ upstream task identity, per selected credential:
+            X-Task-ID = HMAC-SHA256(
+                server_secret,
+                "cline-proxy/x-task-id/v2\0" || session_fp || "\0" || actual_cline_api_key
+            )[..16 hex]
    ```
 
-3. **Failover affinity.** `send_chat(..., task_id: Option<&str>)` passes
-   the identity through the key loop; a `LogicalRequest` groups everything
-   that must stay byte-identical across attempts (body, stream, request id,
-   model, task id). Per attempt only Authorization rotates:
+   **Internal session identity** — privacy-safe HMAC fingerprint, stable
+   across Cline credentials; keys the reasoning shadow store and local
+   telemetry; restart-stable while the server secret and session id are
+   unchanged.
+
+   **Upstream task identity** — derived from (internal session identity,
+   actual selected Cline credential) via a domain-separated HMAC. Stable
+   within one credential, different across credentials. Sent as
+   `X-Task-ID`. The derivation binds the actual credential secret, not
+   the key's config name, so a rotated credential changes the id; raw
+   session ids and raw API keys are never embedded (this is a keyed PRF
+   under the server secret, not an unsalted hash of the key).
+
+   Rationale: the proxy needs cross-key continuity internally (shadow
+   restore, telemetry), but the upstream does not need an explicit
+   cross-key task identifier. Credential-scoping removes an unnecessary
+   direct linkage signal — the proxy no longer hands Cline the same task
+   id under different API keys — while preserving stable task identity
+   within each credential. **This is privacy minimization, not an
+   unlinkability guarantee**: Cline may still correlate requests through
+   request body, timing, IP, model, prompt prefix, tool definitions, or
+   account ownership.
+
+3. **Failover semantics.** `send_chat(..., session_fp: Option<&str>)`
+   passes the internal identity through the key loop; `LogicalRequest`
+   groups everything that must stay byte-identical across attempts (body,
+   stream, request id, model). The X-Task-ID is derived inside
+   `send_once` AFTER the `SelectedKey` exists, so per attempt:
 
    ```text
    body1 == body2
-   task_id1 == task_id2
    authorization1 != authorization2
+   x_task_id1 != x_task_id2
+   x_task_id1 == derive(session_fp, key A)
+   x_task_id2 == derive(session_fp, key B)
    ```
 
    Only an effective HTTP 429 enters the failover loop (unchanged).
    The dynamic `x-task-id` is inserted after the statically configured
-   headers, so it always wins.
+   headers, so it always wins. The derivation is stateless (one HMAC per
+   attempt — no cache, no LRU, no mutex) and therefore deterministic and
+   restart-stable.
 
 4. **Reserved headers.** `x-task-id` and `x-request-id` are rejected in
    `upstream.headers` at startup: a static value could override (or spoof)

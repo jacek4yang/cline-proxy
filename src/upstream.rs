@@ -20,15 +20,18 @@ use crate::redaction::sanitize_text;
 
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 
-/// Per-logical-request data shared by every failover attempt: the body,
-/// protocol flags, and session-affinity header must be byte-identical for
-/// key A and key B; only Authorization rotates between attempts.
+/// Per-logical-request data shared by every failover attempt. The
+/// serialized body and protocol flags are stable across attempts.
+/// `session_fp` is the INTERNAL session identity (cross-credential stable,
+/// used by the reasoning shadow and local telemetry); the upstream-visible
+/// X-Task-ID is derived per selected credential inside `send_once`, so
+/// credential failover intentionally changes it.
 struct LogicalRequest<'a> {
     body: &'a Bytes,
     stream: bool,
     request_id: &'a str,
     model: &'a str,
-    task_id: Option<&'a str>,
+    session_fp: Option<&'a str>,
 }
 
 #[derive(Clone)]
@@ -44,6 +47,10 @@ struct Inner {
     fallback_cooldown: Duration,
     exact_secrets: Vec<String>,
     route: ProxyRoute,
+    /// Server-side secret for deriving the credential-scoped upstream
+    /// X-Task-ID from (internal session fingerprint, actual credential).
+    /// Never logged, never sent anywhere except as HMAC key material.
+    session_secret: String,
 }
 
 pub struct UpstreamResult {
@@ -135,6 +142,7 @@ impl ClineUpstream {
                 fallback_cooldown: Duration::from_secs(config.upstream.fallback_429_cooldown_secs),
                 exact_secrets,
                 route,
+                session_secret: config.server.api_key.clone(),
             }),
         })
     }
@@ -159,27 +167,31 @@ impl ClineUpstream {
     /// enter the retry branch. Transport errors return before response-body
     /// classification, and successful responses retain streaming ownership.
     ///
-    /// `task_id` is the server-derived session fingerprint (X-Task-ID). It is
-    /// computed ONCE per logical request and passed unchanged through every
-    /// failover attempt, so key A and key B observe the same body, the same
-    /// X-Task-ID, and differ only in Authorization. `None` sends no header —
-    /// without a reliable session identity affinity is never faked.
+    /// `session_fp` is the internal session fingerprint (HMAC over the raw
+    /// `metadata.user_id`/`session_id`, computed once per logical request).
+    /// It is NOT sent upstream: after each attempt's key is selected, the
+    /// upstream X-Task-ID is derived as
+    /// `cache::upstream_task_id(server_secret, session_fp, selected_key)`,
+    /// so the same task presents a different — but per-credential stable —
+    /// task id when failover switches keys. `None` sends no header: without
+    /// a reliable session identity affinity is never faked.
     pub async fn send_chat(
         &self,
         body: Bytes,
         stream: bool,
         request_id: &str,
         model: &str,
-        task_id: Option<&str>,
+        session_fp: Option<&str>,
     ) -> std::result::Result<UpstreamResult, UpstreamError> {
         // Everything a failover attempt needs that must stay byte-identical
-        // across attempts lives here; only Authorization rotates.
+        // across attempts lives here; Authorization and the derived
+        // X-Task-ID rotate with the selected credential.
         let logical = LogicalRequest {
             body: &body,
             stream,
             request_id,
             model,
-            task_id,
+            session_fp,
         };
         let mut attempted = HashSet::with_capacity(self.inner.pool.len());
         let mut failed_probes_ms = 0u128;
@@ -316,7 +328,8 @@ impl ClineUpstream {
     }
 
     /// One failover attempt. `request` carries everything that must stay
-    /// byte-identical across attempts; only Authorization rotates here.
+    /// byte-identical across attempts; Authorization and the
+    /// credential-derived X-Task-ID rotate with the selected key.
     async fn send_once(
         &self,
         selected: &SelectedKey,
@@ -328,7 +341,7 @@ impl ClineUpstream {
             stream,
             request_id,
             model,
-            task_id,
+            session_fp,
         } = request;
         let started = Instant::now();
         let mut headers = self.inner.headers.clone();
@@ -340,12 +353,19 @@ impl ClineUpstream {
                 "application/json"
             }),
         );
-        // Dynamic session affinity (X-Task-ID): inserted after the configured
-        // static headers so the per-session fingerprint always wins over any
-        // user-configured value (config validation also rejects a configured
-        // `x-task-id`). Identical for every attempt of one logical request.
-        if let Some(task_id) = task_id {
-            if let Ok(value) = HeaderValue::try_from(*task_id) {
+        // Upstream X-Task-ID, derived AFTER the key is selected so it is
+        // scoped to the actual credential: same session + same key → same
+        // id; failover to a different key → different id. Inserted after the
+        // configured static headers so the dynamic value always wins (config
+        // validation also rejects a configured `x-task-id`). The raw
+        // session id and the raw API key are never sent or logged.
+        if let Some(session_fp) = session_fp {
+            let task_id = crate::cache::upstream_task_id(
+                &self.inner.session_secret,
+                session_fp,
+                selected.api_key(),
+            );
+            if let Ok(value) = HeaderValue::try_from(task_id) {
                 headers.insert("x-task-id", value);
             }
         }

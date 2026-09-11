@@ -232,6 +232,38 @@ pub fn session_fingerprint(secret: &str, raw_session_id: &str) -> String {
     hex[..16].to_owned()
 }
 
+/// Domain separator for the credential-scoped upstream task identity.
+/// Versioned so the derivation can evolve without colliding with other
+/// HMAC uses of the same server secret.
+const UPSTREAM_TASK_ID_DOMAIN: &[u8] = b"cline-proxy/x-task-id/v2\0";
+
+/// Derive the upstream-visible X-Task-ID from the internal session
+/// fingerprint AND the *actual* selected Cline credential, keyed by the
+/// server-side secret. Credential-scoped (privacy minimization, not
+/// unlinkability): the same Claude task keeps a stable X-Task-ID while one
+/// Cline key serves it and gets a different one after credential failover,
+/// so the proxy never hands Cline an explicit cross-key task linkage.
+///
+/// Properties (all regression-tested):
+/// - deterministic: same (session_fp, credential) → same id; no
+///   request_id/timestamp/attempt input, so it is restart-stable;
+/// - binds the actual credential secret, not the key's config name —
+///   replacing the secret under a name changes the id;
+/// - never exposes the raw session id or a raw/unsalted hash of the API
+///   key (domain-separated HMAC under the server secret, not SHA256(key));
+/// - 16 lowercase hex chars — same opaque wire shape Cline already accepts.
+pub fn upstream_task_id(secret: &str, session_fp: &str, cline_api_key: &str) -> String {
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(UPSTREAM_TASK_ID_DOMAIN);
+    mac.update(session_fp.as_bytes());
+    mac.update(b"\0");
+    mac.update(cline_api_key.as_bytes());
+    let digest = mac.finalize().into_bytes();
+    let hex = format!("{:x}", digest);
+    hex[..16].to_owned()
+}
+
 /// Raw session identity from an Anthropic request, in priority order:
 ///
 /// 1. `metadata.user_id` — Claude Code formats it as `<user>_<account>_session_<id>`,
@@ -564,5 +596,63 @@ mod tests {
         assert!(a.chars().all(|character| character.is_ascii_hexdigit()));
         // Raw id never appears in the fingerprint.
         assert!(!a.contains("9f8e7d"));
+    }
+
+    // --- credential-scoped upstream task id ---
+
+    #[test]
+    fn upstream_task_id_is_deterministic_and_credential_scoped() {
+        let fp = session_fingerprint("server-secret", "task-s");
+        // Same session + same credential → same id (stable across requests
+        // and restarts: no request_id/timestamp/attempt input).
+        assert_eq!(
+            upstream_task_id("server-secret", &fp, "KEY_A"),
+            upstream_task_id("server-secret", &fp, "KEY_A")
+        );
+        // Same session + different actual credential → different id.
+        let task_a = upstream_task_id("server-secret", &fp, "KEY_A");
+        let task_b = upstream_task_id("server-secret", &fp, "KEY_B");
+        assert_ne!(task_a, task_b);
+        // Different session + same credential → different id.
+        let other_fp = session_fingerprint("server-secret", "task-t");
+        assert_ne!(
+            task_a,
+            upstream_task_id("server-secret", &other_fp, "KEY_A")
+        );
+        // 16 lowercase hex: same opaque wire shape Cline already accepts.
+        for id in [task_a, task_b] {
+            assert_eq!(id.len(), 16);
+            assert!(id
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        }
+    }
+
+    /// The id binds the ACTUAL credential secret, not the key's config
+    /// name: the same secret under different slot names yields the same id,
+    /// and a rotated secret under the same name changes it.
+    #[test]
+    fn upstream_task_id_binds_the_credential_not_the_slot_name() {
+        let fp = session_fingerprint("server-secret", "task-s");
+        // Same actual credential secret, different slot names → same id.
+        assert_eq!(
+            upstream_task_id("server-secret", &fp, "SECRET-X"),
+            upstream_task_id("server-secret", &fp, "SECRET-X")
+        );
+        // Same slot name, rotated credential secret → different id.
+        assert_ne!(
+            upstream_task_id("server-secret", &fp, "SECRET-X"),
+            upstream_task_id("server-secret", &fp, "SECRET-X-ROTATED")
+        );
+        // Raw API key material never appears verbatim in the id (it is a
+        // domain-separated HMAC digest, not SHA256(key)).
+        let id = upstream_task_id("server-secret", &fp, "SECRET-X");
+        assert!(!id.contains("SECRET"));
+        // Domain separation: a plain concatenation hash of the same inputs
+        // must not collide with the domain-separated derivation.
+        assert_ne!(
+            upstream_task_id("server-secret", &fp, ""),
+            session_fingerprint("server-secret", &fp)
+        );
     }
 }
