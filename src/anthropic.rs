@@ -4,7 +4,7 @@
 //! provider-independent adapter. Provider-specific compaction, OAuth, and
 //! strict-output repair behavior are intentionally not carried over.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
@@ -112,17 +112,24 @@ pub fn convert_request_value(input: Value) -> Result<ConvertedRequest, ProtocolE
     output.insert("max_tokens".into(), Value::from(max_tokens));
     output.insert("stream".into(), Value::Bool(stream));
 
-    let mut messages = Vec::new();
+    let mut messages: Vec<WireMessage> = Vec::new();
     if let Some(system) = object.get("system") {
-        messages.push(json!({"role":"system", "content":convert_system(system)?}));
+        messages.push(WireMessage::System {
+            content: convert_system(system)?,
+        });
     }
     let input_messages = object
         .get("messages")
         .and_then(Value::as_array)
         .ok_or_else(|| ProtocolError::invalid("messages must be an array"))?;
+    // Every tool_use id declared so far, in conversation order. A tool_result
+    // may only reference an id an earlier assistant message declared — never
+    // a positional guess (deepseek-recipe-style checkable contract).
+    let mut declared_tool_ids = HashSet::new();
     for (index, message) in input_messages.iter().enumerate() {
-        convert_message(message, index, &mut messages)?;
+        convert_message(message, index, &mut messages, &mut declared_tool_ids)?;
     }
+    let messages = messages.into_iter().map(WireMessage::into_wire).collect();
     output.insert("messages".into(), Value::Array(messages));
 
     copy_number(object, &mut output, "temperature")?;
@@ -262,10 +269,80 @@ pub fn normalize_system_messages(body: &mut Value) -> u64 {
     removed_bytes
 }
 
+/// Typed OpenAI Chat Completions message produced by Anthropic conversion
+/// (deepseek-recipe idea, narrow cut): the four wire shapes are explicit so
+/// the assistant `tool_calls` ↔ `tool` `tool_call_id` chain has one checkable
+/// contract instead of scattered `Map` mutation. Field order in
+/// [`WireMessage::into_wire`] matches the historical wire bytes exactly —
+/// prefix stability depends on it, so it must never be reordered.
+enum WireMessage {
+    System {
+        content: Value,
+    },
+    /// `role` is `"user"` or `"assistant"` — plain-string content keeps the
+    /// originating role (assistant string content is common and must not be
+    /// relabeled).
+    User {
+        role: &'static str,
+        content: Value,
+    },
+    Assistant {
+        content: Vec<Value>,
+        tool_calls: Vec<Value>,
+        reasoning: String,
+    },
+    Tool {
+        tool_call_id: String,
+        content: Value,
+        is_error: Option<bool>,
+    },
+}
+
+impl WireMessage {
+    fn into_wire(self) -> Value {
+        match self {
+            Self::System { content } => json!({"role":"system", "content":content}),
+            Self::User { role, content } => json!({"role":role, "content":content}),
+            Self::Assistant {
+                content,
+                tool_calls,
+                reasoning,
+            } => {
+                let mut message = Map::new();
+                message.insert("role".into(), Value::String("assistant".into()));
+                message.insert("content".into(), Value::Array(content));
+                if !tool_calls.is_empty() {
+                    message.insert("tool_calls".into(), Value::Array(tool_calls));
+                }
+                if !reasoning.is_empty() {
+                    message.insert("reasoning_content".into(), Value::String(reasoning));
+                }
+                Value::Object(message)
+            }
+            Self::Tool {
+                tool_call_id,
+                content,
+                is_error,
+            } => {
+                let mut result = json!({
+                    "role":"tool",
+                    "tool_call_id":tool_call_id,
+                    "content":content
+                });
+                if let Some(is_error) = is_error {
+                    result["is_error"] = Value::Bool(is_error);
+                }
+                result
+            }
+        }
+    }
+}
+
 fn convert_message(
     value: &Value,
     message_index: usize,
-    output: &mut Vec<Value>,
+    output: &mut Vec<WireMessage>,
+    declared_tool_ids: &mut HashSet<String>,
 ) -> Result<(), ProtocolError> {
     let object = value.as_object().ok_or_else(|| {
         ProtocolError::invalid(format!("messages[{message_index}] must be an object"))
@@ -280,17 +357,26 @@ fn convert_message(
         .get("content")
         .ok_or_else(|| ProtocolError::invalid("message content is required"))?;
     if role == "system" {
-        output.push(json!({"role":"system", "content":convert_system(content)?}));
+        output.push(WireMessage::System {
+            content: convert_system(content)?,
+        });
     } else if content.is_string() {
-        output.push(json!({"role":role, "content":content}));
+        output.push(WireMessage::User {
+            role: if role == "assistant" {
+                "assistant"
+            } else {
+                "user"
+            },
+            content: content.clone(),
+        });
     } else {
         let blocks = content
             .as_array()
             .ok_or_else(|| ProtocolError::invalid("message content must be a string or array"))?;
         if role == "assistant" {
-            convert_assistant_blocks(blocks, output)?;
+            convert_assistant_blocks(blocks, output, declared_tool_ids)?;
         } else {
-            convert_user_blocks(blocks, output)?;
+            convert_user_blocks(blocks, output, declared_tool_ids)?;
         }
     }
     Ok(())
@@ -298,7 +384,8 @@ fn convert_message(
 
 fn convert_assistant_blocks(
     blocks: &[Value],
-    output: &mut Vec<Value>,
+    output: &mut Vec<WireMessage>,
+    declared_tool_ids: &mut HashSet<String>,
 ) -> Result<(), ProtocolError> {
     let mut content = Vec::new();
     let mut tool_calls = Vec::new();
@@ -320,8 +407,10 @@ fn convert_assistant_blocks(
                     object.get("input").unwrap_or(&Value::Object(Map::new())),
                 )
                 .map_err(|error| ProtocolError::invalid(error.to_string()))?;
+                let id = required_string(object, "id")?.to_owned();
+                declared_tool_ids.insert(id.clone());
                 tool_calls.push(json!({
-                    "id":required_string(object, "id")?,
+                    "id":id,
                     "type":"function",
                     "function":{
                         "name":required_string(object, "name")?,
@@ -336,20 +425,19 @@ fn convert_assistant_blocks(
             }
         }
     }
-    let mut message = Map::new();
-    message.insert("role".into(), Value::String("assistant".into()));
-    message.insert("content".into(), Value::Array(content));
-    if !tool_calls.is_empty() {
-        message.insert("tool_calls".into(), Value::Array(tool_calls));
-    }
-    if !reasoning.is_empty() {
-        message.insert("reasoning_content".into(), Value::String(reasoning));
-    }
-    output.push(Value::Object(message));
+    output.push(WireMessage::Assistant {
+        content,
+        tool_calls,
+        reasoning,
+    });
     Ok(())
 }
 
-fn convert_user_blocks(blocks: &[Value], output: &mut Vec<Value>) -> Result<(), ProtocolError> {
+fn convert_user_blocks(
+    blocks: &[Value],
+    output: &mut Vec<WireMessage>,
+    declared_tool_ids: &mut HashSet<String>,
+) -> Result<(), ProtocolError> {
     let mut ordinary = Vec::new();
     for block in blocks {
         let object = block
@@ -360,8 +448,14 @@ fn convert_user_blocks(blocks: &[Value], output: &mut Vec<Value>) -> Result<(), 
             "image" => ordinary.push(convert_image_block(object)?),
             "document" => ordinary.push(convert_document_block(object)?),
             "tool_result" => {
-                flush_user_content(&mut ordinary, output);
-                output.push(convert_tool_result(object)?);
+                if !ordinary.is_empty() {
+                    let content = std::mem::take(&mut ordinary);
+                    output.push(WireMessage::User {
+                        role: "user",
+                        content: Value::Array(content),
+                    });
+                }
+                output.push(convert_tool_result(object, declared_tool_ids)?);
             }
             kind => {
                 return Err(ProtocolError::invalid(format!(
@@ -370,17 +464,81 @@ fn convert_user_blocks(blocks: &[Value], output: &mut Vec<Value>) -> Result<(), 
             }
         }
     }
-    flush_user_content(&mut ordinary, output);
+    if !ordinary.is_empty() {
+        let content = ordinary;
+        output.push(WireMessage::User {
+            role: "user",
+            content: Value::Array(content),
+        });
+    }
     if blocks.is_empty() {
-        output.push(json!({"role":"user", "content":[]}));
+        output.push(WireMessage::User {
+            role: "user",
+            content: Value::Array(Vec::new()),
+        });
     }
     Ok(())
 }
 
-fn flush_user_content(content: &mut Vec<Value>, output: &mut Vec<Value>) {
-    if !content.is_empty() {
-        output.push(json!({"role":"user", "content":std::mem::take(content)}));
+fn convert_tool_result(
+    object: &Map<String, Value>,
+    declared_tool_ids: &HashSet<String>,
+) -> Result<WireMessage, ProtocolError> {
+    let content = object
+        .get("content")
+        .cloned()
+        .unwrap_or_else(|| Value::String(String::new()));
+    let content = if let Some(blocks) = content.as_array() {
+        Value::Array(
+            blocks
+                .iter()
+                .map(|block| {
+                    let object = block.as_object().ok_or_else(|| {
+                        ProtocolError::invalid("tool_result content block must be an object")
+                    })?;
+                    match required_string(object, "type")? {
+                        "text" => convert_text_block(object),
+                        "image" => convert_image_block(object),
+                        "document" => convert_document_block(object),
+                        kind => Err(ProtocolError::invalid(format!(
+                            "unsupported tool_result content type {kind:?}"
+                        ))),
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        )
+    } else if content.is_string() {
+        content
+    } else {
+        return Err(ProtocolError::invalid(
+            "tool_result content must be a string or array",
+        ));
+    };
+    let tool_call_id = required_string(object, "tool_use_id")?.to_owned();
+    if !declared_tool_ids.contains(&tool_call_id) {
+        // An unmatched tool_result would reach the upstream with a dangling
+        // `tool_call_id` and fail there with a worse error. Explicit and
+        // early beats silent and late.
+        return Err(ProtocolError::invalid(format!(
+            "tool_result references tool_use id {tool_call_id:?} which no earlier assistant message declared"
+        )));
     }
+    let is_error = match object.get("is_error") {
+        Some(value) => {
+            if !value.is_boolean() {
+                return Err(ProtocolError::invalid(
+                    "tool_result is_error must be boolean",
+                ));
+            }
+            Some(value.as_bool().unwrap_or_default())
+        }
+        None => None,
+    };
+    Ok(WireMessage::Tool {
+        tool_call_id,
+        content,
+        is_error,
+    })
 }
 
 fn convert_text_block(object: &Map<String, Value>) -> Result<Value, ProtocolError> {
@@ -425,53 +583,6 @@ fn convert_document_block(object: &Map<String, Value>) -> Result<Value, Protocol
             "unsupported document source {kind:?}"
         ))),
     }
-}
-
-fn convert_tool_result(object: &Map<String, Value>) -> Result<Value, ProtocolError> {
-    let content = object
-        .get("content")
-        .cloned()
-        .unwrap_or_else(|| Value::String(String::new()));
-    let content = if let Some(blocks) = content.as_array() {
-        Value::Array(
-            blocks
-                .iter()
-                .map(|block| {
-                    let object = block.as_object().ok_or_else(|| {
-                        ProtocolError::invalid("tool_result content block must be an object")
-                    })?;
-                    match required_string(object, "type")? {
-                        "text" => convert_text_block(object),
-                        "image" => convert_image_block(object),
-                        "document" => convert_document_block(object),
-                        kind => Err(ProtocolError::invalid(format!(
-                            "unsupported tool_result content type {kind:?}"
-                        ))),
-                    }
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        )
-    } else if content.is_string() {
-        content
-    } else {
-        return Err(ProtocolError::invalid(
-            "tool_result content must be a string or array",
-        ));
-    };
-    let mut result = json!({
-        "role":"tool",
-        "tool_call_id":required_string(object, "tool_use_id")?,
-        "content":content
-    });
-    if let Some(is_error) = object.get("is_error") {
-        if !is_error.is_boolean() {
-            return Err(ProtocolError::invalid(
-                "tool_result is_error must be boolean",
-            ));
-        }
-        result["is_error"] = is_error.clone();
-    }
-    Ok(result)
 }
 
 fn convert_tools(value: &Value) -> Result<Value, ProtocolError> {
@@ -2454,6 +2565,116 @@ mod tests {
             .as_slice(),
         );
         assert!(result.is_err());
+    }
+
+    // --- typed wire IR: tool-call chain contract ---
+
+    /// Parallel tool calls are matched by ID, never by position: tool results
+    /// arriving in swapped order still convert with each `tool_call_id`
+    /// pointing at exactly the assistant-declared call.
+    #[test]
+    fn parallel_tool_results_match_by_id_not_position() {
+        let converted = convert_request(
+            serde_json::to_vec(&json!({
+                "model":"claude-sonnet-4-6", "max_tokens":256,
+                "messages":[
+                    {"role":"user","content":"read and edit"},
+                    {"role":"assistant","content":[
+                        {"type":"tool_use","id":"call_read","name":"Read","input":{"path":"a.rs"}},
+                        {"type":"tool_use","id":"call_edit","name":"Edit","input":{"path":"a.rs"}}
+                    ]},
+                    {"role":"user","content":[
+                        {"type":"tool_result","tool_use_id":"call_edit","content":"edited"},
+                        {"type":"tool_result","tool_use_id":"call_read","content":"contents"}
+                    ]}
+                ]
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap();
+        let messages = converted.body["messages"].as_array().unwrap();
+        assert_eq!(messages[2]["tool_call_id"], "call_edit");
+        assert_eq!(messages[2]["content"], "edited");
+        assert_eq!(messages[3]["tool_call_id"], "call_read");
+        assert_eq!(messages[3]["content"], "contents");
+    }
+
+    /// A tool_result that references an id no earlier assistant message
+    /// declared is an explicit protocol error, not a silently dangling
+    /// upstream `tool_call_id`.
+    #[test]
+    fn orphan_tool_result_is_an_explicit_protocol_error() {
+        let error = convert_request(
+            serde_json::to_vec(&json!({
+                "model":"claude-sonnet-4-6", "max_tokens":256,
+                "messages":[
+                    {"role":"user","content":[
+                        {"type":"tool_result","tool_use_id":"toolu_ghost","content":"x"}
+                    ]}
+                ]
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap_err();
+        assert!(error.message.contains("toolu_ghost"), "{}", error.message);
+        assert_eq!(error.error_type, "invalid_request_error");
+    }
+
+    /// A result may reference a call declared in ANY earlier assistant turn
+    /// (cumulative declaration set), matching Anthropic semantics.
+    #[test]
+    fn tool_result_may_reference_earlier_turn_tool_use() {
+        let converted = convert_request(
+            serde_json::to_vec(&json!({
+                "model":"claude-sonnet-4-6", "max_tokens":256,
+                "messages":[
+                    {"role":"user","content":"first"},
+                    {"role":"assistant","content":[
+                        {"type":"tool_use","id":"call_old","name":"Read","input":{}}
+                    ]},
+                    {"role":"user","content":[{"type":"text","text":"go on"}]},
+                    {"role":"assistant","content":[
+                        {"type":"tool_use","id":"call_new","name":"Edit","input":{}}
+                    ]},
+                    {"role":"user","content":[
+                        {"type":"tool_result","tool_use_id":"call_old","content":"late"},
+                        {"type":"text","text":"and the text answer"}
+                    ]}
+                ]
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap();
+        let messages = converted.body["messages"].as_array().unwrap();
+        assert_eq!(messages[4]["tool_call_id"], "call_old");
+        // Mixed ordinary content stays adjacent, after the tool message.
+        assert_eq!(messages[5]["role"], "user");
+        assert_eq!(messages[5]["content"][0]["text"], "and the text answer");
+    }
+
+    /// Plain-string assistant content keeps the assistant role through the
+    /// typed wire IR (no relabeling drift).
+    #[test]
+    fn string_assistant_content_keeps_its_role() {
+        let converted = convert_request(
+            serde_json::to_vec(&json!({
+                "model":"claude-sonnet-4-6", "max_tokens":256,
+                "messages":[
+                    {"role":"user","content":"hi"},
+                    {"role":"assistant","content":"thinking out loud"},
+                    {"role":"user","content":"continue"}
+                ]
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap();
+        let messages = converted.body["messages"].as_array().unwrap();
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"], "thinking out loud");
     }
 
     #[test]

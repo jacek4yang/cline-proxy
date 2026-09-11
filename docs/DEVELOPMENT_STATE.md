@@ -1,9 +1,9 @@
 # Development State
 
-Last updated: 2026-09-10
-Main SHA: 6a37625 (feat(upstream): SOCKS5 Cline route #28)
+Last updated: 2026-09-11
+Main SHA: 9db58e2 (docs: record SOCKS5 production route on main 6a37625)
 Repository: https://github.com/jacek4yang/cline-proxy
-Status: main green; SOCKS5 production route live
+Status: main green; in-flight fix/session-affinity-protocol (ADR 0009)
 
 > Agent recovery protocol — on context compaction or session end:
 > 1. Read this file top to bottom.
@@ -115,6 +115,21 @@ Issues #3, #6, #8, #10, #13, #14, #16, #19, #24, #27 closed with their PRs.
 
 ## Current target
 
+**In flight (branch `fix/session-affinity-protocol`, PR pending):**
+session-affinity correctness fix, ADR 0009. Session identity (HMAC
+fingerprint over `metadata.user_id`/`session_id`) is now extracted
+unconditionally — no longer behind `glm53.telemetry.prefix_hash` — and is
+shared by the reasoning shadow store, prefix/session telemetry, and a
+dynamic upstream `X-Task-ID` (reserved header; static config rejected).
+Failover invariants: body, X-Task-ID, and stream flags byte-identical
+across attempts; only Authorization rotates; only effective 429 rotates
+keys. Anthropic→OpenAI message conversion builds a small typed
+`WireMessage` IR; a `tool_result` must reference an id declared by an
+earlier assistant message (explicit 400 otherwise; ID-matched, never
+positional). 224 tests green (220 lib + 4 + 4); fmt/clippy `-D warnings`
+clean, debug and release. Remaining: controlled live check that the Cline
+route actually sticky-routes on `X-Task-ID`.
+
 Normal production observation on SOCKS5 (`socks5://127.0.0.1:10888`).
 Isolated A/B (n=4 tiny streams): direct headers median 1284 ms vs SOCKS5
 1054 ms; overlap is large — do not claim SOCKS5 is faster. Production
@@ -126,7 +141,9 @@ only if new evidence shows a bug.
 - Observe real production logs (`logs/events-*.jsonl`); analyze only
   when evidence shows a problem.
 - Do NOT proactively redesign the model path (feature freeze on
-  reasoning/cache/prefix/routing semantics — all verified).
+  reasoning/cache/prefix/routing semantics — all verified). The
+  session-affinity fix on `fix/session-affinity-protocol` is a confirmed
+  correctness bug fix, not a redesign (ADR 0009).
 - Optional: set `glm53.context.upstream_context_window_tokens` only after
   a real Cline route limit is measured.
 
