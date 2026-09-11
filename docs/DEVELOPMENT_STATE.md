@@ -33,28 +33,39 @@ lines", "deepseek-recipe does it this way" are NOT change reasons.
 
 ## Current production baseline
 
-- Code baseline: `be01d56` (#32). Includes #30 session identity (HMAC
-  fingerprint
+- Code baseline: `be01d56` (#32) plus credential-scoped upstream task
+  identity (this PR). Includes #30 session identity (HMAC fingerprint
   over `metadata.user_id`/`session_id`) decoupled from the `prefix_hash`
-  telemetry flag; dynamic privacy-safe upstream `X-Task-ID` (reserved
-  header, never the raw id); 429 failover keeps body + X-Task-ID
-  byte-identical with only Authorization rotating; typed `WireMessage`
+  telemetry flag; **credential-scoped** upstream `X-Task-ID` (reserved
+  header): the internal session fingerprint stays stable across Cline
+  credentials (reasoning shadow, telemetry), while the upstream
+  X-Task-ID is derived per selected credential — same session + same key
+  → same id; same session + different key → different id; different
+  session + same key → different id; no metadata → no header. 429
+  credential failover: body byte-identical, Authorization changes,
+  X-Task-ID changes (each matching its selected credential); internal
+  session fingerprint remains stable. Typed `WireMessage`
   conversion with Anthropic tool-use adjacency
   (immediately-preceding-turn tool_result, ID-matched, result-first
   ordering); #32 duplicate tool_result → explicit 400. Missing-result
   strict equality remains INTENTIONALLY DEFERRED (no fixture evidence
   that Claude Code never produces legitimate partial result turns).
-- Tests: 224 lib + 4 glm53_policy + 4 reasoning_shadow = **232**
+- Tests: 226 lib + 4 glm53_policy + 4 reasoning_shadow = **234**
   (debug and release); fmt/clippy `-D warnings` clean.
 - Release hot path (1.3 MB): convert 1.0 ms, optimize 1.1 ms, cache 1.1 ms,
   serialize 0.5 ms — no >5% regression vs the prior 0.9/1.2/1.2/0.5 ms
   baseline. Exact tokenizer ~411 ms on that fixture, still spawn_blocking.
 - Live X-Task-ID evidence (2026-09-11, isolated 127.0.0.1:18800/18802,
   no production touch): Cline accepts the header (200s, no 400/403);
-  same session → identical fingerprint across requests; network-level
-  capture of an effective-429 failover confirmed body identical,
-  X-Task-ID identical, only Authorization rotated; raw id never in
-  headers or logs; semantic marker continuity across turns passed.
+  same session → identical internal fingerprint across requests;
+  network-level capture of an effective-429 failover confirmed body
+  identical with only Authorization rotating (pre-credential-scoping —
+  X-Task-ID equality then was the old semantics, now superseded);
+  raw id never in headers or logs; semantic marker continuity across
+  turns passed. The credential-scoped derivation is verified by
+  integration tests with a scripted 429 mock and pure-function unit
+  tests (no additional live spend needed: the header shape is an
+  unchanged opaque 16-hex value Cline already accepts).
   Cline SERVER-SIDE use of X-Task-ID for routing/cache remains unknown
   and undocumented — do not claim proven sticky routing.
 - Isolated live Cline (2026-09-10, real `config.json`, bind 127.0.0.1:18799,
@@ -163,18 +174,22 @@ Issues #3, #6, #8, #10, #13, #14, #16, #19, #24, #27 closed with their PRs.
 
 **Long-term normal use + production observation under FEATURE FREEZE.**
 
-Stabilization baseline (main `be01d56`): #30 session affinity/X-Task-ID,
-#31 state snapshot, #32 duplicate tool_result hardening — all merged.
-232 tests (224 lib + 4 + 4), debug and release; fmt/clippy `-D warnings`
-clean. Live evidence (isolated ports only): Cline accepts X-Task-ID,
-same session keeps an identical fingerprint, network-level failover
-capture confirmed body+X-Task-ID identical with only Authorization
-rotating, no raw-id leakage, marker continuity passed.
+Stabilization baseline: #30 session affinity/X-Task-ID, #31 state
+snapshot, #32 duplicate tool_result hardening, #33 stabilization
+snapshot — all merged; then credential-scoped upstream task identity
+(this PR). Tests 234 (226 lib + 4 + 4), debug and release; fmt/clippy
+`-D warnings` clean. Live evidence (isolated ports only): Cline accepts
+X-Task-ID, no raw-id leakage, marker continuity passed. The
+credential-scoped X-Task-ID semantics are verified by mock integration
+tests (scripted 429 failover) and unit tests; the header shape is an
+unchanged opaque 16-hex value Cline already accepts, so no new live
+spend was required.
 
 **X-Task-ID evidence boundary:** Cline server-side X-Task-ID routing
 semantics are not publicly guaranteed. Proxy-side affinity is verified;
 live route behavior is empirical — never claim proven server-side
 sticky routing/cache keying without documented or measured evidence.
+Credential-scoping is privacy minimization, not unlinkability.
 
 Normal production observation on SOCKS5 (`socks5://127.0.0.1:10888`).
 Isolated A/B (n=4 tiny streams): direct headers median 1284 ms vs SOCKS5
