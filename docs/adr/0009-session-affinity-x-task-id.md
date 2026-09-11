@@ -75,11 +75,15 @@ User / Assistant / Tool) before serializing, instead of scattered `Map`
 mutation. Two concrete wins:
 
 - the assistant `tool_calls` ↔ `tool` `tool_call_id` chain has one
-  checkable contract: a `tool_result` must reference an id declared by an
-  earlier assistant message (cumulative set, in conversation order) —
-  parallel results are matched by ID, never by position; an orphan result
-  is an explicit `invalid_request_error` instead of a dangling upstream
-  id that fails later with a worse error;
+  checkable contract with Anthropic tool-use adjacency semantics: a
+  `tool_result` must live in the message immediately following its
+  tool_use (the pending window holds only the latest assistant turn's
+  declared ids; any user/system message closes it), tool_result blocks
+  must come first in their user message (ordinary content after them is
+  kept; content before them is an explicit `invalid_request_error`), and
+  parallel results are matched by ID in any order — never by position.
+  An orphan or stale result is an explicit `invalid_request_error`
+  instead of a dangling upstream id that fails later with a worse error;
 - field order in `into_wire` reproduces the historical wire bytes exactly
   (prefix stability depends on it); all pre-existing conversion tests pass
   byte-identically.

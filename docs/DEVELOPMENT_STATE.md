@@ -126,9 +126,10 @@ across attempts; only Authorization rotates; only effective 429 rotates
 keys. Anthropic→OpenAI message conversion builds a small typed
 `WireMessage` IR; a `tool_result` must reference an id declared by an
 earlier assistant message (explicit 400 otherwise; ID-matched, never
-positional). 224 tests green (220 lib + 4 + 4); fmt/clippy `-D warnings`
-clean, debug and release. Remaining: controlled live check that the Cline
-route actually sticky-routes on `X-Task-ID`.
+positional). 231 tests green (223 lib + 4 glm53_policy + 4
+reasoning_shadow); fmt/clippy `-D warnings` clean, debug and release.
+Remaining: controlled live check that the Cline route actually
+sticky-routes on `X-Task-ID`.
 
 Normal production observation on SOCKS5 (`socks5://127.0.0.1:10888`).
 Isolated A/B (n=4 tiny streams): direct headers median 1284 ms vs SOCKS5
