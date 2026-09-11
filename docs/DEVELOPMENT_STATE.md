@@ -1,14 +1,17 @@
 # Development State
 
 Last updated: 2026-09-11
-Main SHA: be01d56 (fix(protocol): reject duplicate tool_result for the same tool_use id #32)
+Code baseline: duplicate-result hardening through PR #32 (merge `be01d56`)
+State snapshot: #33 and the final repository cleanup (#21/#22/#23 closed)
 Repository: https://github.com/jacek4yang/cline-proxy
-Status: main green; STABILIZATION BASELINE — MODEL PATH FEATURE FREEZE in effect
+Status: STABILIZATION BASELINE — MODEL PATH FEATURE FREEZE in effect
 
 > Agent recovery protocol — on context compaction or session end:
 > 1. Read this file top to bottom.
 > 2. `git status && git branch --show-current && git pull --ff-only`.
-> 3. Verify main SHA above against `git log --oneline -1`.
+> 3. Verify the actual main SHA with `git log --oneline -1` (this file
+>    records milestone SHAs, not the current HEAD, so it never goes stale
+>    with itself).
 > 4. `gh pr list --state open && gh issue list --state open`.
 > 5. Continue from "Current target". NEVER trust branch names or
 >    "pending merge" phrases from anything below the Historical record.
@@ -30,7 +33,8 @@ lines", "deepseek-recipe does it this way" are NOT change reasons.
 
 ## Current production baseline
 
-- main `be01d56` (#32). Includes #30 session identity (HMAC fingerprint
+- Code baseline: `be01d56` (#32). Includes #30 session identity (HMAC
+  fingerprint
   over `metadata.user_id`/`session_id`) decoupled from the `prefix_hash`
   telemetry flag; dynamic privacy-safe upstream `X-Task-ID` (reserved
   header, never the raw id); 429 failover keeps body + X-Task-ID
@@ -68,6 +72,11 @@ lines", "deepseek-recipe does it this way" are NOT change reasons.
   `target/release/`; the USER copies it deliberately. Never overwrite the
   production exe automatically.
 - Release: INTENTIONALLY DEFERRED (no tags, no GitHub Release).
+- Repository state: no open PRs, no open issues, remote branches =
+  main only. #21 (tokenizers 0.23), #22 (hmac 0.13), #23 (sha2 0.11)
+  were CLOSED with technical rationale during close-out; dependency
+  upgrades restart only as fresh dedicated PRs when
+  security/correctness/compatibility evidence justifies them.
 
 ## Current architecture
 
@@ -120,9 +129,11 @@ Issues #3, #6, #8, #10, #13, #14, #16, #19, #24, #27 closed with their PRs.
 
 ## Open PRs / issues
 
-- Dependabot: hmac 0.13, sha2 0.11, tokenizers 0.23 — intentionally
-  deferred to a later dedicated bump; do not bump opportunistically.
-- No open recovery issues.
+- **No open PRs, no open issues.** Dependabot bumps for hmac 0.13
+  (#22), sha2 0.11 (#23), and tokenizers 0.23 (#21) were CLOSED with
+  technical rationale during the stabilization close-out — cargo audit
+  reports 0 vulnerabilities; none addressed a security or correctness
+  need. Re-open only as fresh dedicated migration PRs.
 
 ## Known limitations
 
@@ -189,8 +200,11 @@ only if new evidence shows a bug.
 - Missing-result strict equality for tool_use turns (no fixture evidence
   that Claude Code never produces legitimate partial result turns;
   duplicate detection IS implemented, #32).
-- Dependency bumps: hmac 0.13, sha2 0.11, tokenizers 0.23
-  (later dedicated PR; not during stabilization).
+- Dependency upgrades: tokenizers 0.23, hmac 0.13, sha2 0.11 —
+  **No active PR.** Closed as #21/#22/#23. Re-open as a fresh dedicated
+  migration only if security/correctness/compatibility evidence
+  justifies it (tokenizers additionally requires re-running the full
+  Rust/Python oracle parity suite).
 
 ## Agent recovery protocol
 
