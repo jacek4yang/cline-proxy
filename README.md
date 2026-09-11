@@ -251,12 +251,13 @@ addresses the drift sources it can (issue #8, ADR 0005):
   is derived from that internal identity AND the selected Cline API key:
   the same Claude task gets a stable X-Task-ID while using one Cline key,
   and a different X-Task-ID after switching to a different key. Raw
-  session ids and raw API keys are never forwarded or embedded. Without
-  session identity the header is not sent and affinity is never guessed
-  from connection, IP, key, or recent requests. This is privacy
-  minimization, not unlinkability — Cline server-side `X-Task-ID`
-  semantics are undocumented, and correlation through body, timing, IP,
-  or account ownership remains possible.
+  session ids are never forwarded; raw Cline API keys are used only for
+  `Authorization` and as internal HMAC input, and are never embedded in
+  `X-Task-ID` or logged. Without session identity the header is not sent and
+  affinity is never guessed from connection, IP, key, or recent requests.
+  This is privacy minimization, not unlinkability — Cline server-side
+  `X-Task-ID` semantics are undocumented, and correlation through body,
+  timing, IP, or account ownership remains possible.
 - **Cache ratios**: `cache_hit_ratio` and `reasoning_ratio` are logged
   from upstream usage. Verified against live traffic: Cline reports
   `cached_tokens` (subset of `prompt_tokens`), and a real ~300 K-token
