@@ -1,9 +1,9 @@
 # Development State
 
 Last updated: 2026-09-11
-Main SHA: 9db58e2 (docs: record SOCKS5 production route on main 6a37625)
+Main SHA: 317fc2f (fix(session): X-Task-ID affinity decoupled from telemetry + typed tool-call chain #30)
 Repository: https://github.com/jacek4yang/cline-proxy
-Status: main green; in-flight fix/session-affinity-protocol (ADR 0009)
+Status: main green; session-affinity / X-Task-ID fix merged (ADR 0009)
 
 > Agent recovery protocol — on context compaction or session end:
 > 1. Read this file top to bottom.
@@ -15,12 +15,16 @@ Status: main green; in-flight fix/session-affinity-protocol (ADR 0009)
 
 ## Current production baseline
 
-- main `6a37625` (axum 0.8.9 + production recovery + SOCKS5). Adds stall timers,
-  restart-safe JSONL writer, stderr/auto-color, JSONL schema v2, local vs
-  upstream token fields, optional context guard (unset by default).
-- Tests on the recovery branch: 202 lib + 4 glm53_policy + 4
-  reasoning_shadow = **210** (debug and release); fmt/clippy `-D warnings`
-  clean.
+- main `317fc2f` (#30). Session identity (HMAC fingerprint over
+  `metadata.user_id`/`session_id`) decoupled from the `prefix_hash`
+  telemetry flag; dynamic privacy-safe upstream `X-Task-ID` (reserved
+  header, never the raw id); 429 failover keeps body + X-Task-ID
+  byte-identical with only Authorization rotating; typed `WireMessage`
+  conversion with Anthropic tool-use adjacency
+  (immediately-preceding-turn tool_result, ID-matched, result-first
+  ordering).
+- Tests: 223 lib + 4 glm53_policy + 4 reasoning_shadow = **231**
+  (debug and release); fmt/clippy `-D warnings` clean.
 - Release hot path (1.3 MB): convert 1.0 ms, optimize 1.1 ms, cache 1.1 ms,
   serialize 0.5 ms — no >5% regression vs the prior 0.9/1.2/1.2/0.5 ms
   baseline. Exact tokenizer ~411 ms on that fixture, still spawn_blocking.
@@ -83,6 +87,7 @@ Modules: `anthropic.rs` (protocol), `cache.rs` (prefix stability),
 | #20 | axum 0.7.9 → 0.8.9 |
 | #24 | Production recovery: stall timers, restart-safe writer, ANSI/INFO, schema v2 (this work) |
 | #28 | SOCKS5/socks5h outbound Cline route; deterministic direct (`no_proxy`) |
+| #30 | Session identity decoupled from telemetry; dynamic privacy-safe X-Task-ID; 429 failover affinity; typed WireMessage tool-chain validation |
 
 Issues #3, #6, #8, #10, #13, #14, #16, #19, #24, #27 closed with their PRs.
 
@@ -115,21 +120,26 @@ Issues #3, #6, #8, #10, #13, #14, #16, #19, #24, #27 closed with their PRs.
 
 ## Current target
 
-**In flight (branch `fix/session-affinity-protocol`, PR pending):**
-session-affinity correctness fix, ADR 0009. Session identity (HMAC
-fingerprint over `metadata.user_id`/`session_id`) is now extracted
-unconditionally — no longer behind `glm53.telemetry.prefix_hash` — and is
-shared by the reasoning shadow store, prefix/session telemetry, and a
-dynamic upstream `X-Task-ID` (reserved header; static config rejected).
-Failover invariants: body, X-Task-ID, and stream flags byte-identical
-across attempts; only Authorization rotates; only effective 429 rotates
-keys. Anthropic→OpenAI message conversion builds a small typed
-`WireMessage` IR; a `tool_result` must reference an id declared by an
-earlier assistant message (explicit 400 otherwise; ID-matched, never
-positional). 231 tests green (223 lib + 4 glm53_policy + 4
-reasoning_shadow); fmt/clippy `-D warnings` clean, debug and release.
-Remaining: controlled live check that the Cline route actually
-sticky-routes on `X-Task-ID`.
+Controlled production-compatible observation of X-Task-ID/session
+affinity; no further model-path redesign unless evidence shows a bug.
+
+Merged (main `317fc2f`, PR #30, ADR 0009): session identity (HMAC
+fingerprint over `metadata.user_id`/`session_id`) extracted
+unconditionally — no longer behind `glm53.telemetry.prefix_hash` — shared
+by the reasoning shadow store, prefix/session telemetry, and a dynamic
+upstream `X-Task-ID` (reserved header; static config rejected). Failover
+invariants: body, X-Task-ID, and stream flags byte-identical across
+attempts; only Authorization rotates; only effective 429 rotates keys.
+Anthropic→OpenAI message conversion uses a typed `WireMessage` IR with
+Anthropic tool-use adjacency (tool_result only from the immediately
+preceding assistant turn, ID-matched, result-first ordering; explicit
+400 otherwise). 231 tests green (223 lib + 4 glm53_policy + 4
+reasoning_shadow), debug and release.
+
+**X-Task-ID evidence boundary:** Cline server-side X-Task-ID routing
+semantics are not publicly guaranteed. Proxy-side affinity is verified;
+live route behavior is empirical — never claim proven server-side
+sticky routing/cache keying without documented or measured evidence.
 
 Normal production observation on SOCKS5 (`socks5://127.0.0.1:10888`).
 Isolated A/B (n=4 tiny streams): direct headers median 1284 ms vs SOCKS5
@@ -142,9 +152,7 @@ only if new evidence shows a bug.
 - Observe real production logs (`logs/events-*.jsonl`); analyze only
   when evidence shows a problem.
 - Do NOT proactively redesign the model path (feature freeze on
-  reasoning/cache/prefix/routing semantics — all verified). The
-  session-affinity fix on `fix/session-affinity-protocol` is a confirmed
-  correctness bug fix, not a redesign (ADR 0009).
+  reasoning/cache/prefix/routing semantics — all verified).
 - Optional: set `glm53.context.upstream_context_window_tokens` only after
   a real Cline route limit is measured.
 
