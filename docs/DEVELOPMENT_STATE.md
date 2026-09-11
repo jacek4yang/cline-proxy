@@ -1,9 +1,9 @@
 # Development State
 
 Last updated: 2026-09-11
-Main SHA: 317fc2f (fix(session): X-Task-ID affinity decoupled from telemetry + typed tool-call chain #30)
+Main SHA: be01d56 (fix(protocol): reject duplicate tool_result for the same tool_use id #32)
 Repository: https://github.com/jacek4yang/cline-proxy
-Status: main green; session-affinity / X-Task-ID fix merged (ADR 0009)
+Status: main green; STABILIZATION BASELINE — MODEL PATH FEATURE FREEZE in effect
 
 > Agent recovery protocol — on context compaction or session end:
 > 1. Read this file top to bottom.
@@ -13,21 +13,46 @@ Status: main green; session-affinity / X-Task-ID fix merged (ADR 0009)
 > 5. Continue from "Current target". NEVER trust branch names or
 >    "pending merge" phrases from anything below the Historical record.
 
+## MODEL PATH FEATURE FREEZE
+
+Do not proactively redesign or optimize: Anthropic protocol conversion /
+WireMessage semantics, GLM reasoning policy / epoch / shadow,
+prefix normalization / tool JSON canonicalization / cache behavior,
+session fingerprint / X-Task-ID, sticky key selection / effective-429
+classifier / cooldowns, stream-and-aggregate / SSE conversion /
+StreamWatch, SOCKS5/direct routing.
+
+Future changes must be evidence-driven: production anomaly →
+minimal reproduction → failing regression test → small fix → CI.
+One problem, one PR. Do NOT have agents periodically patrol the source
+and refactor proactively. "Architecture could be more elegant", "fewer
+lines", "deepseek-recipe does it this way" are NOT change reasons.
+
 ## Current production baseline
 
-- main `317fc2f` (#30). Session identity (HMAC fingerprint over
-  `metadata.user_id`/`session_id`) decoupled from the `prefix_hash`
+- main `be01d56` (#32). Includes #30 session identity (HMAC fingerprint
+  over `metadata.user_id`/`session_id`) decoupled from the `prefix_hash`
   telemetry flag; dynamic privacy-safe upstream `X-Task-ID` (reserved
   header, never the raw id); 429 failover keeps body + X-Task-ID
   byte-identical with only Authorization rotating; typed `WireMessage`
   conversion with Anthropic tool-use adjacency
   (immediately-preceding-turn tool_result, ID-matched, result-first
-  ordering).
-- Tests: 223 lib + 4 glm53_policy + 4 reasoning_shadow = **231**
+  ordering); #32 duplicate tool_result → explicit 400. Missing-result
+  strict equality remains INTENTIONALLY DEFERRED (no fixture evidence
+  that Claude Code never produces legitimate partial result turns).
+- Tests: 224 lib + 4 glm53_policy + 4 reasoning_shadow = **232**
   (debug and release); fmt/clippy `-D warnings` clean.
 - Release hot path (1.3 MB): convert 1.0 ms, optimize 1.1 ms, cache 1.1 ms,
   serialize 0.5 ms — no >5% regression vs the prior 0.9/1.2/1.2/0.5 ms
   baseline. Exact tokenizer ~411 ms on that fixture, still spawn_blocking.
+- Live X-Task-ID evidence (2026-09-11, isolated 127.0.0.1:18800/18802,
+  no production touch): Cline accepts the header (200s, no 400/403);
+  same session → identical fingerprint across requests; network-level
+  capture of an effective-429 failover confirmed body identical,
+  X-Task-ID identical, only Authorization rotated; raw id never in
+  headers or logs; semantic marker continuity across turns passed.
+  Cline SERVER-SIDE use of X-Task-ID for routing/cache remains unknown
+  and undocumented — do not claim proven sticky routing.
 - Isolated live Cline (2026-09-10, real `config.json`, bind 127.0.0.1:18799,
   no secrets printed): stream 200 + deltas + stop; non-stream 200
   `end_turn`; tool_use 200 with 2 tool-call events, thinking suppressed;
@@ -38,9 +63,10 @@ Status: main green; session-affinity / X-Task-ID fix merged (ADR 0009)
   **not configured**.
 - Timeout policy: first_event 180s, first_semantic 180s, stream_idle 120s,
   semantic_idle 180s; Reqwest read_timeout remains 600s as backstop.
-- Production deployment: `D:\Workspace\cline-proxy-bin`. Do not overwrite
-  the production exe until this recovery is merged and the isolated live
-  binary is copied deliberately.
+- Production deployment: `D:\Workspace\cline-proxy-bin`. The
+  long-term-use candidate binary is built from final main into
+  `target/release/`; the USER copies it deliberately. Never overwrite the
+  production exe automatically.
 - Release: INTENTIONALLY DEFERRED (no tags, no GitHub Release).
 
 ## Current architecture
@@ -88,13 +114,14 @@ Modules: `anthropic.rs` (protocol), `cache.rs` (prefix stability),
 | #24 | Production recovery: stall timers, restart-safe writer, ANSI/INFO, schema v2 (this work) |
 | #28 | SOCKS5/socks5h outbound Cline route; deterministic direct (`no_proxy`) |
 | #30 | Session identity decoupled from telemetry; dynamic privacy-safe X-Task-ID; 429 failover affinity; typed WireMessage tool-chain validation |
+| #32 | Duplicate tool_result hardening (explicit 400; missing-result equality deferred) |
 
 Issues #3, #6, #8, #10, #13, #14, #16, #19, #24, #27 closed with their PRs.
 
 ## Open PRs / issues
 
-- Dependabot: hmac 0.13, sha2 0.11, tokenizers 0.23 — not part of this
-  recovery; leave for a later dedicated bump.
+- Dependabot: hmac 0.13, sha2 0.11, tokenizers 0.23 — intentionally
+  deferred to a later dedicated bump; do not bump opportunistically.
 - No open recovery issues.
 
 ## Known limitations
@@ -117,24 +144,21 @@ Issues #3, #6, #8, #10, #13, #14, #16, #19, #24, #27 closed with their PRs.
   Claude Code's 1M client declaration is not a Cline route guarantee.
 - Isolated live tests used HTTP against the local proxy, not an
   interactive Claude Code TUI session.
+- Cline server-side use of `X-Task-ID` for routing/cache is undocumented;
+  the proxy preserves the header across failover but cannot guarantee
+  upstream behavior.
 
 ## Current target
 
-Controlled production-compatible observation of X-Task-ID/session
-affinity; no further model-path redesign unless evidence shows a bug.
+**Long-term normal use + production observation under FEATURE FREEZE.**
 
-Merged (main `317fc2f`, PR #30, ADR 0009): session identity (HMAC
-fingerprint over `metadata.user_id`/`session_id`) extracted
-unconditionally — no longer behind `glm53.telemetry.prefix_hash` — shared
-by the reasoning shadow store, prefix/session telemetry, and a dynamic
-upstream `X-Task-ID` (reserved header; static config rejected). Failover
-invariants: body, X-Task-ID, and stream flags byte-identical across
-attempts; only Authorization rotates; only effective 429 rotates keys.
-Anthropic→OpenAI message conversion uses a typed `WireMessage` IR with
-Anthropic tool-use adjacency (tool_result only from the immediately
-preceding assistant turn, ID-matched, result-first ordering; explicit
-400 otherwise). 231 tests green (223 lib + 4 glm53_policy + 4
-reasoning_shadow), debug and release.
+Stabilization baseline (main `be01d56`): #30 session affinity/X-Task-ID,
+#31 state snapshot, #32 duplicate tool_result hardening — all merged.
+232 tests (224 lib + 4 + 4), debug and release; fmt/clippy `-D warnings`
+clean. Live evidence (isolated ports only): Cline accepts X-Task-ID,
+same session keeps an identical fingerprint, network-level failover
+capture confirmed body+X-Task-ID identical with only Authorization
+rotating, no raw-id leakage, marker continuity passed.
 
 **X-Task-ID evidence boundary:** Cline server-side X-Task-ID routing
 semantics are not publicly guaranteed. Proxy-side affinity is verified;
@@ -162,6 +186,11 @@ only if new evidence shows a bug.
 - New concurrency/multi-agent load tests (intentionally).
 - prompt_cache_key (unnecessary: 99.8–100% hits without it).
 - Request gzip, deferred tools, adaptive effort heuristics (no evidence).
+- Missing-result strict equality for tool_use turns (no fixture evidence
+  that Claude Code never produces legitimate partial result turns;
+  duplicate detection IS implemented, #32).
+- Dependency bumps: hmac 0.13, sha2 0.11, tokenizers 0.23
+  (later dedicated PR; not during stabilization).
 
 ## Agent recovery protocol
 
