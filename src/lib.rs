@@ -14,6 +14,8 @@ pub mod proxy_route;
 pub mod rate_limit;
 pub mod reasoning_shadow;
 pub mod redaction;
+pub mod responses;
+pub mod responses_pump;
 pub mod server;
 pub mod state;
 pub mod stream_watch;

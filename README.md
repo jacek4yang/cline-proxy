@@ -1,8 +1,9 @@
 # cline-proxy
 
-`cline-proxy` is a small Rust gateway that exposes OpenAI Chat Completions and
-Anthropic Messages APIs over one or more Cline API keys. Its primary use is
-running Claude Code against Cline while filling one configured key at a time.
+`cline-proxy` is a small Rust gateway that exposes OpenAI Chat Completions,
+OpenAI Responses, and Anthropic Messages APIs over one or more Cline API
+keys. Its primary use is running Claude Code or Grok Build against Cline
+while filling one configured key at a time.
 
 > **Routing invariant: ONLY an effective upstream HTTP 429 may trigger Cline
 > API-key switching.** This includes a direct HTTP 429 and a high-confidence
@@ -15,7 +16,8 @@ running Claude Code against Cline while filling one configured key at a time.
 The binary contains five intentionally small subsystems:
 
 - Axum serves `/v1/messages`, `/v1/messages/count_tokens`,
-  `/v1/chat/completions`, `/v1/models`, `/healthz`, and `/readyz`.
+  `/v1/chat/completions`, `/v1/responses`, `/v1/models`, `/healthz`, and
+  `/readyz`.
 - One long-lived rustls `reqwest::Client` provides HTTP/2, gzip, pooling,
   keep-alive, connect timeout, and read-inactivity timeout behavior.
 - A concurrency-safe pool holds the sticky active key, per-key effective-429
@@ -419,6 +421,49 @@ can be interleaved. Malformed or truncated upstream streams produce one
 Anthropic error event and are never replayed. Dropping the downstream body
 drops the reqwest body so abandoned streaming work is cancelled upstream.
 
+## Grok Build (OpenAI Responses API)
+
+`POST /v1/responses` implements the OpenAI Responses wire schema as consumed
+by Grok Build (`api_backend = "responses"`). Point Grok Build's OpenAI base
+URL at the gateway and set the gateway key through your normal
+secret-management mechanism:
+
+```bash
+export OPENAI_BASE_URL=http://127.0.0.1:8788/v1
+export OPENAI_API_KEY="${CLINE_PROXY_GATEWAY_KEY:?set CLINE_PROXY_GATEWAY_KEY}"
+grok
+```
+
+Request support: string `input` and the full item array (`message` items with
+`input_text`/`output_text`/`refusal` parts, roles system/developer/user/
+assistant), `function_call` history replayed with the original `call_id`,
+`function_call_output` → tool results, flat function tools with byte-identical
+schemas, `tool_choice`, `max_output_tokens`, `temperature`/`top_p`, and
+`reasoning.effort` (none/minimal/low → low; medium/high/xhigh/max → high).
+`reasoning.summary` requests reasoning exposure (`requested_only` gate, like
+Anthropic thinking). Historical `reasoning` input items are never replayed
+onto the wire; the proxy's reasoning shadow store keeps in-turn continuity
+instead. Hosted backend tools (`web_search`, `x_search`, …) are dropped, not
+forwarded — this proxy cannot execute them and never fabricates results.
+`item_reference` inputs are rejected (the proxy is stateless).
+
+Streaming emits the exact typed Responses event lifecycle with monotonic
+`sequence_number`: `response.created` → item/content/argument
+added/delta/done frames → a terminal `response.completed`,
+`response.incomplete` (length), or `response.failed` (upstream error; never a
+replay). `response.output_item.added` for a `function_call` always precedes
+its argument deltas (Grok Build requires this ordering). Keepalives are SSE
+comments (`: ping`), never synthetic event frames. Non-stream requests use
+one upstream streaming generation aggregated locally.
+
+`prompt_cache_key` (or `x-grok-conv-id` / conv-id headers) is used as the
+session identity after a domain-separated HMAC fingerprint — the raw value is
+never logged or stored, and Responses fingerprints cannot collide with
+Anthropic session fingerprints. The GLM-5.3-Flash request policy (explicit
+reasoning effort, bounded output, historical-thinking strip, safe compaction,
+canonical tool JSON) applies unchanged, and the effective-429 key-failover
+invariants are identical to the other frontends.
+
 ## Manual integration tests
 
 Set `CLINE_PROXY_GATEWAY_KEY` to `server.api_key` through your normal
@@ -447,6 +492,15 @@ curl -N http://127.0.0.1:8788/v1/chat/completions \
   -H "Authorization: Bearer ${CLINE_PROXY_GATEWAY_KEY:?set CLINE_PROXY_GATEWAY_KEY}" \
   -H 'Content-Type: application/json' \
   -d '{"model":"claude-sonnet-4-6","stream":true,"messages":[{"role":"user","content":"Count to three"}]}'
+```
+
+OpenAI Responses (Grok Build):
+
+```bash
+curl -N http://127.0.0.1:8788/v1/responses \
+  -H "Authorization: Bearer ${CLINE_PROXY_GATEWAY_KEY:?set CLINE_PROXY_GATEWAY_KEY}" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"claude-sonnet-4-6","input":"Count to three","stream":true}'
 ```
 
 Anthropic stream:

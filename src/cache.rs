@@ -293,6 +293,47 @@ pub fn extract_session_fingerprint(anthropic_request: &Value, secret: &str) -> O
     ))
 }
 
+/// Domain-tagged session fingerprint for the Responses frontend. Domain
+/// separation keeps Responses fingerprints (`prompt_cache_key`,
+/// conv-id headers) from colliding with Anthropic ones derived from the
+/// same raw string under the same server secret.
+const RESPONSES_SESSION_DOMAIN: &[u8] = b"cline-proxy/responses/v1\0";
+
+pub fn responses_session_fingerprint(secret: &str, raw_session_id: &str) -> String {
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(RESPONSES_SESSION_DOMAIN);
+    mac.update(b"\0");
+    mac.update(raw_session_id.as_bytes());
+    let digest = mac.finalize().into_bytes();
+    let hex = format!("{:x}", digest);
+    hex[..16].to_owned()
+}
+
+/// Raw Responses session identity, in priority order:
+///
+/// 1. `prompt_cache_key` — Grok Build's sticky routing key (its own mapping
+///    falls back to conv ids when unset);
+/// 2. `metadata.session_id` / `metadata.user_id` (generic fallback).
+///
+/// Conv-id request headers are checked by the caller (they are not part of
+/// the parsed body). Returns `None` when no stable identity exists.
+pub fn responses_session_raw_id(request: &Value) -> Option<&str> {
+    if let Some(key) = request
+        .get("prompt_cache_key")
+        .and_then(Value::as_str)
+        .filter(|key| !key.is_empty())
+    {
+        return Some(key);
+    }
+    let metadata = request.get("metadata")?.as_object()?;
+    metadata
+        .get("session_id")
+        .and_then(Value::as_str)
+        .or_else(|| metadata.get("user_id").and_then(Value::as_str))
+        .filter(|id| !id.is_empty())
+}
+
 /// Compute and log the stable-prefix telemetry for one request:
 /// `prefix_hash` + `prefix_bytes` (sizes/hashes only, never content), plus
 /// the session fingerprint when a stable identity was extracted.

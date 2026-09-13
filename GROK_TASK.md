@@ -1,120 +1,146 @@
-# GROK_TASK.md — cline-proxy network latency + production deployment
+# cline-proxy OpenAI Responses API frontend (Grok Build)
 
 ## Goal
 
-Repository: `D:\Workspace\cline-proxy` (`https://github.com/jacek4yang/cline-proxy`)
-Production runtime: `D:\Workspace\cline-proxy-bin`
-Target proxy: `socks5://127.0.0.1:10888`
+Repository:
 
-Use Grok 4.6 High. Read `AGENTS.md` and `docs/DEVELOPMENT_STATE.md`, verify latest `main`, then complete implementation, tests, PR/CI/merge, release build, and safe production deployment.
-
-Scope:
-1. reduce outbound Cline TCP/TLS/HTTP latency where measurements justify it;
-2. add first-class SOCKS5 support;
-3. safely configure production to use `socks5://127.0.0.1:10888`;
-4. keep JSONL logging correct;
-5. upgrade `D:\Workspace\cline-proxy-bin` without breaking production.
-
-Do not redesign reasoning/cache/shadow/tool semantics unless a concrete regression is proven.
-
-## Secret safety
-
-`D:\Workspace\cline-proxy-bin\config.json` contains real credentials.
-
-You may let the local binary parse/use it and may modify it structurally, but NEVER print/read its raw contents into Grok context or terminal output. Never expose API keys, Authorization headers, tokens, proxy credentials, or secret-bearing config. Never commit production config/state/logs/temp secret configs.
-
-Before editing production config:
-- make a timestamped backup outside Git;
-- edit JSON structurally;
-- preserve unrelated settings;
-- validate the result;
-- never print either config file.
-
-## Work
-
-1. Start from latest `main`; run baseline fmt/check/clippy/tests and audit `Cargo.toml`, `src/upstream.rs`, `src/config.rs`, `src/main.rs`, `src/obs.rs`, `config.example.json`, README.
-
-2. Add optional upstream proxy config:
-
-```json
-"upstream": {
-  "proxy": "socks5://127.0.0.1:10888"
-}
+```
+https://github.com/jacek4yang/cline-proxy
 ```
 
-`null` = deterministic direct mode. Support `socks5h://` if cleanly supported; document DNS semantics.
+Primary reference implementation:
 
-Requirements:
-- enable minimal Reqwest SOCKS support;
-- keep exactly one shared `reqwest::Client`;
-- proxy only outbound Cline traffic;
-- preserve rustls, HTTP/2, connection pooling, keepalive, gzip, and existing timeout behavior;
-- validate proxy URL at startup;
-- direct mode must not silently inherit unwanted environment proxies;
-- SOCKS/network errors do not rotate API keys;
-- only effective HTTP 429 may fail over;
-- never replay a committed stream;
-- no automatic direct retry after an uncertain proxied POST.
+```
+https://github.com/jacek4yang/codebuddy-proxy
+```
 
-3. Audit network latency before changing defaults:
-- client reuse;
-- TCP/TLS connection reuse;
-- HTTP/2 reuse;
-- pool idle timeout;
-- TCP/HTTP2 keepalive;
-- DNS path;
-- unnecessary connection recreation;
-- unnecessary body copies.
+Implement production-quality OpenAI Responses API (`POST /v1/responses`)
+compatibility so **Grok Build** (`api_backend = "responses"`) can run against
+this gateway, using Cline as the upstream OpenAI-compatible transport.
 
-Keep only safe, measurable improvements. Never disable TLS verification or add unsafe/network hacks.
+The target flow is:
 
-4. Add safe route telemetry:
-`route=direct|socks5|socks5h`, `upstream_headers_ms`, `first_sse_ms`, `first_semantic_ms`, `duration_ms`, transport error class.
-Never log secrets.
+```text
+Grok Build
+  -> POST /v1/responses
+  -> Responses request normalization (input items, tools, tool_choice,
+     reasoning effort, max_output_tokens, prompt_cache_key)
+  -> OpenAI Chat Completions body (same shape the Anthropic frontend emits)
+  -> GLM policy (optimize_request) + reasoning shadow + prefix telemetry
+  -> Cline upstream (same pool / 429 failover / route invariants)
+  -> upstream chat SSE
+  -> Responses SSE stream converter (typed frames, sequence numbers)
+  -> Grok Build receives a valid Responses stream / response object
+```
 
-5. Run controlled sequential A/B using the real config through an isolated proxy:
-`direct` vs `socks5://127.0.0.1:10888`.
+This task is the Responses frontend only.
 
-Use comparable model/key/request class and multiple warm samples. Report median/spread for headers, first SSE, first semantic, total duration, and transport errors. Separate network latency from model generation time; do not claim SOCKS5 is faster without evidence.
+Do not redesign the Anthropic frontend, WebSearch server-tool loop, reasoning
+policy, cache behavior, key pool, 429 classification, or routing.
 
-6. If SOCKS5 validates successfully, update `D:\Workspace\cline-proxy-bin\config.json` to `socks5://127.0.0.1:10888`:
-- timestamped config backup first;
-- structurally change only `upstream.proxy`;
-- preserve every other setting;
-- validate with the real parser;
-- never print config contents.
-If 10888 is unreachable or invalid, leave production config unchanged.
+## Required workflow
 
-7. Keep logging architecture:
-- stderr = compact human summaries;
-- `logs\events-*.jsonl` = bounded structured records.
-Verify no `writer closed`, no ANSI in redirected output, no verbose INFO duplication, no prompt/reasoning/tool/API/proxy secrets, and logging never blocks inference.
+Read `AGENTS.md`, relevant docs, current source, tests, and the latest `main`
+before editing.
 
-8. Build `cargo build --release`. Validate new binary first on isolated bind/state/log paths using the real config:
-- stream=true;
-- stream=false;
-- harmless tool call;
-- SOCKS5 route;
-- JSONL;
-- restart logging;
-- redirected output contains no ANSI.
+Port the proven architecture from `codebuddy-proxy`:
 
-Then safely deploy:
-- stop current production proxy cleanly;
-- back up current `cline-proxy.exe`;
-- preserve config/state/historical logs;
-- copy final `target\release\cline-proxy.exe` to `D:\Workspace\cline-proxy-bin\cline-proxy.exe`;
-- start from production directory;
-- verify SOCKS5 route;
-- run one real Claude Code smoke request;
-- verify JSONL;
-- if validation fails, immediately restore previous exe/config backup.
+- `src/responses/request.rs` — Responses → chat conversion;
+- `src/responses/stream.rs` — chat SSE → Responses SSE converter;
+- `src/responses/types.rs` — wire types, usage mapping, IDs;
+- `src/server/responses_pump.rs` — streaming pump + non-stream aggregation;
+- the `/v1/responses` handler in the orchestrator (session extraction from
+  `prompt_cache_key` / `x-grok-conv-id`, error envelope, observability).
 
-Do not overwrite a running executable or delete production evidence.
+Adapt them to `cline-proxy` instead of copying CodeBuddy-specific policy:
 
-9. Add regression tests for direct/socks5/socks5h config, invalid proxy URLs, secret redaction, route logging, transport failure not rotating keys, and existing stream/no-replay behavior.
+- session identity is fingerprinted with `cache::session_fingerprint`
+  (domain-tagged so Responses fingerprints never collide with Anthropic
+  ones); the raw key is never logged or forwarded;
+- the GLM policy step (`optimize::optimize_request` with
+  `Origin::OpenAi`) runs on the converted chat body — explicit reasoning
+  effort, bounded output, historical-thinking strip, safe compaction,
+  canonical tool JSON, prefix telemetry all apply unchanged;
+- reasoning shadow restore/store follows the same epoch rules as the OpenAI
+  chat path (`request_starts_new_epoch`);
+- streaming uses the same `StreamWatch` timeouts, ping keepalive, no-replay
+  discipline, and bounded observability as the other frontends;
+- non-stream uses ONE upstream streaming generation aggregated locally
+  (issue #14 strategy) — never a second generation for shape conversion;
+- errors use the OpenAI error envelope (the Anthropic envelope would fail
+  Grok Build's error parser).
 
-Final gates:
+## Protocol scope (from the verified reference)
+
+Request conversion:
+
+- `input` string → one user message; item array converts in order;
+- `message` items: roles system/developer/user/assistant; content parts
+  `input_text`/`output_text`/`refusal` joined in order; images rejected;
+- `function_call` history → assistant `tool_calls` with the SAME `call_id`;
+  consecutive calls of one assistant turn merged into one message;
+- `function_call_output` → `role=tool` with `tool_call_id = call_id`;
+- historical `reasoning` items dropped (never replayed onto the wire);
+- `item_reference` rejected (stateless proxy);
+- flat function tools → nested OpenAI function tools, schemas byte-identical;
+- hosted backend tools (`web_search`, `x_search`, …) dropped, never
+  forwarded, never a hard failure;
+- `max_output_tokens` → `max_tokens` (never dropped);
+- `temperature`, `top_p` copied; `tool_choice` string modes and
+  `{type: "function", name}` mapped; `prompt_cache_key` forwarded verbatim;
+- `reasoning.effort` maps none/minimal/low→low, medium/high/xhigh/max→high;
+  `reasoning.summary` present → reasoning exposure requested (the
+  `requested_only` gate).
+
+Stream events (exact typed shapes, monotonic `sequence_number`):
+
+- `response.created`, `response.in_progress`;
+- `response.output_item.added` (reasoning) + summary part/text deltas +
+  done frames — only when exposure was requested;
+- `response.output_item.added` (message), `response.content_part.added`,
+  `response.output_text.delta`, `response.output_text.done`,
+  `response.content_part.done`, `response.output_item.done`;
+- `response.output_item.added` (function_call) ALWAYS precedes its
+  `response.function_call_arguments.delta` / `.done` frames;
+- terminal `response.completed` | `response.incomplete` (length) |
+  `response.failed` (midstream error, never a replay);
+- keepalive is an SSE comment (`: ping`), never a synthetic event frame.
+
+Terminal response object reconstructs the full output (Grok Build replays it
+as next-turn conversation state) with `usage` where Responses
+`input_tokens` is the FULL prompt count and cached tokens are a subset.
+
+## Server wiring
+
+- Route `POST /v1/responses` behind the same auth middleware.
+- `response_log_middleware` protocol label: `responses`.
+- Observability: one summary per request; `protocol: "responses"`.
+- Model resolution via `models.default` + `models.aliases`, same as chat.
+
+## Tests
+
+Add focused coverage (deterministic, offline, mocked loopback upstream):
+
+- request conversion (string input, structured items, tools, hosted-tool
+  drop, reasoning effort mapping, tool history round-trip, unknown items);
+- stream lifecycle (text, tools item-added-before-deltas, reasoning
+  requested-only, usage mapping, incomplete, response.failed);
+- server integration: auth, model alias, stream and non-stream through the
+  real handler with a mocked upstream, shadow restore/store interaction,
+  429 behavior unchanged, no prompt content in logs.
+
+## Safety invariants
+
+- No prompt/reasoning/tool content in logs.
+- Once a downstream stream is committed, never replay on another key.
+- Only effective HTTP 429 participates in key failover.
+- No unbounded buffers; same hot-path rules as the other frontends.
+- Raw session keys (`prompt_cache_key`, conv ids) are fingerprinted before
+  any use and never logged.
+
+## Quality gates
+
+Run:
 
 ```powershell
 cargo fmt --all -- --check
@@ -124,56 +150,25 @@ cargo test --workspace --all-targets --all-features
 cargo test --release --workspace --all-targets --all-features
 ```
 
-Workflow:
-`issue -> branch -> implementation -> tests -> A/B -> PR -> CI -> self-review -> merge -> final main build -> safe production deployment`
+No ignored failures.
 
-No GitHub Release/tag.
+## Workflow
 
-## Final report
+issue -> `feat/responses-api` branch -> implementation -> tests -> full
+gates -> self-review -> PR -> CI -> merge when green.
 
-Return only:
+Do not create a GitHub Release or tag. Do not modify or deploy to
+`D:\Workspace\cline-proxy-bin` in this task.
 
-```text
-NETWORK + PRODUCTION REPORT
+Live validation against the real Cline credential is authorized only with
+isolated bind port / state / logs, tiny output budgets, and no secret
+printing (per AGENTS.md rules).
 
-Final main SHA:
-PR/issue:
+## Definition of done
 
-SOCKS5
-implemented:
-production route:
-direct median headers/semantic:
-SOCKS5 median headers/semantic:
-measured improvement:
-
-NETWORK CHANGES
-...
-
-PRODUCTION
-config updated:
-config backup:
-binary updated:
-binary backup:
-startup:
-Claude Code smoke:
-JSONL:
-ANSI:
-rollback needed:
-
-TESTS
-fmt:
-check:
-clippy:
-debug:
-release:
-CI:
-
-REMAINING LATENCY
-what is still upstream/model-side:
-
-SECRETS
-raw secrets printed: NO
-secret files committed: NO
-```
-
-Do not fabricate measurements. Do not stop after analysis; continue until all safe, feasible work is complete.
+- Grok Build can point `OPENAI_BASE_URL` at the gateway and run a session
+  (streaming and non-streaming) with function tools;
+- responses are valid typed Responses events / response objects;
+- all tests, gates, CI pass;
+- README and `docs/DEVELOPMENT_STATE.md` updated;
+- PR self-reviewed and merged.

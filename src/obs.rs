@@ -860,6 +860,9 @@ pub struct StreamSummary {
     pub sink: Option<LogSink>,
     pub session: Option<String>,
     pub requested_model: String,
+    /// Request id echoed into the summary; the Anthropic stream path
+    /// carries it in the snapshot, the Responses pump path holds it here.
+    pub request_id: String,
     pub upstream_model: String,
     pub model_family: &'static str,
     pub downstream_stream: bool,
