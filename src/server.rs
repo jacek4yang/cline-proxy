@@ -642,6 +642,7 @@ async fn anthropic_messages(
         local_tokens: local_tokens.clone(),
         context_limit_tokens: state.config.glm53.context.upstream_context_window_tokens,
         upstream_headers_ms: None,
+        web_search: crate::obs::WebSearchStats::default(),
     };
     let result = match state
         .upstream
@@ -710,7 +711,7 @@ async fn anthropic_messages(
                 response,
                 anthropic::StreamOptions {
                     request_id: request_id.clone(),
-                    fallback_model: upstream_model,
+                    fallback_model: upstream_model.clone(),
                     key_name: result.selected.name.to_string(),
                     request_started: started,
                     progress_secs: state.config.runtime.stream_progress_secs,
@@ -718,6 +719,16 @@ async fn anthropic_messages(
                     shadow: shadow_context,
                     summary: Some(stream_summary.clone()),
                     timeouts: state.config.upstream.stream_timeouts(),
+                    server_loop: converted.server_tools.web_search.clone().map(|config| {
+                        anthropic::ServerLoopContext {
+                            config,
+                            upstream: state.upstream.clone(),
+                            chat_body: converted.body.clone(),
+                            session_fp: session_fp.clone(),
+                            model: upstream_model.clone(),
+                            selected: result.selected.clone(),
+                        }
+                    }),
                 },
             ))
             .unwrap_or_else(|_| Response::new(Body::empty()));
@@ -725,6 +736,22 @@ async fn anthropic_messages(
         return response;
     }
     // Downstream non-stream: aggregate the upstream stream (issue #14).
+    if let Some(config) = converted.server_tools.web_search.clone() {
+        return complete_nonstream_with_web_search(
+            state,
+            response,
+            result.selected,
+            result.attempt,
+            result.failover_count,
+            converted,
+            config,
+            session_fp,
+            request_id,
+            upstream_model,
+            stream_summary,
+        )
+        .await;
+    }
     let aggregated = match anthropic::aggregate_stream_response(
         response,
         &request_id,
@@ -813,6 +840,248 @@ async fn anthropic_messages(
                 &result.selected.name,
                 result.attempt as u64,
                 result.failover_count as u64,
+                None,
+                "protocol_error",
+                Some("protocol_error"),
+                timings,
+            );
+            protocol_error(error, StatusCode::BAD_GATEWAY, &request_id)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn complete_nonstream_with_web_search(
+    state: AppState,
+    mut response: reqwest::Response,
+    mut selected: crate::pool::SelectedKey,
+    attempt: usize,
+    failover_count: usize,
+    mut converted: anthropic::ConvertedRequest,
+    config: crate::websearch::WebSearchConfig,
+    session_fp: Option<String>,
+    request_id: String,
+    upstream_model: String,
+    mut stream_summary: crate::obs::StreamSummary,
+) -> Response {
+    let server_names = converted.server_tools.server_function_names();
+    let mut uses_left = config.max_uses;
+    let mut generation_rounds = 0u32;
+    let mut extra_blocks: Vec<Value> = Vec::new();
+    let mut web_search_requests = 0u64;
+    let mut stop_override: Option<&'static str> = None;
+    let timeouts = state.config.upstream.stream_timeouts();
+    let last_aggregated = loop {
+        generation_rounds = generation_rounds.saturating_add(1);
+        let aggregated =
+            match anthropic::aggregate_stream_response(response, &request_id, timeouts).await {
+                Ok(parts) => parts,
+                Err(error) => {
+                    let kind = error.stall_kind.unwrap_or("protocol_error");
+                    stream_summary.web_search = stream_summary.web_search.clone();
+                    stream_summary.emit_outcome(
+                        &request_id,
+                        &selected.name,
+                        attempt as u64,
+                        failover_count as u64,
+                        None,
+                        kind,
+                        Some(kind),
+                        crate::obs::OutcomeTimings {
+                            upstream_status: Some(200),
+                            ..crate::obs::OutcomeTimings::default()
+                        },
+                    );
+                    return protocol_error(error, StatusCode::BAD_GATEWAY, &request_id);
+                }
+            };
+        let calls = crate::websearch::extract_openai_tool_calls(&aggregated.body);
+        let kind = crate::websearch::classify_round(&calls, &server_names);
+        let server_calls: Vec<_> = calls
+            .iter()
+            .filter(|call| server_names.contains(&call.name))
+            .cloned()
+            .collect();
+        match kind {
+            crate::websearch::ToolRoundKind::None | crate::websearch::ToolRoundKind::ClientOnly => {
+                break aggregated;
+            }
+            crate::websearch::ToolRoundKind::Mixed => {
+                stream_summary.web_search.mixed_tool_rounds = stream_summary
+                    .web_search
+                    .mixed_tool_rounds
+                    .saturating_add(1);
+                let search_started = Instant::now();
+                let outcomes = anthropic::execute_web_search_round(
+                    &server_calls,
+                    &config,
+                    &mut uses_left,
+                    &state.upstream,
+                    &selected,
+                    &request_id,
+                    session_fp.as_deref(),
+                )
+                .await;
+                stream_summary
+                    .web_search
+                    .record_outcomes(&outcomes, search_started.elapsed().as_millis() as u64);
+                for (call, outcome) in server_calls.iter().zip(outcomes.iter()) {
+                    let id = crate::websearch::new_server_tool_id();
+                    let _ = call;
+                    let (use_block, result_block) = crate::websearch::client_blocks(&id, outcome);
+                    extra_blocks.push(use_block);
+                    extra_blocks.push(result_block);
+                    web_search_requests = web_search_requests.saturating_add(1);
+                }
+                break aggregated;
+            }
+            crate::websearch::ToolRoundKind::ServerOnly => {
+                stream_summary.web_search.server_tool_rounds = stream_summary
+                    .web_search
+                    .server_tool_rounds
+                    .saturating_add(1);
+                let budget_exhausted = uses_left == 0
+                    || generation_rounds >= crate::websearch::MAX_INTERNAL_GENERATION_ROUNDS;
+                let search_started = Instant::now();
+                let outcomes = if budget_exhausted {
+                    server_calls
+                        .iter()
+                        .map(|call| {
+                            crate::websearch::SearchOutcome::failed(
+                                crate::websearch::query_from_arguments(&call.arguments)
+                                    .unwrap_or_default(),
+                                crate::websearch::SearchErrorCode::MaxUsesExceeded,
+                            )
+                        })
+                        .collect()
+                } else {
+                    anthropic::execute_web_search_round(
+                        &server_calls,
+                        &config,
+                        &mut uses_left,
+                        &state.upstream,
+                        &selected,
+                        &request_id,
+                        session_fp.as_deref(),
+                    )
+                    .await
+                };
+                stream_summary
+                    .web_search
+                    .record_outcomes(&outcomes, search_started.elapsed().as_millis() as u64);
+                for outcome in &outcomes {
+                    let id = crate::websearch::new_server_tool_id();
+                    let (use_block, result_block) = crate::websearch::client_blocks(&id, outcome);
+                    extra_blocks.push(use_block);
+                    extra_blocks.push(result_block);
+                    web_search_requests = web_search_requests.saturating_add(1);
+                }
+                if budget_exhausted {
+                    stream_summary.web_search.pause_turns =
+                        stream_summary.web_search.pause_turns.saturating_add(1);
+                    stop_override = Some("pause_turn");
+                    break aggregated;
+                }
+                crate::websearch::append_server_round(
+                    &mut converted.body,
+                    &server_calls,
+                    &outcomes,
+                );
+                let body_bytes = match serde_json::to_vec(&converted.body) {
+                    Ok(bytes) => Bytes::from(bytes),
+                    Err(_) => {
+                        return anthropic_error(
+                            StatusCode::BAD_GATEWAY,
+                            "api_error",
+                            "search continuation could not be serialized",
+                            &request_id,
+                        )
+                    }
+                };
+                match state
+                    .upstream
+                    .send_chat(
+                        body_bytes,
+                        true,
+                        &request_id,
+                        &upstream_model,
+                        session_fp.as_deref(),
+                    )
+                    .await
+                {
+                    Ok(next) => {
+                        selected = next.selected;
+                        match next.response {
+                            UpstreamResponse::Success(next_response) => {
+                                response = next_response;
+                            }
+                            UpstreamResponse::HttpError(error) => {
+                                return sanitized_upstream_error(&state, error, true, &request_id)
+                            }
+                        }
+                    }
+                    Err(error) => return upstream_failure(&state, error, true, &request_id),
+                }
+            }
+        }
+    };
+    let aggregated = last_aggregated;
+    store_reasoning_shadow(
+        &state,
+        aggregated.body.as_object(),
+        session_fp.as_deref(),
+        &request_id,
+    );
+    let timings = crate::obs::OutcomeTimings {
+        first_reasoning_ms: aggregated.first_reasoning_ms,
+        first_text_ms: aggregated.first_text_ms,
+        first_tool_call_ms: aggregated.first_tool_call_ms,
+        first_semantic_ms: aggregated.first_semantic_ms,
+        first_sse_event_ms: aggregated.first_event_ms,
+        first_upstream_byte_ms: aggregated.first_byte_ms,
+        last_upstream_progress_ms: aggregated.last_byte_ms,
+        last_semantic_progress_ms: aggregated.last_semantic_ms,
+        upstream_duration_ms: Some(aggregated.duration_ms),
+        text_bytes: aggregated.text_bytes,
+        reasoning_bytes: aggregated.reasoning_bytes,
+        tool_call_bytes: aggregated.tool_call_bytes,
+        text_events: aggregated.text_events,
+        reasoning_events: aggregated.reasoning_events,
+        tool_call_events: aggregated.tool_call_events,
+        response_shape: Some(aggregated.shape.as_str()),
+        upstream_status: Some(200),
+    };
+    match anthropic::convert_response_with(
+        &aggregated.body,
+        &request_id,
+        &upstream_model,
+        converted.expose_thinking,
+        anthropic::ConvertedResponseOptions {
+            extra_prefix: &extra_blocks,
+            skip_tool_names: &server_names,
+            web_search_requests,
+            stop_reason_override: stop_override,
+        },
+    ) {
+        Ok(value) => {
+            stream_summary.emit_outcome(
+                &request_id,
+                &selected.name,
+                attempt as u64,
+                failover_count as u64,
+                value.get("usage"),
+                "complete",
+                None,
+                timings,
+            );
+            json_response(StatusCode::OK, value, &request_id)
+        }
+        Err(error) => {
+            stream_summary.emit_outcome(
+                &request_id,
+                &selected.name,
+                attempt as u64,
+                failover_count as u64,
                 None,
                 "protocol_error",
                 Some("protocol_error"),
@@ -1786,7 +2055,9 @@ mod tests {
     #[derive(Clone, Default)]
     struct MockUpstream {
         sequences: Arc<Mutex<HashMap<String, VecDeque<Spec>>>>,
+        search_sequences: Arc<Mutex<VecDeque<Spec>>>,
         calls: Arc<Mutex<Vec<SeenRequest>>>,
+        search_calls: Arc<Mutex<Vec<SeenRequest>>>,
     }
 
     impl MockUpstream {
@@ -1799,6 +2070,14 @@ mod tests {
 
         async fn seen(&self) -> Vec<SeenRequest> {
             self.calls.lock().await.clone()
+        }
+
+        async fn set_search(&self, specs: Vec<Spec>) {
+            *self.search_sequences.lock().await = VecDeque::from(specs);
+        }
+
+        async fn seen_search(&self) -> Vec<SeenRequest> {
+            self.search_calls.lock().await.clone()
         }
     }
 
@@ -1883,8 +2162,38 @@ mod tests {
 
     async fn start_mock() -> (String, MockUpstream, tokio::task::JoinHandle<()>) {
         let mock = MockUpstream::default();
+        async fn mock_search_handler(
+            State(mock): State<MockUpstream>,
+            headers: HeaderMap,
+            body: Bytes,
+        ) -> Response {
+            let authorization = headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            let parsed = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            mock.search_calls.lock().await.push(SeenRequest {
+                authorization,
+                headers,
+                body: parsed,
+            });
+            let spec = mock
+                .search_sequences
+                .lock()
+                .await
+                .pop_front()
+                .unwrap_or_else(|| Spec::json(500, r#"{"error":{"message":"unscripted search"}}"#));
+            Response::builder()
+                .status(spec.status)
+                .header(header::CONTENT_TYPE, spec.content_type)
+                .body(Body::from(spec.body))
+                .unwrap()
+        }
+
         let app = Router::new()
             .route("/api/v1/chat/completions", post(mock_handler))
+            .route("/api/v1/search/websearch", post(mock_search_handler))
             .with_state(mock.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -3933,6 +4242,302 @@ mod tests {
         assert!(!body.contains("Daily free limit"));
         state.flush_runtime_state();
         std::fs::remove_dir_all(state_path.parent().unwrap()).ok();
+        task.abort();
+    }
+
+    fn web_search_anthropic_body(stream: bool) -> String {
+        json!({
+            "model":"claude-sonnet-4-6",
+            "max_tokens":128,
+            "stream":stream,
+            "messages":[{"role":"user","content":"What is the latest Rust version?"}],
+            "tools":[{"type":"web_search_20250305","name":"web_search","max_uses":3}]
+        })
+        .to_string()
+    }
+
+    fn web_search_tool_sse() -> String {
+        format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            json!({"id":"chat_1","model":"z-ai/glm-5.3-flash",
+            "choices":[{"delta":{"tool_calls":[{
+                "index":0,"id":"call_ws","function":{"name":"web_search","arguments":"{\"query\":\"rust release\"}"}
+            }]}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}],
+                "usage":{"prompt_tokens":9,"completion_tokens":4}})
+        )
+    }
+
+    fn search_envelope() -> String {
+        json!({
+            "data": {"results": [
+                {"title":"Rust 1.x","url":"https://blog.rust-lang.org/release","snippet":"release notes","page_age":"1 day"}
+            ]}
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn anthropic_web_search_stream_executes_cline_and_continues() {
+        let (base, mock, task) = start_mock().await;
+        mock.set(
+            "cline-key-1",
+            vec![
+                Spec::sse(web_search_tool_sse()),
+                Spec::sse(successful_sse("The latest Rust is 1.x.")),
+            ],
+        )
+        .await;
+        mock.set_search(vec![Spec::json(200, search_envelope())])
+            .await;
+        let app = router(AppState::new(test_config(base, 1)).unwrap());
+        let response = app
+            .oneshot(gateway_request(
+                "/v1/messages",
+                web_search_anthropic_body(true),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains("server_tool_use"), "{body}");
+        assert!(body.contains("web_search_tool_result"), "{body}");
+        assert!(
+            body.contains("https://blog.rust-lang.org/release"),
+            "{body}"
+        );
+        assert!(body.contains("The latest Rust is 1.x."), "{body}");
+        assert!(body.contains("event: message_stop"));
+        assert_eq!(body.matches("event: message_stop").count(), 1);
+        assert_eq!(body.matches("event: message_start").count(), 1);
+        assert!(!body.contains("encrypted"));
+        let search_calls = mock.seen_search().await;
+        assert_eq!(search_calls.len(), 1);
+        assert_eq!(search_calls[0].body["query"], "rust release");
+        assert!(search_calls[0].body.get("blocked_domains").is_none());
+        assert_eq!(search_calls[0].authorization, "Bearer cline-key-1");
+        let chat_calls = mock.seen().await;
+        assert_eq!(chat_calls.len(), 2);
+        assert_eq!(
+            chat_calls[1].body["messages"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()["role"],
+            "tool"
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn anthropic_web_search_nonstream_aggregates_server_blocks() {
+        let (base, mock, task) = start_mock().await;
+        mock.set(
+            "cline-key-1",
+            vec![
+                Spec::sse(web_search_tool_sse()),
+                Spec::sse(successful_sse("Grounded answer.")),
+            ],
+        )
+        .await;
+        mock.set_search(vec![Spec::json(200, search_envelope())])
+            .await;
+        let app = router(AppState::new(test_config(base, 1)).unwrap());
+        let response = app
+            .oneshot(gateway_request(
+                "/v1/messages",
+                web_search_anthropic_body(false),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: Value = serde_json::from_str(&response_text(response).await).unwrap();
+        let types: Vec<_> = value["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|block| block["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(types, ["server_tool_use", "web_search_tool_result", "text"]);
+        assert_eq!(value["stop_reason"], "end_turn");
+        assert_eq!(value["usage"]["server_tool_use"]["web_search_requests"], 1);
+        assert!(!response_text_contains_secret(&value));
+        task.abort();
+    }
+
+    fn response_text_contains_secret(value: &Value) -> bool {
+        let encoded = value.to_string();
+        encoded.contains("cline-key-") || encoded.contains("gateway-secret")
+    }
+
+    #[tokio::test]
+    async fn anthropic_web_search_budget_pause_turn_does_not_call_cline() {
+        let (base, mock, task) = start_mock().await;
+        mock.set(
+            "cline-key-1",
+            vec![
+                Spec::sse(web_search_tool_sse()),
+                Spec::sse(web_search_tool_sse()),
+            ],
+        )
+        .await;
+        mock.set_search(vec![Spec::json(200, search_envelope())])
+            .await;
+        let app = router(AppState::new(test_config(base, 1)).unwrap());
+        let body = json!({
+            "model":"claude-sonnet-4-6",
+            "max_tokens":128,
+            "stream":false,
+            "messages":[{"role":"user","content":"search"}],
+            "tools":[{"type":"web_search_20250305","name":"web_search","max_uses":1}]
+        })
+        .to_string();
+        let response = app
+            .oneshot(gateway_request("/v1/messages", body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: Value = serde_json::from_str(&response_text(response).await).unwrap();
+        assert_eq!(value["stop_reason"], "pause_turn");
+        let codes: Vec<_> = value["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|block| block["type"] == "web_search_tool_result")
+            .filter_map(|block| block["content"]["error_code"].as_str())
+            .collect();
+        assert!(codes.contains(&"max_uses_exceeded"), "{value}");
+        assert_eq!(mock.seen_search().await.len(), 1);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn anthropic_web_search_429_is_error_block_not_key_rotation() {
+        let (base, mock, task) = start_mock().await;
+        mock.set(
+            "cline-key-1",
+            vec![
+                Spec::sse(web_search_tool_sse()),
+                Spec::sse(successful_sse("answered without rotating")),
+            ],
+        )
+        .await;
+        mock.set("cline-key-2", vec![Spec::sse(successful_sse("key2"))])
+            .await;
+        mock.set_search(vec![Spec::json(429, r#"{"error":"rate"}"#)])
+            .await;
+        let app = router(AppState::new(test_config(base, 2)).unwrap());
+        let response = app
+            .oneshot(gateway_request(
+                "/v1/messages",
+                web_search_anthropic_body(false),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: Value = serde_json::from_str(&response_text(response).await).unwrap();
+        assert_eq!(
+            value["content"][1]["content"]["error_code"],
+            "too_many_requests"
+        );
+        let state = AppState::new(test_config("http://127.0.0.1:9/api/v1".into(), 2)).unwrap();
+        drop(state);
+        assert_eq!(mock.seen().await[0].authorization, "Bearer cline-key-1");
+        assert_eq!(mock.seen().await[1].authorization, "Bearer cline-key-1");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn anthropic_web_search_domain_filter_is_sent_to_cline() {
+        let (base, mock, task) = start_mock().await;
+        mock.set(
+            "cline-key-1",
+            vec![
+                Spec::sse(web_search_tool_sse()),
+                Spec::sse(successful_sse("filtered")),
+            ],
+        )
+        .await;
+        mock.set_search(vec![Spec::json(200, search_envelope())])
+            .await;
+        let app = router(AppState::new(test_config(base, 1)).unwrap());
+        let body = json!({
+            "model":"claude-sonnet-4-6",
+            "max_tokens":128,
+            "stream":false,
+            "messages":[{"role":"user","content":"search"}],
+            "tools":[{
+                "type":"web_search_20250305",
+                "name":"web_search",
+                "allowed_domains":["rust-lang.org"]
+            }]
+        })
+        .to_string();
+        let response = app
+            .oneshot(gateway_request("/v1/messages", body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let search = &mock.seen_search().await[0].body;
+        assert_eq!(search["allowed_domains"], json!(["rust-lang.org"]));
+        assert!(search.get("blocked_domains").is_none());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn count_tokens_accepts_web_search_declaration() {
+        let (base, _mock, task) = start_mock().await;
+        let app = router(AppState::new(test_config(base, 1)).unwrap());
+        let response = app
+            .oneshot(gateway_request(
+                "/v1/messages/count_tokens",
+                json!({
+                    "model":"claude-sonnet-4-6",
+                    "max_tokens":128,
+                    "messages":[{"role":"user","content":"hi"}],
+                    "tools":[{"type":"web_search_20250305","name":"web_search"}]
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: Value = serde_json::from_str(&response_text(response).await).unwrap();
+        assert!(value["input_tokens"].as_u64().unwrap() > 0);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn client_only_tools_still_work_when_web_search_is_absent() {
+        let (base, mock, task) = start_mock().await;
+        mock.set(
+            "cline-key-1",
+            vec![Spec::sse(format!(
+                "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                json!({"id":"chat","model":"z-ai/glm-5.3-flash","choices":[{"delta":{"tool_calls":[
+                    {"index":0,"id":"call_r","function":{"name":"Read","arguments":"{\"path\":\"a\"}"}}
+                ]}}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})
+            ))],
+        )
+        .await;
+        let app = router(AppState::new(test_config(base, 1)).unwrap());
+        let body = json!({
+            "model":"claude-sonnet-4-6",
+            "max_tokens":128,
+            "stream":true,
+            "messages":[{"role":"user","content":"read"}],
+            "tools":[{"name":"Read","description":"read","input_schema":{"type":"object"}}]
+        })
+        .to_string();
+        let response = app
+            .oneshot(gateway_request("/v1/messages", body))
+            .await
+            .unwrap();
+        let text = response_text(response).await;
+        assert!(text.contains("\"type\":\"tool_use\""));
+        assert!(!text.contains("server_tool_use"));
+        assert!(mock.seen_search().await.is_empty());
         task.abort();
     }
 }

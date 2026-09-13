@@ -48,14 +48,20 @@ pub fn convert_anthropic_to_glm(request: &Value) -> Result<GlmConversion, CountE
 
     let tools = match object.get("tools") {
         Some(Value::Array(tools)) if !tools.is_empty() => {
+            let mut converted = Vec::with_capacity(tools.len());
             for (index, tool) in tools.iter().enumerate() {
                 if !tool.is_object() {
                     return Err(CountError::invalid(format!(
                         "tools[{index}] must be an object"
                     )));
                 }
+                match crate::websearch::convert_declaration(tool) {
+                    Ok(Some(function)) => converted.push(function),
+                    Ok(None) => converted.push(tool.clone()),
+                    Err(error) => return Err(CountError::invalid(error.message)),
+                }
             }
-            Some(tools.clone())
+            Some(converted)
         }
         Some(Value::Array(_)) => None,
         Some(_) => return Err(CountError::invalid("tools must be an array")),
@@ -143,7 +149,7 @@ fn convert_message(
             }
             flush_user(&mut ordinary, output);
         }
-        "assistant" => output.push(convert_assistant(content, index)?),
+        "assistant" => output.extend(convert_assistant(content, index)?),
         other => {
             return Err(CountError::invalid(format!(
                 "messages[{index}].role {other:?} is not supported by the GLM template"
@@ -268,77 +274,134 @@ fn convert_tool_result(
     }))
 }
 
-fn convert_assistant(content: &Value, index: usize) -> Result<Value, CountError> {
-    let mut text = String::new();
-    let mut reasoning = String::new();
-    let mut tool_calls: Vec<Value> = Vec::new();
+fn convert_assistant(content: &Value, index: usize) -> Result<Vec<Value>, CountError> {
     match content {
-        Value::String(inline) => text.push_str(inline),
-        Value::Null => {}
-        Value::Array(blocks) => {
-            for (block_index, block) in blocks.iter().enumerate() {
-                let object = block.as_object().ok_or_else(|| {
-                    CountError::invalid(format!(
-                        "messages[{index}][{block_index}] must be an object"
-                    ))
-                })?;
-                match object.get("type").and_then(Value::as_str) {
-                    Some("text") => {
-                        text.push_str(object.get("text").and_then(Value::as_str).ok_or_else(
-                            || {
-                                CountError::invalid(format!(
-                                    "messages[{index}][{block_index}] text block needs a string text"
-                                ))
-                            },
-                        )?);
-                    }
-                    Some("thinking") => {
-                        if let Some(thinking) = object.get("thinking").and_then(Value::as_str) {
-                            reasoning.push_str(thinking);
-                        }
-                    }
-                    // Redacted thinking is opaque ciphertext upstream; the
-                    // official template renders nothing for it, so it
-                    // contributes nothing here either.
-                    Some("redacted_thinking") => {}
-                    Some("tool_use") => {
-                        let name = object.get("name").and_then(Value::as_str).ok_or_else(|| {
-                            CountError::invalid(format!(
-                                "messages[{index}][{block_index}] tool_use needs a name"
-                            ))
-                        })?;
-                        let input = object.get("input").cloned().unwrap_or_else(|| json!({}));
-                        if !input.is_object() {
-                            return Err(CountError::invalid(format!(
-                                "messages[{index}][{block_index}] tool_use input must be an object"
-                            )));
-                        }
-                        tool_calls.push(json!({"function": {"name": name, "arguments": input}}));
-                    }
-                    other => {
-                        return Err(CountError::invalid(format!(
-                            "messages[{index}][{block_index}] has unsupported assistant block type {other:?}"
-                        )))
-                    }
+        Value::String(inline) => Ok(vec![json!({
+            "role": "assistant",
+            "content": inline,
+        })]),
+        Value::Null => Ok(vec![json!({
+            "role": "assistant",
+            "content": "",
+        })]),
+        Value::Array(blocks) => convert_assistant_blocks(blocks, index),
+        _ => Err(CountError::invalid(format!(
+            "messages[{index}] assistant content must be a string or array"
+        ))),
+    }
+}
+
+fn convert_assistant_blocks(blocks: &[Value], index: usize) -> Result<Vec<Value>, CountError> {
+    #[derive(Default)]
+    struct Segment {
+        text: String,
+        reasoning: String,
+        tool_calls: Vec<Value>,
+    }
+    impl Segment {
+        fn is_empty(&self) -> bool {
+            self.text.is_empty() && self.reasoning.is_empty() && self.tool_calls.is_empty()
+        }
+        fn into_message(self) -> Value {
+            let mut message = Map::new();
+            message.insert("role".into(), Value::String("assistant".into()));
+            message.insert("content".into(), Value::String(self.text));
+            if !self.reasoning.is_empty() {
+                message.insert("reasoning_content".into(), Value::String(self.reasoning));
+            }
+            if !self.tool_calls.is_empty() {
+                message.insert("tool_calls".into(), Value::Array(self.tool_calls));
+            }
+            Value::Object(message)
+        }
+    }
+    let mut output = Vec::new();
+    let mut segment = Segment::default();
+    let mut server_calls: Vec<Value> = Vec::new();
+    let flush = |output: &mut Vec<Value>, segment: &mut Segment| {
+        if !segment.is_empty() {
+            output.push(std::mem::take(segment).into_message());
+        }
+    };
+    for (block_index, block) in blocks.iter().enumerate() {
+        let object = block.as_object().ok_or_else(|| {
+            CountError::invalid(format!(
+                "messages[{index}][{block_index}] must be an object"
+            ))
+        })?;
+        match object.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                segment
+                    .text
+                    .push_str(object.get("text").and_then(Value::as_str).ok_or_else(|| {
+                        CountError::invalid(format!(
+                            "messages[{index}][{block_index}] text block needs a string text"
+                        ))
+                    })?);
+            }
+            Some("thinking") => {
+                if let Some(thinking) = object.get("thinking").and_then(Value::as_str) {
+                    segment.reasoning.push_str(thinking);
                 }
             }
-        }
-        _ => {
-            return Err(CountError::invalid(format!(
-                "messages[{index}] assistant content must be a string or array"
+            Some("redacted_thinking") => {}
+            Some("tool_use") | Some("server_tool_use") => {
+                let name = object.get("name").and_then(Value::as_str).ok_or_else(|| {
+                    CountError::invalid(format!(
+                        "messages[{index}][{block_index}] tool_use needs a name"
+                    ))
+                })?;
+                let input = object.get("input").cloned().unwrap_or_else(|| json!({}));
+                if !input.is_object() {
+                    return Err(CountError::invalid(format!(
+                        "messages[{index}][{block_index}] tool_use input must be an object"
+                    )));
+                }
+                let call = json!({"function": {"name": name, "arguments": input}});
+                if object.get("type").and_then(Value::as_str) == Some("server_tool_use") {
+                    flush(&mut output, &mut segment);
+                    server_calls.push(call);
+                } else {
+                    segment.tool_calls.push(call);
+                }
+            }
+            Some("web_search_tool_result") => {
+                let tool_use_id = object
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("srvtoolu_unknown");
+                if !server_calls.is_empty() {
+                    output.push(json!({
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": std::mem::take(&mut server_calls)
+                    }));
+                }
+                output.push(json!({
+                    "role": "tool",
+                    "tool_call_id": tool_use_id,
+                    "content": crate::websearch::replayed_result_text(block),
+                }));
+            }
+            other => {
+                return Err(CountError::invalid(format!(
+                "messages[{index}][{block_index}] has unsupported assistant block type {other:?}"
             )))
+            }
         }
     }
-    let mut message = Map::new();
-    message.insert("role".into(), Value::String("assistant".into()));
-    message.insert("content".into(), Value::String(text));
-    if !reasoning.is_empty() {
-        message.insert("reasoning_content".into(), Value::String(reasoning));
+    if !server_calls.is_empty() {
+        output.push(json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": server_calls
+        }));
     }
-    if !tool_calls.is_empty() {
-        message.insert("tool_calls".into(), Value::Array(tool_calls));
+    flush(&mut output, &mut segment);
+    if output.is_empty() {
+        output.push(json!({"role": "assistant", "content": ""}));
     }
-    Ok(Value::Object(message))
+    Ok(output)
 }
 
 /// System and user display content: strings stay strings; block arrays keep

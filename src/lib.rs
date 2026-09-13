@@ -18,3 +18,4 @@ pub mod server;
 pub mod state;
 pub mod stream_watch;
 pub mod upstream;
+pub mod websearch;

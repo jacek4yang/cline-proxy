@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use bytes::Bytes;
+use serde_json::Value;
 use thiserror::Error;
 
 use crate::config::Config;
@@ -42,6 +43,7 @@ pub struct ClineUpstream {
 struct Inner {
     http: reqwest::Client,
     chat_url: reqwest::Url,
+    search_url: reqwest::Url,
     headers: HeaderMap,
     pool: KeyPool,
     fallback_cooldown: Duration,
@@ -112,6 +114,8 @@ impl ClineUpstream {
         let chat_url =
             reqwest::Url::parse(&format!("{}{}", base, config.upstream.chat_path.as_str()))
                 .context("building Cline chat-completions URL")?;
+        let search_url = reqwest::Url::parse(&format!("{base}/search/websearch"))
+            .context("building Cline websearch URL")?;
         let mut headers = HeaderMap::new();
         for (name, value) in &config.upstream.headers {
             headers.insert(
@@ -137,6 +141,7 @@ impl ClineUpstream {
             inner: Arc::new(Inner {
                 http,
                 chat_url,
+                search_url,
                 headers,
                 pool,
                 fallback_cooldown: Duration::from_secs(config.upstream.fallback_429_cooldown_secs),
@@ -161,6 +166,113 @@ impl ClineUpstream {
             .iter()
             .map(String::as_str)
             .collect()
+    }
+
+    /// Execute one Cline `/search/websearch` call with the same HTTP client,
+    /// static headers, selected credential, request-id, and X-Task-ID as
+    /// chat. Failures become a `SearchOutcome` error; they never rotate the
+    /// chat key pool.
+    pub async fn search_web(
+        &self,
+        selected: &SelectedKey,
+        query: &str,
+        domains: Option<&crate::websearch::DomainFilter>,
+        request_id: &str,
+        session_fp: Option<&str>,
+    ) -> crate::websearch::SearchOutcome {
+        use crate::websearch::{
+            cline_search_body, error_code_for_status, parse_cline_results, SearchErrorCode,
+            SearchOutcome, MAX_SEARCH_RESPONSE_BYTES, SEARCH_TIMEOUT_SECS,
+        };
+        let body = cline_search_body(query, domains);
+        let encoded = match serde_json::to_vec(&body) {
+            Ok(bytes) => bytes,
+            Err(_) => return SearchOutcome::failed(query, SearchErrorCode::InvalidToolInput),
+        };
+        if encoded.len() > MAX_SEARCH_RESPONSE_BYTES {
+            return SearchOutcome::failed(query, SearchErrorCode::RequestTooLarge);
+        }
+        let mut headers =
+            match self.credential_headers(selected, request_id, session_fp, "application/json") {
+                Ok(headers) => headers,
+                Err(_) => return SearchOutcome::failed(query, SearchErrorCode::Unavailable),
+            };
+        headers.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
+        let started = Instant::now();
+        let result = self
+            .inner
+            .http
+            .post(self.inner.search_url.clone())
+            .headers(headers)
+            .timeout(Duration::from_secs(SEARCH_TIMEOUT_SECS))
+            .body(encoded)
+            .send()
+            .await;
+        let elapsed_ms = started.elapsed().as_millis();
+        match result {
+            Err(error) => {
+                let class = transport_error_class(&error);
+                tracing::warn!(
+                    request_id,
+                    selected_key_name = %selected.name,
+                    duration_ms = elapsed_ms,
+                    error_class = class,
+                    "Cline web search request failed"
+                );
+                SearchOutcome::failed(query, SearchErrorCode::Unavailable)
+            }
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let raw = read_limited(response, MAX_SEARCH_RESPONSE_BYTES).await;
+                tracing::debug!(
+                    request_id,
+                    selected_key_name = %selected.name,
+                    duration_ms = elapsed_ms,
+                    status,
+                    result_bytes = raw.len(),
+                    "Cline web search response"
+                );
+                if status != 200 {
+                    return SearchOutcome::failed(query, error_code_for_status(status));
+                }
+                match serde_json::from_slice::<Value>(&raw) {
+                    Ok(doc) => parse_cline_results(&doc, query),
+                    Err(_) => SearchOutcome::failed(query, SearchErrorCode::Unavailable),
+                }
+            }
+        }
+    }
+
+    fn credential_headers(
+        &self,
+        selected: &SelectedKey,
+        request_id: &str,
+        session_fp: Option<&str>,
+        accept: &'static str,
+    ) -> std::result::Result<HeaderMap, ()> {
+        let mut headers = self.inner.headers.clone();
+        headers.insert(header::ACCEPT, HeaderValue::from_static(accept));
+        if let Some(session_fp) = session_fp {
+            let task_id = crate::cache::upstream_task_id(
+                &self.inner.session_secret,
+                session_fp,
+                selected.api_key(),
+            );
+            if let Ok(value) = HeaderValue::try_from(task_id) {
+                headers.insert("x-task-id", value);
+            }
+        }
+        let authorization = format!("Bearer {}", selected.api_key());
+        match HeaderValue::try_from(authorization) {
+            Ok(value) => {
+                headers.insert(header::AUTHORIZATION, value);
+            }
+            Err(_) => return Err(()),
+        }
+        if let Ok(value) = HeaderValue::try_from(request_id) {
+            headers.insert("x-request-id", value);
+        }
+        Ok(headers)
     }
 
     /// Send one logical chat request. Only a classified effective HTTP 429 can

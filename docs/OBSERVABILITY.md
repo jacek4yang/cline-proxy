@@ -52,6 +52,10 @@ counters, timings) and emits exactly one record on completion:
   usage), `reserved_output_tokens`, `total_context_budget`,
   `first_sse_event_ms`, `first_semantic_ms` (`ttft_ms` aliases this),
   `upstream_headers_ms`, `text/reasoning/tool_call_{bytes,events}`.
+  WebSearch (when used): `web_search.web_searches` / `web_search_errors` /
+  `web_search_rounds` / `web_search_results` / `web_search_ms` /
+  `server_tool_rounds` / `mixed_tool_rounds` / `pause_turns`. Never query
+  text, snippets, URLs, or credentials.
 
   jq examples:
 
