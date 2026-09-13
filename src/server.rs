@@ -4508,6 +4508,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_result_tool_reference_is_not_a_400() {
+        let (base, mock, task) = start_mock().await;
+        mock.set("cline-key-1", vec![Spec::sse(successful_sse("ok"))])
+            .await;
+        let app = router(AppState::new(test_config(base, 1)).unwrap());
+        let response = app
+            .oneshot(gateway_request(
+                "/v1/messages",
+                json!({
+                    "model":"claude-sonnet-4-6",
+                    "max_tokens":128,
+                    "stream":false,
+                    "messages":[
+                        {"role":"user","content":"fetch"},
+                        {"role":"assistant","content":[
+                            {"type":"tool_use","id":"toolu_wf1","name":"WebFetch",
+                             "input":{"url":"https://example.com"}}
+                        ]},
+                        {"role":"user","content":[
+                            {"type":"tool_result","tool_use_id":"toolu_wf1","content":[
+                                {"type":"tool_reference","tool_name":"WebFetch"},
+                                {"type":"search_result","title":"Example Domain",
+                                 "url":"https://example.com","content":"example page"}
+                            ]}
+                        ]}
+                    ]
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let seen = mock.seen().await;
+        assert_eq!(seen.len(), 1);
+        let tool = seen[0].body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .expect("upstream tool message");
+        let encoded = tool["content"].to_string();
+        assert!(encoded.contains("[tool reference: WebFetch]"), "{encoded}");
+        assert!(encoded.contains("https://example.com"), "{encoded}");
+        assert!(encoded.contains("Example Domain"), "{encoded}");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn count_tokens_accepts_tool_reference_in_tool_result() {
+        let (base, _mock, task) = start_mock().await;
+        let app = router(AppState::new(test_config(base, 1)).unwrap());
+        let response = app
+            .oneshot(gateway_request(
+                "/v1/messages/count_tokens",
+                json!({
+                    "model":"claude-sonnet-4-6",
+                    "max_tokens":128,
+                    "messages":[
+                        {"role":"user","content":"fetch"},
+                        {"role":"assistant","content":[
+                            {"type":"tool_use","id":"toolu_wf1","name":"WebFetch","input":{}}
+                        ]},
+                        {"role":"user","content":[
+                            {"type":"tool_result","tool_use_id":"toolu_wf1","content":[
+                                {"type":"tool_reference","tool_name":"WebFetch"}
+                            ]}
+                        ]}
+                    ]
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: Value = serde_json::from_str(&response_text(response).await).unwrap();
+        assert!(value["input_tokens"].as_u64().unwrap() > 0);
+        task.abort();
+    }
+
+    #[tokio::test]
     async fn client_only_tools_still_work_when_web_search_is_absent() {
         let (base, mock, task) = start_mock().await;
         mock.set(

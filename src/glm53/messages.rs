@@ -252,6 +252,29 @@ fn convert_tool_result(
                         message_index,
                         block_index,
                     )?),
+                    Some("tool_reference") => {
+                        let name = block_object
+                            .get("tool_name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("?");
+                        converted.push(json!({
+                            "type": "text",
+                            "text": format!("[tool reference: {name}]"),
+                        }));
+                    }
+                    Some("search_result") => {
+                        let title = block_object
+                            .get("title")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let url = block_object.get("url").and_then(Value::as_str).unwrap_or("");
+                        let mut text = format!("{title}\n{url}");
+                        if let Some(quote) = block_object.get("content").and_then(Value::as_str) {
+                            text.push('\n');
+                            text.push_str(quote);
+                        }
+                        converted.push(json!({"type": "text", "text": text}));
+                    }
                     other => {
                         return Err(CountError::invalid(format!(
                             "messages[{message_index}][{block_index}] content[{item_index}] has unsupported type {other:?}"
