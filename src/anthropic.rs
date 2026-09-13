@@ -644,19 +644,7 @@ fn convert_tool_result(
         Value::Array(
             blocks
                 .iter()
-                .map(|block| {
-                    let object = block.as_object().ok_or_else(|| {
-                        ProtocolError::invalid("tool_result content block must be an object")
-                    })?;
-                    match required_string(object, "type")? {
-                        "text" => convert_text_block(object),
-                        "image" => convert_image_block(object),
-                        "document" => convert_document_block(object),
-                        kind => Err(ProtocolError::invalid(format!(
-                            "unsupported tool_result content type {kind:?}"
-                        ))),
-                    }
-                })
+                .map(convert_tool_result_content_block)
                 .collect::<Result<Vec<_>, _>>()?,
         )
     } else if content.is_string() {
@@ -692,6 +680,43 @@ fn convert_tool_result(
         content,
         is_error,
     })
+}
+
+fn convert_tool_result_content_block(block: &Value) -> Result<Value, ProtocolError> {
+    let object = block
+        .as_object()
+        .ok_or_else(|| ProtocolError::invalid("tool_result content block must be an object"))?;
+    match required_string(object, "type")? {
+        "text" => convert_text_block(object),
+        "image" => convert_image_block(object),
+        "document" => convert_document_block(object),
+        // Claude Code deferred-tool pointer. The named tool's schema is
+        // already in `tools`; this block carries no payload of its own.
+        "tool_reference" => {
+            let name = object
+                .get("tool_name")
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            Ok(json!({"type":"text", "text":format!("[tool reference: {name}]")}))
+        }
+        // Anthropic search_result: keep title/URL/snippet verbatim as text.
+        // Never invent page body; never fabricate encrypted citation fields.
+        "search_result" => Ok(json!({"type":"text", "text":search_result_text(object)})),
+        kind => Err(ProtocolError::invalid(format!(
+            "unsupported tool_result content type {kind:?}"
+        ))),
+    }
+}
+
+fn search_result_text(object: &Map<String, Value>) -> String {
+    let title = object.get("title").and_then(Value::as_str).unwrap_or("");
+    let url = object.get("url").and_then(Value::as_str).unwrap_or("");
+    let mut out = format!("{title}\n{url}");
+    if let Some(quote) = object.get("content").and_then(Value::as_str) {
+        out.push('\n');
+        out.push_str(quote);
+    }
+    out
 }
 
 fn convert_text_block(object: &Map<String, Value>) -> Result<Value, ProtocolError> {
@@ -3180,6 +3205,7 @@ mod tests {
             "Read"
         );
         assert_eq!(converted.body["messages"][3]["role"], "tool");
+        assert_eq!(converted.body["messages"][3]["content"], "ok");
         assert_eq!(converted.body["parallel_tool_calls"], true);
         // Small thinking budget -> low effort, explicitly on the wire.
         assert_eq!(converted.body["reasoning_effort"], "low");
@@ -3191,6 +3217,72 @@ mod tests {
             .is_none());
         assert!(converted.body.get("thinking").is_none());
         assert!(converted.body.get("metadata").is_none());
+    }
+
+    #[test]
+    fn tool_result_tool_reference_and_search_result_become_text() {
+        let converted = convert_request(
+            serde_json::to_vec(&json!({
+                "model":"claude-sonnet-4-6", "max_tokens":128,
+                "messages":[
+                    {"role":"user","content":"fetch"},
+                    {"role":"assistant","content":[
+                        {"type":"tool_use","id":"toolu_wf1","name":"WebFetch",
+                         "input":{"url":"https://example.com"}}
+                    ]},
+                    {"role":"user","content":[
+                        {"type":"tool_result","tool_use_id":"toolu_wf1","content":[
+                            {"type":"tool_reference","tool_name":"WebFetch"},
+                            {"type":"search_result","title":"Example Domain",
+                             "url":"https://example.com",
+                             "content":"This domain is for use in examples."}
+                        ]}
+                    ]}
+                ]
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap();
+        let content = converted.body["messages"][2]["content"]
+            .as_array()
+            .expect("tool result content array");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "[tool reference: WebFetch]");
+        let search = content[1]["text"].as_str().unwrap();
+        assert!(search.contains("Example Domain"), "{search}");
+        assert!(search.contains("https://example.com"), "{search}");
+        assert!(
+            search.contains("This domain is for use in examples."),
+            "{search}"
+        );
+        assert!(!search.contains("encrypted"));
+    }
+
+    #[test]
+    fn unknown_tool_result_content_type_is_still_rejected() {
+        let error = convert_request(
+            serde_json::to_vec(&json!({
+                "model":"claude-sonnet-4-6", "max_tokens":128,
+                "messages":[
+                    {"role":"assistant","content":[
+                        {"type":"tool_use","id":"toolu_1","name":"Read","input":{}}
+                    ]},
+                    {"role":"user","content":[
+                        {"type":"tool_result","tool_use_id":"toolu_1","content":[
+                            {"type":"made_up_block","text":"nope"}
+                        ]}
+                    ]}
+                ]
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap_err();
+        assert_eq!(error.error_type, "invalid_request_error");
+        assert!(error
+            .message
+            .contains("unsupported tool_result content type"));
     }
 
     #[test]
