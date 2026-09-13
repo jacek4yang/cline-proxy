@@ -443,9 +443,19 @@ schemas, `tool_choice`, `max_output_tokens`, `temperature`/`top_p`, and
 `reasoning.summary` requests reasoning exposure (`requested_only` gate, like
 Anthropic thinking). Historical `reasoning` input items are never replayed
 onto the wire; the proxy's reasoning shadow store keeps in-turn continuity
-instead. Hosted backend tools (`web_search`, `x_search`, …) are dropped, not
-forwarded — this proxy cannot execute them and never fabricates results.
-`item_reference` inputs are rejected (the proxy is stateless).
+instead.
+
+Backend-hosted `web_search` declarations convert to the same upstream
+`web_search` function the Anthropic frontend offers: the gateway executes the
+search against Cline's `/search/websearch` endpoint and answers the model,
+then streams `response.web_search_call.in_progress` + `output_item.done`
+frames (`action.search` with query and source URLs) before the grounded
+continuation. The terminal response reconstructs those items, and replayed
+`web_search_call` input items are accepted and rebuilt into the upstream
+tool-call chain. Other hosted backend tools (`x_search`, `code_interpreter`,
+MCP, …) are dropped, not forwarded — this proxy cannot execute them and never
+fabricates results. `item_reference` inputs are rejected (the proxy is
+stateless).
 
 Streaming emits the exact typed Responses event lifecycle with monotonic
 `sequence_number`: `response.created` → item/content/argument

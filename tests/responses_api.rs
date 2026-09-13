@@ -162,6 +162,29 @@ fn successful_sse(text: &str) -> String {
     )
 }
 
+/// A tool-call stream where the model calls the hosted `web_search`
+/// function (the one the gateway offers for the hosted declaration). The
+/// gateway must execute the search, then run a continuation generation.
+fn tool_call_web_search_sse() -> String {
+    let first = json!({
+        "id": "chat_1", "model": "z-ai/glm-5.3-flash",
+        "choices": [{"delta": {"reasoning_content": "need to search"}, "finish_reason": null}]
+    });
+    let second = json!({
+        "choices": [{"delta": {"tool_calls": [
+            {"index": 0, "id": "call_WS", "type": "function",
+             "function": {"name": "web_search", "arguments": ""}}
+        ]}}]
+    });
+    let third = json!({
+        "choices": [{"delta": {"tool_calls": [
+            {"index": 0, "function": {"arguments": "{\"query\": \"glm 5.3 flash\"}"}}
+        ]}, "finish_reason": "tool_calls"}],
+        "usage": {"prompt_tokens": 12, "completion_tokens": 4}
+    });
+    format!("data: {first}\n\ndata: {second}\n\ndata: {third}\n\ndata: [DONE]\n\n")
+}
+
 fn tool_call_sse() -> String {
     // Upstream fragments tool arguments across chunks. Argument fragments
     // are built as JSON values so no escaped-quote literals are needed:
@@ -331,6 +354,114 @@ async fn stream_tool_items_added_before_argument_deltas() {
 }
 
 #[tokio::test]
+async fn hosted_web_search_converts_to_upstream_function() {
+    let (base, mock, task) = start_mock().await;
+    mock.set("cline-key-1", vec![Spec::sse(successful_sse("ok"))])
+        .await;
+    let app = router(AppState::new(test_config(base)).unwrap());
+    let request = responses_request(json!({
+        "model": "gpt-5.3",
+        "input": "hi",
+        "tools": [
+            {"type": "web_search"},
+            {"type": "x_search"},
+            {"type": "function", "name": "read_file",
+             "parameters": {"type": "object",
+                            "properties": {"path": {"type": "string"}}}}
+        ],
+        "tool_choice": "auto"
+    }));
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bodies = mock.bodies().await;
+    let tools = bodies[0]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 2);
+    assert_eq!(tools[0]["function"]["name"], "web_search");
+    assert_eq!(tools[1]["function"]["name"], "read_file");
+    assert_eq!(bodies[0]["tool_choice"], "auto");
+    task.abort();
+}
+
+#[tokio::test]
+async fn web_search_call_replay_does_not_fail_the_session() {
+    // Grok Build replays the terminal output (including `web_search_call`
+    // items) as the next turn's input. Before the fix this was a 400 that
+    // permanently broke the session.
+    let (base, mock, task) = start_mock().await;
+    mock.set("cline-key-1", vec![Spec::sse(successful_sse("done"))])
+        .await;
+    let app = router(AppState::new(test_config(base)).unwrap());
+    let request = responses_request(json!({
+        "model": "gpt-5.3",
+        "input": [
+            {"type": "message", "role": "user", "content": "search it"},
+            {"type": "web_search_call", "id": "ws_abc", "status": "completed",
+             "action": {"type": "search", "query": "glm 5.3 flash",
+                        "sources": [{"type": "url", "url": "https://example.com/a"}]}},
+            {"type": "message", "role": "user", "content": "thanks"}
+        ]
+    }));
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bodies = mock.bodies().await;
+    let messages = bodies[0]["messages"].as_array().unwrap();
+    let roles: Vec<&str> = messages
+        .iter()
+        .map(|m| m["role"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(roles, vec!["user", "assistant", "tool", "user"]);
+    assert_eq!(messages[1]["tool_calls"][0]["id"], "ws_abc");
+    assert_eq!(
+        messages[1]["tool_calls"][0]["function"]["name"],
+        "web_search"
+    );
+    assert!(messages[2]["content"]
+        .as_str()
+        .unwrap()
+        .contains("https://example.com/a"));
+    task.abort();
+}
+
+#[tokio::test]
+async fn web_search_server_round_executes_and_continues() {
+    // The model calls web_search; the gateway executes the search and the
+    // same downstream stream continues after the grounding round.
+    let (base, mock, task) = start_mock().await;
+    mock.set(
+        "cline-key-1",
+        vec![
+            Spec::sse(tool_call_web_search_sse()),
+            Spec::sse(successful_sse("Grounded answer")),
+        ],
+    )
+    .await;
+    let app = router(AppState::new(test_config(base)).unwrap());
+    let request = responses_request(json!({
+        "model": "gpt-5.3",
+        "input": "search the web for glm 5.3 flash",
+        "tools": [{"type": "web_search"}],
+        "stream": true
+    }));
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let raw = response_text(response).await;
+    // The search executed against Cline (mock saw the chat continuation).
+    let bodies = mock.bodies().await;
+    assert_eq!(bodies.len(), 2, "continuation generation must run");
+    let continuation = &bodies[1];
+    let messages = continuation["messages"].as_array().unwrap();
+    let last = messages.last().unwrap();
+    assert_eq!(last["role"], "tool");
+    // Client sees web_search_call items, never a function_call for the
+    // server tool.
+    assert!(raw.contains("\"web_search_call\""));
+    assert!(raw.contains("in_progress"));
+    assert!(!raw.contains("read_file"));
+    assert!(raw.contains("Grounded answer"));
+    task.abort();
+}
+
+#[tokio::test]
 async fn glm_policy_applied_to_converted_body() {
     let (base, mock, task) = start_mock().await;
     mock.set("cline-key-1", vec![Spec::sse(successful_sse("ok"))])
@@ -360,7 +491,7 @@ async fn glm_policy_applied_to_converted_body() {
 }
 
 #[tokio::test]
-async fn hosted_tools_dropped_and_function_tools_forwarded() {
+async fn hosted_tools_other_than_web_search_dropped() {
     let (base, mock, task) = start_mock().await;
     mock.set("cline-key-1", vec![Spec::sse(successful_sse("ok"))])
         .await;
@@ -369,21 +500,15 @@ async fn hosted_tools_dropped_and_function_tools_forwarded() {
         "model": "gpt-5.3",
         "input": "hi",
         "tools": [
-            {"type": "web_search"},
-            {"type": "function", "name": "read_file",
-             "description": "Read a file",
-             "parameters": {"type": "object",
-                            "properties": {"path": {"type": "string"}}}}
-        ],
-        "tool_choice": "auto"
+            {"type": "x_search"},
+            {"type": "code_interpreter"}
+        ]
     }));
     let response = app.oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let bodies = mock.bodies().await;
-    let tools = bodies[0]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 1);
-    assert_eq!(tools[0]["function"]["name"], "read_file");
-    assert_eq!(bodies[0]["tool_choice"], "auto");
+    // All hosted tools dropped: no tools array forwarded.
+    assert!(bodies[0].get("tools").is_none());
     task.abort();
 }
 

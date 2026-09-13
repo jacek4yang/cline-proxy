@@ -1,9 +1,9 @@
 # Development State
 
 Last updated: 2026-09-13
-Code baseline: Responses API frontend (this PR) on main `434d15f`
+Code baseline: Responses web-search fix (this PR) on main `27055c1`
 Repository: https://github.com/jacek4yang/cline-proxy
-Status: FEATURE WORK — OpenAI Responses API frontend for Grok Build (issue #41)
+Status: BUG FIX — Responses frontend: hosted web_search + web_search_call replay (issue #43)
 
 > Agent recovery protocol — on context compaction or session end:
 > 1. Read this file top to bottom.
@@ -188,30 +188,34 @@ Issues #3, #6, #8, #10, #13, #14, #16, #19, #24, #27 closed with their PRs.
 
 ## Current target
 
-**OpenAI Responses API frontend (`POST /v1/responses`, issue #41, branch
-`feat/responses-api`) so Grok Build (`api_backend = "responses"`) can run
-against the gateway.**
+**Responses frontend web-search fix (issue #43, branch
+`fix/responses-web-search`).**
 
-Ported from the verified `codebuddy-proxy` Responses implementation and
-adapted to cline-proxy policy: `src/responses/{request,stream,types}.rs`
-(protocol conversion), `src/responses_pump.rs` (streaming pump + one-stream
-non-stream aggregation), and the `/v1/responses` handler in `server.rs`.
-Session identity comes from `prompt_cache_key`/conv-id headers, fingerprinted
-with a domain-separated HMAC (`cache::responses_session_fingerprint`). The
-GLM policy, reasoning shadow, prefix telemetry, canonical tool JSON, watchdog,
-and effective-429 invariants apply unchanged. Hosted backend tools are
-dropped (never faked); historical `reasoning` items are never replayed;
-`response.output_item.added` always precedes argument deltas; terminal frames
-are `response.completed` / `response.incomplete` / `response.failed`.
+Two Grok Build session breakers fixed:
 
-Tests: 304 total (281 lib + 4 glm53_policy + 4 reasoning_shadow + 15
+1. The hosted `web_search` tool declaration is no longer dropped: it
+   converts to the same upstream `web_search` function the Anthropic
+   frontend offers. The gateway executes searches against Cline
+   `/search/websearch` (same credential pool discipline as the Anthropic
+   server-tool loop) and streams `response.web_search_call.in_progress` +
+   `output_item.done` frames with `action.search` payloads, then continues
+   the generation with the grounding appended to the upstream conversation
+   (pure server-tool rounds only; mixed rounds end the stream so client
+   tools run). Per-request budget clamped to the implementation cap.
+2. Replayed `web_search_call` input items (Grok Build replays the terminal
+   output as next-turn input) are accepted and rebuilt into the upstream
+   assistant/tool message pair from the item's own `action` data — nothing
+   invented; previously a 400 that permanently broke the session.
+
+Non-`web_search` hosted tools (`x_search`, `code_interpreter`, MCP, …)
+remain dropped, never forwarded. `start_continuation` reuses `send_chat`, so
+effective-429 failover and no-replay-after-commit apply per round.
+
+Tests: 309 total (283 lib + 4 glm53_policy + 4 reasoning_shadow + 18
 responses_api integration), debug and release; fmt/clippy `-D warnings`
-clean.
+clean. Production `D:\Workspace\cline-proxy-bin` not touched. No release.
 
-WebFetch is out of scope. Production `D:\Workspace\cline-proxy-bin` is not
-touched. No GitHub Release.
-
-## Previous target snapshot (WebSearch completion)
+## Previous target snapshot (Responses API frontend)
 
 **Long-term normal use + production observation under FEATURE FREEZE.**
 

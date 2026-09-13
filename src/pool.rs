@@ -405,6 +405,27 @@ impl KeyPool {
         self.inner.keys.get(active).map(|key| key.name.clone())
     }
 
+    /// The currently active key without eligibility scanning: no probe is
+    /// started and the sticky selection is untouched. Used by auxiliary
+    /// endpoints (server-tool search) that must ride the credential chat
+    /// selected for the logical request, never rotate it.
+    pub fn active_key(&self) -> SelectedKey {
+        let count = self.len().max(1);
+        let active = self.inner.active.load(Ordering::Acquire) % count;
+        let key = self
+            .inner
+            .keys
+            .get(active)
+            .expect("active index is within key count");
+        SelectedKey {
+            index: active,
+            configured_index: key.configured_index,
+            name: key.name.clone(),
+            is_probe: false,
+            api_key: key.api_key.clone(),
+        }
+    }
+
     pub fn active_age(&self) -> Duration {
         let since = self.inner.active_since_unix.load(Ordering::Relaxed);
         let now = unix_secs(SystemTime::now());

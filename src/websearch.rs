@@ -77,6 +77,25 @@ pub struct WebSearchConfig {
     pub domains: Option<DomainFilter>,
 }
 
+/// Static Responses-frontend server-tool context held on `AppState`: the
+/// per-request budget cap for the hosted `web_search` declaration plus the
+/// optional domain restriction. The Anthropic frontend derives the same
+/// values from each `web_search_*` declaration; the Responses frontend has
+/// no encrypted declaration to parse, so these are the deployment-level
+/// defaults (`max_uses` clamped to the same hard cap).
+#[derive(Debug, Clone, Default)]
+pub struct ResponsesWebSearchContext {
+    pub max_uses: u32,
+    pub domains: Option<DomainFilter>,
+}
+
+impl ResponsesWebSearchContext {
+    /// Clamp a declared or configured `max_uses` to the implementation cap.
+    pub fn clamped_uses(uses: u64) -> u32 {
+        uses.clamp(1, u64::from(MAX_WEB_SEARCH_USES_PER_REQUEST)) as u32
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ServerToolConfig {
     pub web_search: Option<WebSearchConfig>,
