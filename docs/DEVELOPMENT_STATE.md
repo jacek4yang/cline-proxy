@@ -1,9 +1,9 @@
 # Development State
 
 Last updated: 2026-09-13
-Code baseline: WebSearch server-tool support (this PR) on main `19163a9`
+Code baseline: Responses API frontend (this PR) on main `434d15f`
 Repository: https://github.com/jacek4yang/cline-proxy
-Status: FEATURE WORK — Anthropic WebSearch via Cline `/search/websearch`
+Status: FEATURE WORK — OpenAI Responses API frontend for Grok Build (issue #41)
 
 > Agent recovery protocol — on context compaction or session end:
 > 1. Read this file top to bottom.
@@ -188,12 +188,37 @@ Issues #3, #6, #8, #10, #13, #14, #16, #19, #24, #27 closed with their PRs.
 
 ## Current target
 
+**OpenAI Responses API frontend (`POST /v1/responses`, issue #41, branch
+`feat/responses-api`) so Grok Build (`api_backend = "responses"`) can run
+against the gateway.**
+
+Ported from the verified `codebuddy-proxy` Responses implementation and
+adapted to cline-proxy policy: `src/responses/{request,stream,types}.rs`
+(protocol conversion), `src/responses_pump.rs` (streaming pump + one-stream
+non-stream aggregation), and the `/v1/responses` handler in `server.rs`.
+Session identity comes from `prompt_cache_key`/conv-id headers, fingerprinted
+with a domain-separated HMAC (`cache::responses_session_fingerprint`). The
+GLM policy, reasoning shadow, prefix telemetry, canonical tool JSON, watchdog,
+and effective-429 invariants apply unchanged. Hosted backend tools are
+dropped (never faked); historical `reasoning` items are never replayed;
+`response.output_item.added` always precedes argument deltas; terminal frames
+are `response.completed` / `response.incomplete` / `response.failed`.
+
+Tests: 304 total (281 lib + 4 glm53_policy + 4 reasoning_shadow + 15
+responses_api integration), debug and release; fmt/clippy `-D warnings`
+clean.
+
+WebFetch is out of scope. Production `D:\Workspace\cline-proxy-bin` is not
+touched. No GitHub Release.
+
+## Previous target snapshot (WebSearch completion)
+
 **Long-term normal use + production observation under FEATURE FREEZE.**
 
 Stabilization baseline: #30 session affinity/X-Task-ID, #31 state
 snapshot, #32 duplicate tool_result hardening, #33 stabilization
-snapshot — all merged; then credential-scoped upstream task identity
-(this PR). Tests 234 (226 lib + 4 + 4), debug and release; fmt/clippy
+snapshot — all merged; then credential-scoped upstream task identity.
+Tests were 234 (226 lib + 4 + 4) before the Responses work; fmt/clippy
 `-D warnings` clean. Live evidence (isolated ports only): Cline accepts
 X-Task-ID, no raw-id leakage, marker continuity passed. The
 credential-scoped X-Task-ID semantics are verified by mock integration
@@ -213,7 +238,7 @@ Isolated A/B (n=4 tiny streams): direct headers median 1284 ms vs SOCKS5
 smoke on :8788 completed via SOCKS5 (schema v3 JSONL). Analyze JSONL
 only if new evidence shows a bug.
 
-## Next tasks (after this recovery)
+## Next tasks (after this PR)
 
 - Observe real production logs (`logs/events-*.jsonl`); analyze only
   when evidence shows a problem.
@@ -221,6 +246,9 @@ only if new evidence shows a bug.
   reasoning/cache/prefix/routing semantics — all verified).
 - Optional: set `glm53.context.upstream_context_window_tokens` only after
   a real Cline route limit is measured.
+- Live Grok Build E2E validation of `/v1/responses` when convenient
+  (offline mock integration tests are green; live spend not required
+  for merge).
 
 ## Explicitly deferred
 

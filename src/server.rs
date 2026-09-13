@@ -155,6 +155,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/messages", post(anthropic_messages))
         .route("/v1/messages/count_tokens", post(anthropic_count_tokens))
         .route("/v1/chat/completions", post(openai_chat))
+        .route("/v1/responses", post(responses))
         .route("/v1/models", get(models))
         .route("/admin/status", get(admin_status))
         .layer(DefaultBodyLimit::max(max_request_bytes))
@@ -373,6 +374,240 @@ async fn openai_chat(
     {
         Ok(result) => openai_upstream_response(&state, result, &request_id, stream, started).await,
         Err(error) => upstream_failure(&state, error, false, &request_id),
+    }
+}
+
+/// `POST /v1/responses` — OpenAI Responses API frontend (primary client:
+/// Grok Build). Same authentication, credential pool, effective-429 handling,
+/// GLM policy, watchdog, and no-replay discipline as the other frontends;
+/// only the protocol conversion differs (Responses → chat upstream, chat SSE
+/// → Responses SSE).
+///
+/// Session identity precedence: `prompt_cache_key` (Grok Build's sticky
+/// routing key), then `x-grok-conv-id` / `x-grok-session-id` headers, then
+/// `metadata.session_id` / `metadata.user_id`. The raw key is fingerprinted
+/// with a domain-separated HMAC before any use — never logged, never sent
+/// in that form.
+async fn responses(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: std::result::Result<Bytes, BytesRejection>,
+) -> Response {
+    let request_id = request_id(&headers);
+    let body = match request_body(body, false, &request_id) {
+        Ok(body) => body,
+        Err(response) => return *response,
+    };
+    // Parse once: identity extraction, conversion, and telemetry all read
+    // this value (megabyte-scale bodies are never parsed twice).
+    let input: Value = match serde_json::from_slice(&body) {
+        Ok(input) => input,
+        Err(error) => {
+            return responses_error(
+                StatusCode::BAD_REQUEST,
+                format!("invalid JSON: {error}"),
+                &request_id,
+            )
+        }
+    };
+    let session_fp = cache::responses_session_raw_id(&input)
+        .map(|raw| cache::responses_session_fingerprint(&state.config.server.api_key, raw));
+    // Model resolution: aliases/default, same as the other frontends.
+    let requested_model = input
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|model| !model.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| state.config.models.default.clone());
+    let upstream_model = state.config.resolve_model(&requested_model);
+    let converted = match crate::responses::request::convert_request(&input, &upstream_model) {
+        Ok(converted) => converted,
+        Err(error) => return responses_error(StatusCode::BAD_REQUEST, error.message, &request_id),
+    };
+    let client_stream = input
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut chat_body = converted.chat_body;
+    // Reasoning shadow restore (issue #10): same epoch rules as the OpenAI
+    // chat path — a request ending in a plain human user turn starts a new
+    // epoch and drops previous shadow state.
+    if let (Some(shadow), Some(fp)) = (state.reasoning_shadow.as_ref(), session_fp.as_deref()) {
+        if request_starts_new_epoch(&chat_body) {
+            shadow.clear_session(fp);
+        } else if let Some(object) = chat_body.as_object_mut() {
+            shadow.restore_into(object, fp);
+        }
+    }
+    // GLM policy: explicit reasoning effort, bounded output,
+    // historical-thinking strip, safe compaction (model-family scoped).
+    let optimization = match optimize::optimize_request(
+        &mut chat_body,
+        &state.config.glm53,
+        optimize::Origin::OpenAi,
+    ) {
+        Ok(optimization) => optimization,
+        Err(message) => return responses_error(StatusCode::BAD_REQUEST, message, &request_id),
+    };
+    // Canonicalize historical tool-call argument JSON for byte-stable
+    // prefixes (config-gated; plain-text content is never touched).
+    let canonicalized = if state.config.glm53.context.canonical_tool_json {
+        chat_body
+            .as_object_mut()
+            .map(cache::canonicalize_tool_arguments)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let prefix_telemetry =
+        cache::log_prefix_telemetry(&chat_body, session_fp.as_deref(), &request_id);
+    log_request_optimization(
+        &request_id,
+        "responses",
+        &optimization,
+        0,
+        canonicalized,
+        &prefix_telemetry,
+    );
+    // Streaming is the canonical upstream transport (issue #14): a
+    // downstream non-stream request is served by ONE upstream streaming
+    // request aggregated locally.
+    let upstream_stream = true;
+    if let Some(object) = chat_body.as_object_mut() {
+        object.insert("stream".into(), Value::Bool(true));
+        object.insert("stream_options".into(), json!({"include_usage": true}));
+    }
+    let upstream_body = match serde_json::to_vec(&chat_body) {
+        Ok(bytes) => Bytes::from(bytes),
+        Err(_) => {
+            return responses_error(
+                StatusCode::BAD_REQUEST,
+                "request could not be serialized",
+                &request_id,
+            )
+        }
+    };
+    tracing::debug!(
+        request_id,
+        protocol = "responses",
+        requested_model,
+        upstream_model,
+        downstream_stream = client_stream,
+        upstream_stream,
+        upstream_strategy = if client_stream {
+            "native_streaming"
+        } else {
+            "stream_and_aggregate"
+        },
+        request_bytes = body.len(),
+        upstream_request_bytes = upstream_body.len(),
+        "client request accepted"
+    );
+    let started = Instant::now();
+    let upstream_request_bytes = upstream_body.len();
+    let result = state
+        .upstream
+        .send_chat(
+            upstream_body,
+            upstream_stream,
+            &request_id,
+            &upstream_model,
+            session_fp.as_deref(),
+        )
+        .await;
+    let selected = match result {
+        Ok(result) => result,
+        Err(error) => {
+            return upstream_failure(&state, error, false, &request_id);
+        }
+    };
+    let response = match selected.response {
+        UpstreamResponse::Success(response) => response,
+        UpstreamResponse::HttpError(error) => {
+            return sanitized_upstream_error(&state, error, false, &request_id)
+        }
+    };
+    let model_family = if optimize::ModelFamily::from_upstream_model(&upstream_model)
+        == optimize::ModelFamily::Glm53
+    {
+        "glm53"
+    } else {
+        "generic_openai"
+    };
+    let mut stream_summary = crate::obs::StreamSummary {
+        sink: state.log_sink.clone(),
+        session: session_fp.clone(),
+        requested_model: requested_model.clone(),
+        request_id: request_id.clone(),
+        upstream_model: upstream_model.clone(),
+        model_family,
+        downstream_stream: client_stream,
+        upstream_strategy: if client_stream {
+            "native_streaming"
+        } else {
+            "stream_and_aggregate"
+        },
+        route: state.upstream.route().kind(),
+        started,
+        slow_ttft_ms: state.config.logging.slow_ttft_ms,
+        slow_duration_ms: state.config.logging.slow_duration_ms,
+        reasoning_effort: optimization.reasoning_effort,
+        expose_thinking: optimization.expose_thinking,
+        client_max_tokens: optimization.client_max_tokens,
+        effective_max_tokens: optimization.effective_max_tokens,
+        request_bytes: body.len(),
+        upstream_request_bytes,
+        system_bytes: optimization.system_bytes,
+        messages_bytes: optimization.messages_bytes,
+        tools_bytes: optimization.tools_bytes,
+        historical_reasoning_bytes_removed: optimization.historical_reasoning_bytes_removed,
+        billing_header_bytes_removed: 0,
+        canonicalized_arguments: canonicalized,
+        local_tokens: crate::obs::LocalTokenSlot::default(),
+        context_limit_tokens: state.config.glm53.context.upstream_context_window_tokens,
+        upstream_headers_ms: None,
+        web_search: crate::obs::WebSearchStats::default(),
+    };
+    if client_stream {
+        return crate::responses_pump::responses_stream_response(
+            response,
+            converted.thinking_requested,
+            upstream_model,
+            session_fp,
+            state.reasoning_shadow.clone(),
+            state.config.upstream.stream_timeouts(),
+            stream_summary,
+            selected.selected.name.to_string(),
+            request_id,
+        );
+    }
+    // Downstream non-stream: aggregate the upstream stream locally.
+    let result = crate::responses_pump::aggregate_responses(
+        response,
+        converted.thinking_requested,
+        upstream_model.clone(),
+        session_fp.clone(),
+        state.reasoning_shadow.clone(),
+        state.config.upstream.stream_timeouts(),
+        started,
+        &mut stream_summary,
+        &request_id,
+        selected.selected.name.as_ref(),
+    )
+    .await;
+    stream_summary.upstream_headers_ms = Some(started.elapsed().as_millis());
+    match result {
+        Ok(value) => json_response(StatusCode::OK, value, &request_id),
+        Err(error) => {
+            let kind = error.stall_kind.unwrap_or("protocol_error");
+            tracing::info!(
+                request_id,
+                error_kind = kind,
+                duration_ms = started.elapsed().as_millis(),
+                "responses aggregation failed"
+            );
+            responses_error(StatusCode::BAD_GATEWAY, error.message, &request_id)
+        }
     }
 }
 
@@ -609,6 +844,7 @@ async fn anthropic_messages(
         sink: state.log_sink.clone(),
         session: session_fp.clone(),
         requested_model: requested_model.clone(),
+        request_id: request_id.clone(),
         upstream_model: upstream_model.clone(),
         model_family: if optimize::ModelFamily::from_upstream_model(&upstream_model)
             == optimize::ModelFamily::Glm53
@@ -1793,6 +2029,8 @@ async fn response_log_middleware(request: Request<Body>, next: Next) -> Response
     let path = request.uri().path().to_owned();
     let protocol = if path.starts_with("/v1/messages") {
         "anthropic"
+    } else if path.starts_with("/v1/responses") {
+        "responses"
     } else {
         "openai"
     };
@@ -1873,6 +2111,22 @@ fn openai_error(status: StatusCode, message: impl Into<String>, request_id: &str
     json_response(
         status,
         json!({"error":{"type":"proxy_error", "message":message.into()}}),
+        request_id,
+    )
+}
+
+/// OpenAI-flavored error envelope for the Responses frontend (the Anthropic
+/// envelope would fail Grok Build's error parser).
+fn responses_error(status: StatusCode, message: impl Into<String>, request_id: &str) -> Response {
+    json_response(
+        status,
+        json!({
+            "error": {
+                "message": message.into(),
+                "type": "invalid_request_error",
+                "code": "invalid_request_error",
+            }
+        }),
         request_id,
     )
 }
