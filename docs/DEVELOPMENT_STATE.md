@@ -1,10 +1,9 @@
 # Development State
 
-Last updated: 2026-09-11
-Code baseline: duplicate-result hardening through PR #32 (merge `be01d56`)
-State snapshot: #33 and the final repository cleanup (#21/#22/#23 closed)
+Last updated: 2026-09-13
+Code baseline: WebSearch server-tool support (this PR) on main `19163a9`
 Repository: https://github.com/jacek4yang/cline-proxy
-Status: STABILIZATION BASELINE — MODEL PATH FEATURE FREEZE in effect
+Status: FEATURE WORK — Anthropic WebSearch via Cline `/search/websearch`
 
 > Agent recovery protocol — on context compaction or session end:
 > 1. Read this file top to bottom.
@@ -15,6 +14,19 @@ Status: STABILIZATION BASELINE — MODEL PATH FEATURE FREEZE in effect
 > 4. `gh pr list --state open && gh issue list --state open`.
 > 5. Continue from "Current target". NEVER trust branch names or
 >    "pending merge" phrases from anything below the Historical record.
+
+## Current target
+
+**Anthropic WebSearch server-tool compatibility (issue #37, branch `feat/web-search`).**
+
+Claude Code declares `web_search_20250305`; GLM sees an OpenAI `web_search`
+function; the proxy executes `POST {Cline base_url}/search/websearch` with
+the same credential/client/route as chat; Anthropic `server_tool_use` +
+`web_search_tool_result` are emitted; GLM continues; one downstream stream
+stays open across internal rounds.
+
+WebFetch is out of scope. Production `D:\Workspace\cline-proxy-bin` is not
+touched. No GitHub Release.
 
 ## MODEL PATH FEATURE FREEZE
 
@@ -30,6 +42,10 @@ minimal reproduction → failing regression test → small fix → CI.
 One problem, one PR. Do NOT have agents periodically patrol the source
 and refactor proactively. "Architecture could be more elegant", "fewer
 lines", "deepseek-recipe does it this way" are NOT change reasons.
+
+The WebSearch work is an explicit exception: it extends Anthropic conversion
+and the stream pump with a bounded server-tool loop. Unrelated reasoning,
+cache, 429, and routing behavior must stay unchanged.
 
 ## Current production baseline
 

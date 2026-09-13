@@ -266,6 +266,20 @@ addresses the drift sources it can (issue #8, ADR 0005):
   (`docs/DEVELOPMENT_STATE.md`). `prompt_cache_key` is *not* sent —
   high cache hits are achieved without it.
 
+## WebSearch (Claude Code server tool)
+
+Claude Code's `WebSearch` is executed by the gateway, not the client.
+`web_search_20250305` is fully supported. `web_search_20260209` and
+`web_search_20260318` are accepted only for basic direct search
+(`allowed_callers: ["direct"]`); dynamic filtering, code-execution callers,
+encrypted Anthropic citations, and WebFetch are not implemented.
+
+Searches go to Cline `POST {base_url}/search/websearch` using the same HTTP
+client, credential, headers, X-Task-ID, and SOCKS/direct route as chat.
+Domain allow/block lists and `max_uses` (hard cap 5) are enforced locally.
+Stream and non-stream `/v1/messages` both keep one client response across
+internal search rounds. Details: `docs/WEB_SEARCH.md`.
+
 ## Key stickiness and persisted quota state
 
 Routing is **strict sticky sequential**. The active key is used for every

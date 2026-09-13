@@ -70,6 +70,9 @@ pub struct ConvertedRequest {
     pub body: Value,
     pub model: String,
     pub stream: bool,
+    /// Parsed Anthropic server-tool declarations. The OpenAI body never
+    /// carries `web_search_*` types; GLM sees a normal `web_search` function.
+    pub server_tools: crate::websearch::ServerToolConfig,
     /// Explicit Anthropic reasoning controls, preserved for
     /// `crate::optimize::optimize_request` (the single resolution point).
     /// Never forwarded to the OpenAI wire.
@@ -155,8 +158,13 @@ pub fn convert_request_value(input: Value) -> Result<ConvertedRequest, ProtocolE
         }
         output.insert("metadata".into(), metadata.clone());
     }
+    let mut server_tools = crate::websearch::ServerToolConfig::default();
     if let Some(tools) = object.get("tools") {
-        output.insert("tools".into(), convert_tools(tools)?);
+        let (converted, parsed) = convert_tools(tools)?;
+        if !converted.as_array().is_none_or(Vec::is_empty) {
+            output.insert("tools".into(), converted);
+        }
+        server_tools = parsed;
     }
     if let Some(choice) = object.get("tool_choice") {
         let (choice, parallel) = convert_tool_choice(choice)?;
@@ -187,6 +195,7 @@ pub fn convert_request_value(input: Value) -> Result<ConvertedRequest, ProtocolE
         body: Value::Object(output),
         model,
         stream,
+        server_tools,
         thinking,
         output_effort,
         expose_thinking: false,
@@ -400,31 +409,84 @@ fn convert_assistant_blocks(
     output: &mut Vec<WireMessage>,
     pending_tool_ids: &mut HashSet<String>,
 ) -> Result<(), ProtocolError> {
-    let mut content = Vec::new();
-    let mut tool_calls = Vec::new();
-    let mut reasoning = String::new();
     // This turn's declarations replace whatever the previous turn left.
     pending_tool_ids.clear();
+
+    // Server-tool history replay: a previous gateway-executed round comes
+    // back as `server_tool_use` + `web_search_tool_result` in the same
+    // assistant message. OpenAI needs those split into assistant tool_calls
+    // followed by role=tool results so later client tool_use stays a
+    // distinct turn. Text/thinking before the server segment belong to the
+    // first assistant message.
+    #[derive(Default)]
+    struct Segment {
+        content: Vec<Value>,
+        tool_calls: Vec<Value>,
+        reasoning: String,
+    }
+    impl Segment {
+        fn is_empty(&self) -> bool {
+            self.content.is_empty() && self.tool_calls.is_empty() && self.reasoning.is_empty()
+        }
+    }
+
+    let start_len = output.len();
+    let mut segment = Segment::default();
+    let mut server_calls: Vec<Value> = Vec::new();
+    let mut pending_server_ids: HashSet<String> = HashSet::new();
+    let mut seen_server_results: HashSet<String> = HashSet::new();
+    let flush = |output: &mut Vec<WireMessage>, segment: &mut Segment| {
+        if !segment.is_empty() {
+            let taken = std::mem::take(segment);
+            output.push(WireMessage::Assistant {
+                content: taken.content,
+                tool_calls: taken.tool_calls,
+                reasoning: taken.reasoning,
+            });
+        }
+    };
+    let flush_server_calls = |output: &mut Vec<WireMessage>, server_calls: &mut Vec<Value>| {
+        if !server_calls.is_empty() {
+            output.push(WireMessage::Assistant {
+                content: Vec::new(),
+                tool_calls: std::mem::take(server_calls),
+                reasoning: String::new(),
+            });
+        }
+    };
+
     for block in blocks {
         let object = block
             .as_object()
             .ok_or_else(|| ProtocolError::invalid("assistant content block must be an object"))?;
         match required_string(object, "type")? {
-            "text" => content.push(convert_text_block(object)?),
+            "text" => {
+                if pending_server_ids.len() != seen_server_results.len() {
+                    return Err(ProtocolError::invalid(
+                        "server_tool_use without its web_search_tool_result",
+                    ));
+                }
+                segment.content.push(convert_text_block(object)?);
+            }
             "thinking" => {
                 if let Some(text) = object.get("thinking").and_then(Value::as_str) {
-                    reasoning.push_str(text);
+                    segment.reasoning.push_str(text);
                 }
             }
             "redacted_thinking" => {}
             "tool_use" => {
+                if pending_server_ids.len() != seen_server_results.len() {
+                    return Err(ProtocolError::invalid(
+                        "server_tool_use without its web_search_tool_result",
+                    ));
+                }
                 let arguments = serde_json::to_string(
                     object.get("input").unwrap_or(&Value::Object(Map::new())),
                 )
                 .map_err(|error| ProtocolError::invalid(error.to_string()))?;
                 let id = required_string(object, "id")?.to_owned();
                 pending_tool_ids.insert(id.clone());
-                tool_calls.push(json!({
+                segment.tool_calls.push(json!({
                     "id":id,
                     "type":"function",
                     "function":{
@@ -433,6 +495,50 @@ fn convert_assistant_blocks(
                     }
                 }));
             }
+            "server_tool_use" => {
+                flush(&mut *output, &mut segment);
+                let id = required_string(object, "id")?.to_owned();
+                if !pending_server_ids.insert(id.clone()) {
+                    return Err(ProtocolError::invalid(format!(
+                        "duplicate server_tool_use id {id:?}"
+                    )));
+                }
+                let input = object.get("input").cloned().unwrap_or_else(|| json!({}));
+                if !input.is_object() {
+                    return Err(ProtocolError::invalid(
+                        "server_tool_use input must be an object",
+                    ));
+                }
+                let arguments = serde_json::to_string(&input)
+                    .map_err(|error| ProtocolError::invalid(error.to_string()))?;
+                server_calls.push(json!({
+                    "id": id,
+                    "type": "function",
+                    "function": {
+                        "name": required_string(object, "name")?,
+                        "arguments": arguments
+                    }
+                }));
+            }
+            "web_search_tool_result" => {
+                let tool_use_id = required_string(object, "tool_use_id")?.to_owned();
+                if !pending_server_ids.contains(&tool_use_id) {
+                    return Err(ProtocolError::invalid(format!(
+                        "web_search_tool_result references unknown server_tool_use id {tool_use_id:?}"
+                    )));
+                }
+                if !seen_server_results.insert(tool_use_id.clone()) {
+                    return Err(ProtocolError::invalid(format!(
+                        "duplicate web_search_tool_result for id {tool_use_id:?}"
+                    )));
+                }
+                flush_server_calls(&mut *output, &mut server_calls);
+                output.push(WireMessage::Tool {
+                    tool_call_id: tool_use_id,
+                    content: Value::String(crate::websearch::replayed_result_text(block)),
+                    is_error: None,
+                });
+            }
             kind => {
                 return Err(ProtocolError::invalid(format!(
                     "unsupported assistant content block type {kind:?}"
@@ -440,11 +546,19 @@ fn convert_assistant_blocks(
             }
         }
     }
-    output.push(WireMessage::Assistant {
-        content,
-        tool_calls,
-        reasoning,
-    });
+    if !server_calls.is_empty() || pending_server_ids.len() != seen_server_results.len() {
+        return Err(ProtocolError::invalid(
+            "server_tool_use without its web_search_tool_result",
+        ));
+    }
+    flush(&mut *output, &mut segment);
+    if output.len() == start_len {
+        output.push(WireMessage::Assistant {
+            content: Vec::new(),
+            tool_calls: Vec::new(),
+            reasoning: String::new(),
+        });
+    }
     Ok(())
 }
 
@@ -624,40 +738,60 @@ fn convert_document_block(object: &Map<String, Value>) -> Result<Value, Protocol
     }
 }
 
-fn convert_tools(value: &Value) -> Result<Value, ProtocolError> {
+fn convert_tools(
+    value: &Value,
+) -> Result<(Value, crate::websearch::ServerToolConfig), ProtocolError> {
     let tools = value
         .as_array()
         .ok_or_else(|| ProtocolError::invalid("tools must be an array"))?;
-    tools
-        .iter()
-        .map(|tool| {
-            let object = tool
-                .as_object()
-                .ok_or_else(|| ProtocolError::invalid("tool must be an object"))?;
-            let schema = object
-                .get("input_schema")
-                .filter(|value| value.is_object())
-                .ok_or_else(|| ProtocolError::invalid("tool input_schema must be an object"))?;
-            let mut function = json!({
-                "name":required_string(object, "name")?,
-                "parameters":schema
-            });
-            if let Some(description) = object.get("description") {
-                if !description.is_string() {
-                    return Err(ProtocolError::invalid("tool description must be a string"));
-                }
-                function["description"] = description.clone();
+    let mut converted = Vec::with_capacity(tools.len());
+    let mut server_tools = crate::websearch::ServerToolConfig::default();
+    for tool in tools {
+        let object = tool
+            .as_object()
+            .ok_or_else(|| ProtocolError::invalid("tool must be an object"))?;
+        if crate::websearch::is_web_search_type(tool) {
+            if server_tools.web_search.is_some() {
+                return Err(ProtocolError::invalid(
+                    "at most one web_search server tool may be declared",
+                ));
             }
-            if let Some(strict) = object.get("strict") {
-                if !strict.is_boolean() {
-                    return Err(ProtocolError::invalid("tool strict must be a boolean"));
-                }
-                function["strict"] = strict.clone();
+            server_tools.web_search = Some(crate::websearch::parse_declaration(tool)?);
+            converted.push(crate::websearch::upstream_function());
+            continue;
+        }
+        let kind = object
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("custom");
+        if kind != "custom" && object.get("input_schema").is_none() {
+            return Err(ProtocolError::invalid(format!(
+                "tool type {kind:?} is not supported"
+            )));
+        }
+        let schema = object
+            .get("input_schema")
+            .filter(|value| value.is_object())
+            .ok_or_else(|| ProtocolError::invalid("tool input_schema must be an object"))?;
+        let mut function = json!({
+            "name":required_string(object, "name")?,
+            "parameters":schema
+        });
+        if let Some(description) = object.get("description") {
+            if !description.is_string() {
+                return Err(ProtocolError::invalid("tool description must be a string"));
             }
-            Ok(json!({"type":"function", "function":function}))
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map(Value::Array)
+            function["description"] = description.clone();
+        }
+        if let Some(strict) = object.get("strict") {
+            if !strict.is_boolean() {
+                return Err(ProtocolError::invalid("tool strict must be a boolean"));
+            }
+            function["strict"] = strict.clone();
+        }
+        converted.push(json!({"type":"function", "function":function}));
+    }
+    Ok((Value::Array(converted), server_tools))
 }
 
 fn convert_tool_choice(value: &Value) -> Result<(Value, Option<bool>), ProtocolError> {
@@ -768,6 +902,28 @@ pub fn convert_response(
     fallback_model: &str,
     expose_thinking: bool,
 ) -> Result<Value, ProtocolError> {
+    let skip = HashSet::new();
+    convert_response_with(
+        upstream,
+        request_id,
+        fallback_model,
+        expose_thinking,
+        ConvertedResponseOptions {
+            extra_prefix: &[],
+            skip_tool_names: &skip,
+            web_search_requests: 0,
+            stop_reason_override: None,
+        },
+    )
+}
+
+pub fn convert_response_with(
+    upstream: &Value,
+    request_id: &str,
+    fallback_model: &str,
+    expose_thinking: bool,
+    options: ConvertedResponseOptions<'_>,
+) -> Result<Value, ProtocolError> {
     let choice = upstream
         .get("choices")
         .and_then(Value::as_array)
@@ -778,6 +934,7 @@ pub fn convert_response(
         .and_then(Value::as_object)
         .ok_or_else(|| ProtocolError::upstream("upstream choice did not contain a message"))?;
     let mut content = Vec::new();
+    content.extend(options.extra_prefix.iter().cloned());
     // Anti-amplification gate: reasoning reaches the client only when the
     // request explicitly asked for thinking. Unexposed reasoning still cost
     // this turn's output tokens, but it can never be stored, replayed, and
@@ -803,6 +960,13 @@ pub fn convert_response(
                 .ok_or_else(|| {
                     ProtocolError::upstream("upstream returned a malformed tool call")
                 })?;
+            let name = function
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            if options.skip_tool_names.contains(name) {
+                continue;
+            }
             let arguments = function
                 .get("arguments")
                 .and_then(Value::as_str)
@@ -817,20 +981,24 @@ pub fn convert_response(
             content.push(json!({
                 "type":"tool_use",
                 "id":call.get("id").and_then(Value::as_str).unwrap_or("toolu_unknown"),
-                "name":function.get("name").and_then(Value::as_str).unwrap_or("unknown"),
+                "name":name,
                 "input":input
             }));
         }
     }
+    let stop_reason = options
+        .stop_reason_override
+        .map(|reason| Value::String(reason.to_owned()))
+        .unwrap_or_else(|| map_stop_reason(choice.get("finish_reason").and_then(Value::as_str)));
     Ok(json!({
         "id":upstream.get("id").and_then(Value::as_str).unwrap_or(request_id),
         "type":"message",
         "role":"assistant",
         "content":content,
         "model":upstream.get("model").and_then(Value::as_str).unwrap_or(fallback_model),
-        "stop_reason":map_stop_reason(choice.get("finish_reason").and_then(Value::as_str)),
+        "stop_reason":stop_reason,
         "stop_sequence":choice.get("stop_sequence").cloned().unwrap_or(Value::Null),
-        "usage":convert_usage(upstream.get("usage"))
+        "usage":convert_usage_with(upstream.get("usage"), options.web_search_requests)
     }))
 }
 
@@ -888,7 +1056,14 @@ fn thinking_signature(reasoning: &str, request_id: &str) -> String {
     format!("cline-proxy-v1-{:016x}", hasher.finish())
 }
 
-fn convert_usage(usage: Option<&Value>) -> Value {
+pub struct ConvertedResponseOptions<'a> {
+    pub extra_prefix: &'a [Value],
+    pub skip_tool_names: &'a HashSet<String>,
+    pub web_search_requests: u64,
+    pub stop_reason_override: Option<&'static str>,
+}
+
+fn convert_usage_with(usage: Option<&Value>, web_search_requests: u64) -> Value {
     let output = usage
         .and_then(|usage| usage.get("completion_tokens"))
         .and_then(Value::as_u64)
@@ -921,12 +1096,16 @@ fn convert_usage(usage: Option<&Value>) -> Value {
         .and_then(|usage| usage.get("cache_creation_input_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    json!({
+    let mut usage = json!({
         "input_tokens":total_input.saturating_sub(cached).saturating_sub(cache_creation),
         "output_tokens":output,
         "cache_creation_input_tokens":cache_creation,
         "cache_read_input_tokens":cached
-    })
+    });
+    if web_search_requests > 0 {
+        usage["server_tool_use"] = json!({"web_search_requests": web_search_requests});
+    }
+    usage
 }
 
 fn map_stop_reason(reason: Option<&str>) -> Value {
@@ -1368,6 +1547,19 @@ pub struct StreamOptions {
     /// stream emits the single RequestSummary at close.
     pub summary: Option<crate::obs::StreamSummary>,
     pub timeouts: StreamTimeouts,
+    /// Present only when the request declared a WebSearch server tool.
+    pub server_loop: Option<ServerLoopContext>,
+}
+
+/// Inputs the streaming pump needs to execute Cline WebSearch and start
+/// continuation generations on the same downstream SSE stream.
+pub struct ServerLoopContext {
+    pub config: crate::websearch::WebSearchConfig,
+    pub upstream: crate::upstream::ClineUpstream,
+    pub chat_body: Value,
+    pub session_fp: Option<String>,
+    pub model: String,
+    pub selected: crate::pool::SelectedKey,
 }
 
 pub fn stream_body(response: reqwest::Response, options: StreamOptions) -> Body {
@@ -1381,16 +1573,29 @@ pub fn stream_body(response: reqwest::Response, options: StreamOptions) -> Body 
         shadow,
         summary,
         timeouts,
+        server_loop,
     } = options;
     let output = async_stream::stream! {
-        let mut upstream = response.bytes_stream();
         let idle = tokio::time::sleep(STREAM_PING_INTERVAL);
         tokio::pin!(idle);
         let progress_interval = Duration::from_secs(progress_secs.max(1));
         let progress = tokio::time::sleep(progress_interval);
         tokio::pin!(progress);
-        let mut decoder = SseDecoder::default();
-        let mut state = StreamState::new(request_id, fallback_model, expose_thinking, request_started);
+        let server_names: std::collections::HashSet<String> = server_loop
+            .as_ref()
+            .map(|_context| {
+                [crate::websearch::FUNCTION_NAME.to_owned()]
+                    .into_iter()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut state = StreamState::new(request_id, fallback_model, expose_thinking, request_started)
+            .with_server_tools(server_names.clone());
+        let mut current_response = Some(response);
+        let mut server_loop = server_loop;
+        let mut uses_left = server_loop.as_ref().map(|context| context.config.max_uses).unwrap_or(0);
+        let mut generation_rounds = 0u32;
+        let mut web_search_stats = crate::obs::WebSearchStats::default();
         let mut telemetry = StreamTelemetry::new(
             state.request_id.clone(),
             key_name.clone(),
@@ -1401,7 +1606,16 @@ pub fn stream_body(response: reqwest::Response, options: StreamOptions) -> Body 
         let mut watch = StreamWatch::new(timeouts, watch_start);
         let stall = tokio::time::sleep_until(watch.next_deadline());
         tokio::pin!(stall);
-        loop {
+        'rounds: loop {
+            generation_rounds = generation_rounds.saturating_add(1);
+            let Some(response) = current_response.take() else {
+                break 'rounds;
+            };
+            let mut upstream = response.bytes_stream();
+            let mut decoder = SseDecoder::default();
+            watch = StreamWatch::new(timeouts, TokioInstant::now());
+            stall.as_mut().reset(watch.next_deadline());
+            loop {
             tokio::select! {
                 biased;
                 chunk = upstream.next() => match chunk {
@@ -1451,6 +1665,9 @@ pub fn stream_body(response: reqwest::Response, options: StreamOptions) -> Body 
                                 telemetry.absorb(&state);
                                 telemetry.finish(if state.finish_reason.is_some() { "complete" } else { "protocol_error" });
                                 return;
+                            }
+                            if state.round_complete {
+                                break;
                             }
                         }
                         stall.as_mut().reset(watch.next_deadline());
@@ -1509,38 +1726,55 @@ pub fn stream_body(response: reqwest::Response, options: StreamOptions) -> Body 
                     progress.as_mut().reset(tokio::time::Instant::now() + progress_interval);
                 }
             }
-        }
-        let trailing = match decoder.finish() {
-            Ok(events) => events,
-            Err(()) => {
-                let frame = sse_frame("error", error_envelope(
-                    "api_error", "upstream SSE event exceeded the gateway limit", &state.request_id,
-                ));
-                telemetry.commit(frame.len());
-                yield Ok(frame);
-                telemetry.absorb(&state);
-                telemetry.finish("decode_error");
+            } // inner select loop
+            if state.terminal {
                 return;
             }
-        };
-        for event in trailing {
-            telemetry.upstream_events = telemetry.upstream_events.saturating_add(1);
-            telemetry.first_event();
-            for frame in state.handle(&event.data) {
-                telemetry.commit(frame.len());
-                yield Ok(frame);
-            }
-        }
-        if !state.terminal {
-            if state.finish_reason.is_some() {
-                for frame in state.finalize() {
+            let trailing = match decoder.finish() {
+                Ok(events) => events,
+                Err(()) => {
+                    let frame = sse_frame("error", error_envelope(
+                        "api_error", "upstream SSE event exceeded the gateway limit", &state.request_id,
+                    ));
+                    telemetry.commit(frame.len());
+                    yield Ok(frame);
+                    telemetry.absorb(&state);
+                    telemetry.finish("decode_error");
+                    return;
+                }
+            };
+            for event in trailing {
+                telemetry.upstream_events = telemetry.upstream_events.saturating_add(1);
+                telemetry.first_event();
+                for frame in state.handle(&event.data) {
                     telemetry.commit(frame.len());
                     yield Ok(frame);
                 }
-                state.commit_shadow(shadow.as_ref());
-                telemetry.absorb(&state);
-                telemetry.finish("complete");
-            } else {
+            }
+            if state.terminal {
+                return;
+            }
+            if server_loop.is_none() {
+                if state.finish_reason.is_some() {
+                    for frame in state.finalize() {
+                        telemetry.commit(frame.len());
+                        yield Ok(frame);
+                    }
+                    state.commit_shadow(shadow.as_ref());
+                    telemetry.absorb(&state);
+                    telemetry.finish("complete");
+                } else {
+                    let frame = sse_frame("error", error_envelope(
+                        "api_error", "upstream stream ended unexpectedly", &state.request_id,
+                    ));
+                    telemetry.commit(frame.len());
+                    yield Ok(frame);
+                    telemetry.absorb(&state);
+                    telemetry.finish("unexpected_eof");
+                }
+                return;
+            }
+            if state.finish_reason.is_none() && !state.round_complete {
                 let frame = sse_frame("error", error_envelope(
                     "api_error", "upstream stream ended unexpectedly", &state.request_id,
                 ));
@@ -1548,10 +1782,239 @@ pub fn stream_body(response: reqwest::Response, options: StreamOptions) -> Body 
                 yield Ok(frame);
                 telemetry.absorb(&state);
                 telemetry.finish("unexpected_eof");
+                return;
+            }
+            let calls = state.openai_tool_calls();
+            let kind = crate::websearch::classify_round(&calls, &server_names);
+            let server_calls: Vec<_> = calls
+                .iter()
+                .filter(|call| server_names.contains(&call.name))
+                .cloned()
+                .collect();
+            match kind {
+                crate::websearch::ToolRoundKind::None
+                | crate::websearch::ToolRoundKind::ClientOnly => {
+                    for frame in state.finalize() {
+                        telemetry.commit(frame.len());
+                        yield Ok(frame);
+                    }
+                    state.commit_shadow(shadow.as_ref());
+                    if let Some(summary) = telemetry.summary.as_mut() {
+                        summary.web_search = web_search_stats.clone();
+                    }
+                    telemetry.absorb(&state);
+                    telemetry.finish("complete");
+                    return;
+                }
+                crate::websearch::ToolRoundKind::Mixed => {
+                    web_search_stats.mixed_tool_rounds =
+                        web_search_stats.mixed_tool_rounds.saturating_add(1);
+                    let Some(context) = server_loop.as_ref() else {
+                        break 'rounds;
+                    };
+                    for frame in state.emit_server_tool_use(&server_calls) {
+                        telemetry.commit(frame.len());
+                        yield Ok(frame);
+                    }
+                    let search_started = Instant::now();
+                    let outcomes = execute_web_search_round(
+                        &server_calls,
+                        &context.config,
+                        &mut uses_left,
+                        &context.upstream,
+                        &context.selected,
+                        &state.request_id,
+                        context.session_fp.as_deref(),
+                    )
+                    .await;
+                    web_search_stats.record_outcomes(&outcomes, search_started.elapsed().as_millis() as u64);
+                    for frame in state.finish_server_tool_round(&outcomes) {
+                        telemetry.commit(frame.len());
+                        yield Ok(frame);
+                    }
+                    for frame in state.finalize() {
+                        telemetry.commit(frame.len());
+                        yield Ok(frame);
+                    }
+                    state.commit_shadow(shadow.as_ref());
+                    if let Some(summary) = telemetry.summary.as_mut() {
+                        summary.web_search = web_search_stats.clone();
+                    }
+                    telemetry.absorb(&state);
+                    telemetry.finish("complete");
+                    return;
+                }
+                crate::websearch::ToolRoundKind::ServerOnly => {
+                    web_search_stats.server_tool_rounds =
+                        web_search_stats.server_tool_rounds.saturating_add(1);
+                    let budget_exhausted = uses_left == 0
+                        || generation_rounds >= crate::websearch::MAX_INTERNAL_GENERATION_ROUNDS;
+                    for frame in state.emit_server_tool_use(&server_calls) {
+                        telemetry.commit(frame.len());
+                        yield Ok(frame);
+                    }
+                    let Some(context) = server_loop.as_mut() else {
+                        break 'rounds;
+                    };
+                    let search_started = Instant::now();
+                    let outcomes = if budget_exhausted {
+                        server_calls
+                            .iter()
+                            .map(|call| {
+                                crate::websearch::SearchOutcome::failed(
+                                    crate::websearch::query_from_arguments(&call.arguments)
+                                        .unwrap_or_default(),
+                                    crate::websearch::SearchErrorCode::MaxUsesExceeded,
+                                )
+                            })
+                            .collect()
+                    } else {
+                        execute_web_search_round(
+                            &server_calls,
+                            &context.config,
+                            &mut uses_left,
+                            &context.upstream,
+                            &context.selected,
+                            &state.request_id,
+                            context.session_fp.as_deref(),
+                        )
+                        .await
+                    };
+                    web_search_stats.record_outcomes(
+                        &outcomes,
+                        search_started.elapsed().as_millis() as u64,
+                    );
+                    for frame in state.finish_server_tool_round(&outcomes) {
+                        telemetry.commit(frame.len());
+                        yield Ok(frame);
+                    }
+                    if budget_exhausted {
+                        web_search_stats.pause_turns =
+                            web_search_stats.pause_turns.saturating_add(1);
+                        for frame in state.finalize_as_paused() {
+                            telemetry.commit(frame.len());
+                            yield Ok(frame);
+                        }
+                        state.commit_shadow(shadow.as_ref());
+                        if let Some(summary) = telemetry.summary.as_mut() {
+                            summary.web_search = web_search_stats.clone();
+                        }
+                        telemetry.absorb(&state);
+                        telemetry.finish("complete");
+                        return;
+                    }
+                    crate::websearch::append_server_round(
+                        &mut context.chat_body,
+                        &server_calls,
+                        &outcomes,
+                    );
+                    let body_bytes = match serde_json::to_vec(&context.chat_body) {
+                        Ok(bytes) => Bytes::from(bytes),
+                        Err(_) => {
+                            let frame = sse_frame("error", error_envelope(
+                                "api_error", "search continuation could not be serialized", &state.request_id,
+                            ));
+                            telemetry.commit(frame.len());
+                            yield Ok(frame);
+                            telemetry.absorb(&state);
+                            telemetry.finish("protocol_error");
+                            return;
+                        }
+                    };
+                    match context
+                        .upstream
+                        .send_chat(
+                            body_bytes,
+                            true,
+                            &state.request_id,
+                            &context.model,
+                            context.session_fp.as_deref(),
+                        )
+                        .await
+                    {
+                        Ok(result) => {
+                            context.selected = result.selected.clone();
+                            telemetry.key_name = result.selected.name.to_string();
+                            match result.response {
+                                crate::upstream::UpstreamResponse::Success(response) => {
+                                    current_response = Some(response);
+                                    state.begin_new_round();
+                                    continue 'rounds;
+                                }
+                                crate::upstream::UpstreamResponse::HttpError(_) => {
+                                    let frame = sse_frame("error", error_envelope(
+                                        "api_error", "search continuation failed", &state.request_id,
+                                    ));
+                                    telemetry.commit(frame.len());
+                                    yield Ok(frame);
+                                    telemetry.absorb(&state);
+                                    telemetry.finish("upstream_protocol_error");
+                                    return;
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            let frame = sse_frame("error", error_envelope(
+                                "api_error", "search continuation failed", &state.request_id,
+                            ));
+                            telemetry.commit(frame.len());
+                            yield Ok(frame);
+                            telemetry.absorb(&state);
+                            telemetry.finish("upstream_error");
+                            return;
+                        }
+                    }
+                }
             }
         }
     };
     Body::from_stream(output)
+}
+
+pub(crate) async fn execute_web_search_round(
+    calls: &[crate::websearch::OpenAiToolCall],
+    config: &crate::websearch::WebSearchConfig,
+    uses_left: &mut u32,
+    upstream: &crate::upstream::ClineUpstream,
+    selected: &crate::pool::SelectedKey,
+    request_id: &str,
+    session_fp: Option<&str>,
+) -> Vec<crate::websearch::SearchOutcome> {
+    let mut outcomes = Vec::with_capacity(calls.len());
+    for call in calls {
+        if *uses_left == 0 {
+            outcomes.push(crate::websearch::SearchOutcome::failed(
+                crate::websearch::query_from_arguments(&call.arguments).unwrap_or_default(),
+                crate::websearch::SearchErrorCode::MaxUsesExceeded,
+            ));
+            continue;
+        }
+        match crate::websearch::query_from_arguments(&call.arguments) {
+            Err(code) => {
+                outcomes.push(crate::websearch::SearchOutcome::failed(String::new(), code))
+            }
+            Ok(query) => {
+                *uses_left = uses_left.saturating_sub(1);
+                let outcome = upstream
+                    .search_web(
+                        selected,
+                        &query,
+                        config.domains.as_ref(),
+                        request_id,
+                        session_fp,
+                    )
+                    .await;
+                tracing::debug!(
+                    request_id,
+                    results = outcome.results.len(),
+                    error = outcome.error.map(|code| code.as_str()),
+                    "web search executed"
+                );
+                outcomes.push(outcome);
+            }
+        }
+    }
+    outcomes
 }
 
 struct StreamTelemetry {
@@ -1891,6 +2354,11 @@ struct StreamState {
     fallback_model: String,
     started: bool,
     terminal: bool,
+    /// Set when this upstream round produced a finish_reason and [DONE]
+    /// (or the stream ended). The caller decides whether to finalize or
+    /// continue a server-tool loop; auto-finalize is skipped when server
+    /// tools are declared.
+    round_complete: bool,
     /// Anti-amplification gate: when false, upstream reasoning is counted
     /// but never emitted as Anthropic thinking blocks.
     expose_thinking: bool,
@@ -1918,6 +2386,11 @@ struct StreamState {
     /// stream duration; empty when exposed (client already has it) or no
     /// shadow context was provided.
     shadow_reasoning: String,
+    server_tool_names: HashSet<String>,
+    buffer_client_tools: bool,
+    server_blocks: Vec<Value>,
+    web_search_requests: u64,
+    pending_server_ids: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -1925,6 +2398,9 @@ enum BlockKind {
     Text,
     Thinking,
     Tool,
+    /// Already emitted `content_block_stop` (server-tool blocks, or a
+    /// text/thinking block closed so a later round can open a new one).
+    Closed,
 }
 
 #[derive(Default)]
@@ -1933,6 +2409,7 @@ struct ToolStream {
     id: Option<String>,
     name: Option<String>,
     pending_arguments: String,
+    server: bool,
 }
 
 impl StreamState {
@@ -1966,7 +2443,19 @@ impl StreamState {
             first_tool_call: None,
             request_started,
             shadow_reasoning: String::new(),
+            round_complete: false,
+            server_tool_names: HashSet::new(),
+            buffer_client_tools: false,
+            server_blocks: Vec::new(),
+            web_search_requests: 0,
+            pending_server_ids: Vec::new(),
         }
+    }
+
+    fn with_server_tools(mut self, names: HashSet<String>) -> Self {
+        self.buffer_client_tools = !names.is_empty();
+        self.server_tool_names = names;
+        self
     }
 
     fn mark_first(kind: &mut Option<u128>, request_started: Instant) {
@@ -1978,6 +2467,10 @@ impl StreamState {
     fn handle(&mut self, data: &str) -> Vec<Bytes> {
         if data.trim() == "[DONE]" {
             if self.finish_reason.is_some() {
+                if !self.server_tool_names.is_empty() {
+                    self.round_complete = true;
+                    return Vec::new();
+                }
                 return self.finalize();
             }
             self.terminal = true;
@@ -2165,26 +2658,41 @@ impl StreamState {
             .and_then(|function| function.get("arguments"))
             .and_then(Value::as_str)
             .unwrap_or("");
-        if tool.block_index.is_none() && (tool.name.is_some() || !arguments.is_empty()) {
-            let index = self.blocks.len();
-            self.blocks.push(BlockKind::Tool);
-            tool.block_index = Some(index);
-            let id = tool
-                .id
-                .clone()
-                .unwrap_or_else(|| format!("toolu_{upstream_index}"));
-            let name = tool.name.clone().unwrap_or_else(|| "unknown".into());
-            frames.push(sse_frame(
-                "content_block_start",
-                json!({"type":"content_block_start", "index":index,
-                    "content_block":{"type":"tool_use", "id":id, "name":name, "input":{}}}),
-            ));
-            if !tool.pending_arguments.is_empty() {
+        if let Some(name) = tool.name.as_deref() {
+            if self.server_tool_names.contains(name) {
+                tool.server = true;
+            }
+        }
+        let ready_to_start = tool.block_index.is_none()
+            && (tool.name.is_some() || !arguments.is_empty())
+            && !(!self.server_tool_names.is_empty() && tool.name.is_none());
+        if ready_to_start {
+            if tool.server {
+                // Server tools are never emitted as client `tool_use`.
+            } else if self.buffer_client_tools {
+                // Mixed/server-declared rounds emit client tools after
+                // server-tool blocks so indexes stay monotonic.
+            } else {
+                let index = self.blocks.len();
+                self.blocks.push(BlockKind::Tool);
+                tool.block_index = Some(index);
+                let id = tool
+                    .id
+                    .clone()
+                    .unwrap_or_else(|| format!("toolu_{upstream_index}"));
+                let name = tool.name.clone().unwrap_or_else(|| "unknown".into());
                 frames.push(sse_frame(
+                    "content_block_start",
+                    json!({"type":"content_block_start", "index":index,
+                    "content_block":{"type":"tool_use", "id":id, "name":name, "input":{}}}),
+                ));
+                if !tool.pending_arguments.is_empty() {
+                    frames.push(sse_frame(
                     "content_block_delta",
                     json!({"type":"content_block_delta", "index":index,
                         "delta":{"type":"input_json_delta", "partial_json":std::mem::take(&mut tool.pending_arguments)}}),
                 ));
+                }
             }
         }
         if arguments.is_empty() {
@@ -2209,7 +2717,7 @@ impl StreamState {
         let pending = self
             .tools
             .iter()
-            .filter(|(_, tool)| tool.block_index.is_none())
+            .filter(|(_, tool)| tool.block_index.is_none() && !tool.server)
             .map(|(index, _)| *index)
             .collect::<Vec<_>>();
         for upstream_index in pending {
@@ -2237,29 +2745,184 @@ impl StreamState {
                 }
             }
         }
+        self.finish_with_stop(&mut frames, None);
+        frames
+    }
+
+    fn finish_with_stop(&mut self, frames: &mut Vec<Bytes>, stop_override: Option<&str>) {
         self.terminal = true;
         for (index, block) in self.blocks.iter().enumerate() {
-            if matches!(block, BlockKind::Thinking) {
+            match block {
+                BlockKind::Closed => continue,
+                BlockKind::Thinking => {
+                    frames.push(sse_frame(
+                        "content_block_delta",
+                        json!({"type":"content_block_delta", "index":index,
+                            "delta":{"type":"signature_delta",
+                                "signature":thinking_signature("streamed", &self.request_id)}}),
+                    ));
+                    frames.push(sse_frame(
+                        "content_block_stop",
+                        json!({"type":"content_block_stop", "index":index}),
+                    ));
+                }
+                BlockKind::Text | BlockKind::Tool => {
+                    frames.push(sse_frame(
+                        "content_block_stop",
+                        json!({"type":"content_block_stop", "index":index}),
+                    ));
+                }
+            }
+        }
+        let stop_reason = stop_override
+            .map(|reason| Value::String(reason.to_owned()))
+            .unwrap_or_else(|| map_stop_reason(self.finish_reason.as_deref()));
+        frames.push(sse_frame(
+            "message_delta",
+            json!({"type":"message_delta", "delta":{
+                "stop_reason":stop_reason,
+                "stop_sequence":self.stop_sequence
+            }, "usage":convert_usage_with(Some(&self.usage), self.web_search_requests)}),
+        ));
+        frames.push(sse_frame("message_stop", json!({"type":"message_stop"})));
+    }
+
+    fn close_open_content_blocks(&mut self) -> Vec<Bytes> {
+        let mut frames = Vec::new();
+        if let Some(index) = self.thinking_index {
+            if matches!(self.blocks.get(index), Some(BlockKind::Thinking)) {
                 frames.push(sse_frame(
                     "content_block_delta",
                     json!({"type":"content_block_delta", "index":index,
                         "delta":{"type":"signature_delta",
                             "signature":thinking_signature("streamed", &self.request_id)}}),
                 ));
+                frames.push(sse_frame(
+                    "content_block_stop",
+                    json!({"type":"content_block_stop", "index":index}),
+                ));
+                self.blocks[index] = BlockKind::Closed;
             }
+            self.thinking_index = None;
+        }
+        if let Some(index) = self.text_index {
+            if matches!(self.blocks.get(index), Some(BlockKind::Text)) {
+                frames.push(sse_frame(
+                    "content_block_stop",
+                    json!({"type":"content_block_stop", "index":index}),
+                ));
+                self.blocks[index] = BlockKind::Closed;
+            }
+            self.text_index = None;
+        }
+        frames
+    }
+
+    fn openai_tool_calls(&self) -> Vec<crate::websearch::OpenAiToolCall> {
+        let mut calls: Vec<(u64, crate::websearch::OpenAiToolCall)> = self
+            .tools
+            .iter()
+            .map(|(index, tool)| {
+                (
+                    *index,
+                    crate::websearch::OpenAiToolCall {
+                        id: tool.id.clone().unwrap_or_else(|| format!("toolu_{index}")),
+                        name: tool.name.clone().unwrap_or_else(|| "unknown".into()),
+                        arguments: tool.pending_arguments.clone(),
+                    },
+                )
+            })
+            .collect();
+        calls.sort_by_key(|(index, _)| *index);
+        calls.into_iter().map(|(_, call)| call).collect()
+    }
+
+    fn emit_server_tool_use(&mut self, calls: &[crate::websearch::OpenAiToolCall]) -> Vec<Bytes> {
+        let mut frames = self.close_open_content_blocks();
+        self.pending_server_ids.clear();
+        for call in calls {
+            let tool_use_id = crate::websearch::new_server_tool_id();
+            let input = serde_json::from_str::<Value>(&call.arguments)
+                .ok()
+                .filter(Value::is_object)
+                .unwrap_or_else(|| json!({}));
+            let use_block = json!({
+                "type": "server_tool_use",
+                "id": tool_use_id,
+                "name": crate::websearch::FUNCTION_NAME,
+                "input": input
+            });
+            let index = self.blocks.len();
+            self.blocks.push(BlockKind::Closed);
+            frames.push(sse_frame(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {
+                        "type": "server_tool_use",
+                        "id": tool_use_id,
+                        "name": crate::websearch::FUNCTION_NAME,
+                        "input": {}
+                    }
+                }),
+            ));
+            frames.push(sse_frame(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {"type": "input_json_delta", "partial_json": input.to_string()}
+                }),
+            ));
             frames.push(sse_frame(
                 "content_block_stop",
-                json!({"type":"content_block_stop", "index":index}),
+                json!({"type": "content_block_stop", "index": index}),
             ));
+            self.pending_server_ids.push(tool_use_id);
+            self.server_blocks.push(use_block);
         }
-        frames.push(sse_frame(
-            "message_delta",
-            json!({"type":"message_delta", "delta":{
-                "stop_reason":map_stop_reason(self.finish_reason.as_deref()),
-                "stop_sequence":self.stop_sequence
-            }, "usage":convert_usage(Some(&self.usage))}),
-        ));
-        frames.push(sse_frame("message_stop", json!({"type":"message_stop"})));
+        frames
+    }
+
+    fn finish_server_tool_round(
+        &mut self,
+        outcomes: &[crate::websearch::SearchOutcome],
+    ) -> Vec<Bytes> {
+        let mut frames = Vec::new();
+        let ids = std::mem::take(&mut self.pending_server_ids);
+        for (tool_use_id, outcome) in ids.into_iter().zip(outcomes.iter()) {
+            let (_, result_block) = crate::websearch::client_blocks(&tool_use_id, outcome);
+            let index = self.blocks.len();
+            self.blocks.push(BlockKind::Closed);
+            frames.push(sse_frame(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": result_block
+                }),
+            ));
+            frames.push(sse_frame(
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": index}),
+            ));
+            self.server_blocks.push(result_block);
+            self.web_search_requests = self.web_search_requests.saturating_add(1);
+        }
+        frames
+    }
+
+    fn begin_new_round(&mut self) {
+        self.tools.clear();
+        self.finish_reason = None;
+        self.round_complete = false;
+        self.stop_sequence = Value::Null;
+    }
+
+    fn finalize_as_paused(&mut self) -> Vec<Bytes> {
+        let mut frames = Vec::new();
+        self.finish_with_stop(&mut frames, Some("pause_turn"));
         frames
     }
 }
@@ -3209,5 +3872,233 @@ mod tests {
         let frames = truncated.handle(r#"{"choices":[{"delta":{"content":"partial"}}]}"#);
         assert!(!frames.is_empty());
         assert!(truncated.finish_reason.is_none());
+    }
+
+    #[test]
+    fn web_search_declaration_converts_to_stable_function() {
+        let converted = convert_request(
+            serde_json::to_vec(&json!({
+                "model":"claude-sonnet-4-6", "max_tokens":128,
+                "messages":[{"role":"user","content":"search rust"}],
+                "tools":[{
+                    "type":"web_search_20250305",
+                    "name":"web_search",
+                    "max_uses": 4,
+                    "allowed_domains":["rust-lang.org"]
+                }]
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap();
+        let tools = converted.body["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["name"], "web_search");
+        assert_eq!(
+            tools[0],
+            crate::websearch::upstream_function(),
+            "upstream function must be deterministic"
+        );
+        let search = converted.server_tools.web_search.expect("parsed");
+        assert_eq!(search.max_uses, 4);
+        assert_eq!(
+            search.domains,
+            Some(crate::websearch::DomainFilter::Allowed(vec![
+                "rust-lang.org".into()
+            ]))
+        );
+    }
+
+    #[test]
+    fn unknown_web_search_version_is_rejected() {
+        let error = convert_request(
+            serde_json::to_vec(&json!({
+                "model":"claude-sonnet-4-6", "max_tokens":128,
+                "messages":[{"role":"user","content":"x"}],
+                "tools":[{"type":"web_search_20990101","name":"web_search"}]
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap_err();
+        assert_eq!(error.error_type, "invalid_request_error");
+        assert!(error.message.contains("not supported"));
+    }
+
+    #[test]
+    fn client_tools_remain_unchanged_alongside_web_search() {
+        let converted = convert_request(
+            serde_json::to_vec(&json!({
+                "model":"claude-sonnet-4-6", "max_tokens":128,
+                "messages":[{"role":"user","content":"x"}],
+                "tools":[
+                    {"name":"Read","description":"read","input_schema":{"type":"object"}},
+                    {"type":"web_search_20250305","name":"web_search"}
+                ]
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap();
+        let tools = converted.body["tools"].as_array().unwrap();
+        assert_eq!(tools[0]["function"]["name"], "Read");
+        assert_eq!(tools[1]["function"]["name"], "web_search");
+        assert!(converted.server_tools.web_search.is_some());
+    }
+
+    #[test]
+    fn server_tool_history_replays_matching_ids() {
+        let converted = convert_request(
+            serde_json::to_vec(&json!({
+                "model":"claude-sonnet-4-6", "max_tokens":128,
+                "messages":[
+                    {"role":"user","content":"search"},
+                    {"role":"assistant","content":[
+                        {"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{"query":"q"}},
+                        {"type":"web_search_tool_result","tool_use_id":"srvtoolu_1","content":[
+                            {"type":"web_search_result","title":"T","url":"https://example.com"}
+                        ]},
+                        {"type":"text","text":"done"}
+                    ]}
+                ]
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap();
+        let messages = converted.body["messages"].as_array().unwrap();
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "srvtoolu_1");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "srvtoolu_1");
+        assert!(messages[2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("https://example.com"));
+        assert_eq!(messages[3]["role"], "assistant");
+        assert_eq!(messages[3]["content"][0]["text"], "done");
+    }
+
+    #[test]
+    fn server_tool_result_without_use_is_rejected() {
+        let error = convert_request(
+            serde_json::to_vec(&json!({
+                "model":"claude-sonnet-4-6", "max_tokens":128,
+                "messages":[{"role":"assistant","content":[
+                    {"type":"web_search_tool_result","tool_use_id":"srvtoolu_x","content":[]}
+                ]}]
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap_err();
+        assert!(error.message.contains("unknown server_tool_use"));
+    }
+
+    #[test]
+    fn dangling_server_tool_use_is_rejected() {
+        let error = convert_request(
+            serde_json::to_vec(&json!({
+                "model":"claude-sonnet-4-6", "max_tokens":128,
+                "messages":[{"role":"assistant","content":[
+                    {"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{"query":"q"}}
+                ]}]
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap_err();
+        assert!(error.message.contains("without its web_search_tool_result"));
+    }
+
+    #[test]
+    fn stream_does_not_emit_web_search_as_client_tool_use() {
+        let names = ["web_search".to_owned()].into_iter().collect();
+        let mut state = StreamState::new("req".into(), "model".into(), false, Instant::now())
+            .with_server_tools(names);
+        let mut frames = Vec::new();
+        frames.extend(state.handle(
+            r#"{"id":"chat","model":"m","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_w","function":{"name":"web_search","arguments":"{\"query\":\"rust\"}"}}]}}]}"#,
+        ));
+        frames.extend(state.handle(r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#));
+        frames.extend(state.handle("[DONE]"));
+        let text = frames
+            .into_iter()
+            .map(|frame| String::from_utf8(frame.to_vec()).unwrap())
+            .collect::<String>();
+        assert!(text.contains("message_start"));
+        assert!(!text.contains("\"type\":\"tool_use\""));
+        assert!(state.round_complete);
+        let calls = state.openai_tool_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "web_search");
+        let server_frames = state.emit_server_tool_use(&calls);
+        let emitted = server_frames
+            .into_iter()
+            .map(|frame| String::from_utf8(frame.to_vec()).unwrap())
+            .collect::<String>();
+        assert!(emitted.contains("server_tool_use"));
+        assert!(emitted.contains("\"index\":0"));
+        let outcome = crate::websearch::SearchOutcome {
+            query: "rust".into(),
+            results: vec![json!({"title":"t","url":"https://a.example"})],
+            error: None,
+        };
+        let result_frames = state.finish_server_tool_round(std::slice::from_ref(&outcome));
+        let emitted = result_frames
+            .into_iter()
+            .map(|frame| String::from_utf8(frame.to_vec()).unwrap())
+            .collect::<String>();
+        assert!(emitted.contains("web_search_tool_result"));
+        assert!(emitted.contains("\"index\":1"));
+        assert!(!emitted.contains("encrypted"));
+        let end = state.finalize_as_paused();
+        let emitted = end
+            .into_iter()
+            .map(|frame| String::from_utf8(frame.to_vec()).unwrap())
+            .collect::<String>();
+        assert!(emitted.contains("pause_turn"));
+        assert!(emitted.contains("message_stop"));
+    }
+
+    #[test]
+    fn mixed_round_keeps_client_tools_and_monotonic_indexes() {
+        let names = ["web_search".to_owned()].into_iter().collect();
+        let mut state = StreamState::new("req".into(), "model".into(), false, Instant::now())
+            .with_server_tools(names);
+        let _ = state.handle(
+            r#"{"id":"c","model":"m","choices":[{"delta":{"tool_calls":[
+                {"index":0,"id":"call_w","function":{"name":"web_search","arguments":"{\"query\":\"q\"}"}},
+                {"index":1,"id":"call_r","function":{"name":"Read","arguments":"{\"path\":\"a\"}"}}
+            ]}}]}"#,
+        );
+        let _ = state.handle(r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#);
+        let _ = state.handle("[DONE]");
+        let calls = state.openai_tool_calls();
+        let server: Vec<_> = calls
+            .iter()
+            .filter(|call| call.name == "web_search")
+            .cloned()
+            .collect();
+        let _ = state.emit_server_tool_use(&server);
+        let outcome = crate::websearch::SearchOutcome::failed(
+            "q",
+            crate::websearch::SearchErrorCode::Unavailable,
+        );
+        let result_frames = state.finish_server_tool_round(std::slice::from_ref(&outcome));
+        let mut text = result_frames
+            .into_iter()
+            .map(|frame| String::from_utf8(frame.to_vec()).unwrap())
+            .collect::<String>();
+        text.push_str(
+            &state
+                .finalize()
+                .into_iter()
+                .map(|frame| String::from_utf8(frame.to_vec()).unwrap())
+                .collect::<String>(),
+        );
+        assert!(text.contains("\"type\":\"tool_use\""));
+        assert!(text.contains("Read"));
+        assert!(text.contains("web_search_tool_result_error"));
     }
 }

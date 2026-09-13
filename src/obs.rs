@@ -30,6 +30,56 @@ use crate::console::{format_duration_ms, format_tokens};
 /// JSONL schema for `RequestSummary`. Bump when field meaning changes.
 pub const SCHEMA_VERSION: u32 = 3;
 
+/// WebSearch server-tool counters. Counts and timings only — never queries,
+/// URLs, snippets, or result bodies.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct WebSearchStats {
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub web_searches: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub web_search_errors: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub web_search_rounds: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub web_search_results: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub web_search_ms: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub server_tool_rounds: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub mixed_tool_rounds: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub pause_turns: u64,
+}
+
+impl WebSearchStats {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn record_outcomes(
+        &mut self,
+        outcomes: &[crate::websearch::SearchOutcome],
+        elapsed_ms: u64,
+    ) {
+        self.web_searches = self.web_searches.saturating_add(outcomes.len() as u64);
+        self.web_search_ms = self.web_search_ms.saturating_add(elapsed_ms);
+        for outcome in outcomes {
+            if outcome.is_error() {
+                self.web_search_errors = self.web_search_errors.saturating_add(1);
+            } else {
+                self.web_search_results = self
+                    .web_search_results
+                    .saturating_add(outcome.results.len() as u64);
+            }
+        }
+    }
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
 /// Approximate upper bound of one summary's serialized size, used to
 /// document queue memory: 8192 × ~1 KiB ≈ 8 MiB worst case, typically
 /// far less (most fields are small integers).
@@ -223,6 +273,8 @@ pub struct RequestSummary {
     pub tool_call_events: u64,
     pub response_shape: Option<&'static str>,
     pub upstream_status: Option<u16>,
+    #[serde(skip_serializing_if = "WebSearchStats::is_empty")]
+    pub web_search: WebSearchStats,
     pub outcome: &'static str,
     /// Present only for anomalous requests.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -668,6 +720,7 @@ impl SummaryBuilder {
             tool_call_events: facts.tool_call_events,
             response_shape: facts.response_shape,
             upstream_status: facts.upstream_status,
+            web_search: facts.web_search.clone(),
             outcome: facts.outcome,
             flight,
             flight_dropped,
@@ -730,8 +783,13 @@ fn compact_request_line(summary: &RequestSummary, session: Option<&str>) -> Stri
         .error_kind
         .map(|kind| format!(" err={kind}"))
         .unwrap_or_default();
+    let search = if summary.web_search.web_searches > 0 {
+        format!(" search={}", summary.web_search.web_searches)
+    } else {
+        String::new()
+    };
     format!(
-        "{symbol} {family} agent={} key={} route={} in={input}{budget} cache={cache} out={out} ttft={ttft}{tool} dur={}{err}",
+        "{symbol} {family} agent={} key={} route={} in={input}{budget} cache={cache} out={out} ttft={ttft}{tool}{search} dur={}{err}",
         session.unwrap_or("-"),
         summary.selected_key_name,
         summary.route,
@@ -782,6 +840,7 @@ pub struct SummaryEmit<'a> {
     pub response_shape: Option<&'static str>,
     pub upstream_status: Option<u16>,
     pub outcome: &'static str,
+    pub web_search: WebSearchStats,
 }
 
 /// Walk a path into a JSON value (tiny helper for usage fields).
@@ -825,6 +884,7 @@ pub struct StreamSummary {
     pub local_tokens: LocalTokenSlot,
     pub context_limit_tokens: Option<u64>,
     pub upstream_headers_ms: Option<u128>,
+    pub web_search: WebSearchStats,
 }
 
 /// Dynamic per-stream data at close.
@@ -918,6 +978,7 @@ impl StreamSummary {
             tool_call_events: snap.tool_call_events,
             response_shape: None,
             upstream_status: Some(200),
+            web_search: self.web_search.clone(),
             outcome,
         });
     }
@@ -993,6 +1054,7 @@ impl StreamSummary {
             tool_call_events: timings.tool_call_events,
             response_shape: timings.response_shape,
             upstream_status: timings.upstream_status,
+            web_search: self.web_search.clone(),
             outcome,
         });
     }
@@ -1216,6 +1278,7 @@ mod tests {
             tool_call_events: 1,
             response_shape: Some("openai"),
             upstream_status: Some(200),
+            web_search: WebSearchStats::default(),
             outcome: "complete",
             flight: None,
             flight_dropped: None,
@@ -1440,6 +1503,7 @@ mod tests {
             tool_call_events: 0,
             response_shape: None,
             upstream_status: Some(200),
+            web_search: WebSearchStats::default(),
             outcome: "upstream_error",
         });
         let LogRecord::Request(summary) = rx.try_recv().unwrap() else {
@@ -1519,6 +1583,7 @@ mod tests {
             tool_call_events: 0,
             response_shape: Some("openai"),
             upstream_status: Some(200),
+            web_search: WebSearchStats::default(),
             outcome: "complete",
         });
         let LogRecord::Request(summary) = rx.try_recv().unwrap() else {
