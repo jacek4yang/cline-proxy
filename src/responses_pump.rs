@@ -50,6 +50,85 @@ struct PumpStats {
     reasoning_bytes: u64,
     tool_bytes: u64,
     error: bool,
+    /// Gateway-executed web searches (counts only, never queries).
+    web_searches: u64,
+}
+
+/// Start one continuation generation (server-tool grounding round). The
+/// pool's effective-429 failover applies per round; a transport failure or a
+/// non-429 upstream error returns a sanitized terminal message (never a
+/// replay of already-streamed output).
+async fn start_continuation(
+    upstream: &crate::upstream::ClineUpstream,
+    chat_body: &Value,
+    session_fp: Option<&str>,
+    request_id: &str,
+) -> Result<(reqwest::Response, crate::pool::SelectedKey), String> {
+    let body = match serde_json::to_vec(chat_body) {
+        Ok(bytes) => Bytes::from(bytes),
+        Err(_) => return Err("search continuation could not be serialized".to_owned()),
+    };
+    let result = upstream
+        .send_chat(body, true, request_id, "", session_fp)
+        .await;
+    match result {
+        Ok(result) => match result.response {
+            crate::upstream::UpstreamResponse::Success(response) => Ok((response, result.selected)),
+            crate::upstream::UpstreamResponse::HttpError(_) => {
+                Err("search continuation failed".to_owned())
+            }
+        },
+        Err(_) => Err("search continuation failed".to_owned()),
+    }
+}
+
+/// Execute one server round's searches against Cline `/search/websearch`
+/// with the credential chat selected for this logical request. Failures
+/// become structured `SearchOutcome`s; they never rotate the chat key pool.
+async fn execute_server_round(
+    upstream: &crate::upstream::ClineUpstream,
+    context: &crate::websearch::ResponsesWebSearchContext,
+    calls: &[crate::websearch::OpenAiToolCall],
+    session_fp: &Option<String>,
+    request_id: &str,
+) -> Vec<crate::websearch::SearchOutcome> {
+    let mut uses_left = context.max_uses;
+    let selected = upstream.pool().active_key();
+    let mut outcomes = Vec::with_capacity(calls.len());
+    for call in calls {
+        if uses_left == 0 {
+            outcomes.push(crate::websearch::SearchOutcome::failed(
+                crate::websearch::query_from_arguments(&call.arguments).unwrap_or_default(),
+                crate::websearch::SearchErrorCode::MaxUsesExceeded,
+            ));
+            continue;
+        }
+        match crate::websearch::query_from_arguments(&call.arguments) {
+            Err(code) => {
+                outcomes.push(crate::websearch::SearchOutcome::failed(String::new(), code))
+            }
+            Ok(query) => {
+                uses_left = uses_left.saturating_sub(1);
+                let outcome = upstream
+                    .search_web(
+                        &selected,
+                        &query,
+                        context.domains.as_ref(),
+                        request_id,
+                        session_fp.as_deref(),
+                    )
+                    .await;
+                tracing::debug!(
+                    request_id,
+                    results = outcome.results.len(),
+                    error = outcome.error.map(|code| code.as_str()),
+                    "web search executed (responses)"
+                );
+                outcomes.push(outcome);
+            }
+        }
+    }
+    outcomes
 }
 
 fn openai_usage_shape(usage: (u64, u64, u64, u64)) -> Value {
@@ -86,26 +165,48 @@ fn commit_shadow(
 /// frame, which would fail the client's typed deserialization.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn responses_stream_response(
+    state: std::sync::Arc<crate::server::AppState>,
     response: reqwest::Response,
+    selected: crate::pool::SelectedKey,
+    chat_body: Value,
+    web_search: Option<crate::websearch::ResponsesWebSearchContext>,
     expose_thinking: bool,
     model: String,
     session_fp: Option<String>,
     shadow: Option<Arc<crate::reasoning_shadow::ReasoningShadowStore>>,
     timeouts: StreamTimeouts,
     summary: crate::obs::StreamSummary,
-    key_name: String,
     request_id: String,
 ) -> axum::response::Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<PumpItem>(64);
     let (stats_tx, stats_rx) = tokio::sync::oneshot::channel::<PumpStats>();
     let started_at = summary.started;
+    let key_name = selected.name.to_string();
 
     let _pump_task = tokio::spawn(async move {
-        let mut converter = ResponsesConverter::new(&model, expose_thinking);
+        // Server-tool loop inputs: the converter suppresses client-side
+        // `function_call` items for the upstream `web_search` function; the
+        // pump executes searches and re-invokes the upstream generation per
+        // round (retry invariants enforced by `send_chat`, per round).
+        let server_tool_names: std::collections::HashSet<String> = web_search
+            .as_ref()
+            .map(|_| {
+                [crate::websearch::FUNCTION_NAME.to_owned()]
+                    .into_iter()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut converter =
+            ResponsesConverter::with_server_tools(&model, expose_thinking, server_tool_names);
         let mut watch = StreamWatch::new(timeouts, tokio::time::Instant::now());
         let mut buffer: Vec<u8> = Vec::with_capacity(8192);
         let mut stats = PumpStats::default();
         let mut byte_stream = response.bytes_stream();
+        let mut chat_body = chat_body;
+        let mut rounds_left = web_search
+            .as_ref()
+            .map(|config| config.max_uses)
+            .unwrap_or(0);
         let mut ping = tokio::time::interval(PING_INTERVAL);
         ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut out: Vec<u8> = Vec::with_capacity(4096);
@@ -185,16 +286,88 @@ pub(crate) fn responses_stream_response(
                                 };
                                 let payload = trim_ascii(payload);
                                 if payload == b"[DONE]" {
-                                    let error = (converter.finish_reason().is_none())
-                                        .then_some("upstream stream ended unexpectedly");
-                                    if let Some(message) = error {
-                                        converter.finish(Some(message), &mut out);
-                                        stats.error = true;
+                                    // [DONE] for this upstream round: a pure
+                                    // server-tool round continues with a fresh
+                                    // upstream generation; anything else ends
+                                    // the client stream.
+                                    if converter.has_server_tools()
+                                        && !converter.has_client_tools()
+                                        && rounds_left > 0
+                                    {
+                                        let calls = converter.server_tool_calls();
+                                        rounds_left = rounds_left.saturating_sub(1);
+                                        let context = web_search
+                                            .as_ref()
+                                            .expect("server round requires context");
+                                        let outcomes = execute_server_round(
+                                            &state.upstream,
+                                            context,
+                                            &calls,
+                                            &session_fp,
+                                            &request_id,
+                                        )
+                                        .await;
+                                        let executed = converter.emit_web_search_round(
+                                            &calls, &outcomes, &mut out,
+                                        );
+                                        stats.web_searches =
+                                            stats.web_searches.saturating_add(executed);
+                                        crate::websearch::append_server_round(
+                                            &mut chat_body, &calls, &outcomes,
+                                        );
+                                        converter.begin_new_upstream_round();
+                                        if !out.is_empty() {
+                                            let payload = std::mem::take(&mut out);
+                                            if tx.send(PumpItem::Bytes(payload)).await.is_err() {
+                                                return;
+                                            }
+                                        }
+                                        // Continue with a fresh upstream
+                                        // generation. Retry invariants
+                                        // (effective-429 failover) are
+                                        // enforced inside `send_chat`, per
+                                        // round. A failed continuation is
+                                        // terminal: semantic output already
+                                        // streamed — never replayed.
+                                        match start_continuation(
+                                            &state.upstream,
+                                            &chat_body,
+                                            session_fp.as_deref(),
+                                            &request_id,
+                                        )
+                                        .await
+                                        {
+                                            Ok((next_response, _next_key)) => {
+                                                byte_stream = next_response.bytes_stream();
+                                                // Re-arm the watchdog for the
+                                                // new round; the outer loop's
+                                                // select continues.
+                                                watch = StreamWatch::new(
+                                                    timeouts,
+                                                    tokio::time::Instant::now(),
+                                                );
+                                                buffer.clear();
+                                                break;
+                                            }
+                                            Err(message) => {
+                                                converter.finish(Some(&message), &mut out);
+                                                stats.error = true;
+                                                done = true;
+                                                break;
+                                            }
+                                        }
                                     } else {
-                                        converter.finish(None, &mut out);
+                                        let error = (converter.finish_reason().is_none())
+                                            .then_some("upstream stream ended unexpectedly");
+                                        if let Some(message) = error {
+                                            converter.finish(Some(message), &mut out);
+                                            stats.error = true;
+                                        } else {
+                                            converter.finish(None, &mut out);
+                                        }
+                                        done = true;
+                                        break;
                                     }
-                                    done = true;
-                                    break;
                                 }
                                 let Ok(chunk_value) = serde_json::from_slice::<Value>(payload)
                                 else {
@@ -283,10 +456,16 @@ pub(crate) fn responses_stream_response(
 }
 
 /// Non-stream Responses: ONE upstream stream, aggregated locally into a
-/// single Responses object by the same converter the streaming path uses —/// never a second generation for shape conversion.
+/// single Responses object by the same converter the streaming path uses —
+/// never a second generation for shape conversion. Server-tool rounds
+/// re-invoke the upstream generation with grounding appended (same loop as
+/// the streaming pump; retry invariants enforced per round).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn aggregate_responses(
-    response: reqwest::Response,
+    upstream: &crate::upstream::ClineUpstream,
+    mut response: reqwest::Response,
+    chat_body: Value,
+    web_search: Option<crate::websearch::ResponsesWebSearchContext>,
     expose_thinking: bool,
     model: String,
     session_fp: Option<String>,
@@ -297,11 +476,25 @@ pub(crate) async fn aggregate_responses(
     request_id: &str,
     key_name: &str,
 ) -> Result<Value, crate::anthropic::ProtocolError> {
-    let mut converter = ResponsesConverter::new(&model, expose_thinking);
+    let server_tool_names: std::collections::HashSet<String> = web_search
+        .as_ref()
+        .map(|_| {
+            [crate::websearch::FUNCTION_NAME.to_owned()]
+                .into_iter()
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut converter =
+        ResponsesConverter::with_server_tools(&model, expose_thinking, server_tool_names);
     let mut watch = StreamWatch::new(timeouts, tokio::time::Instant::now());
     let mut buffer: Vec<u8> = Vec::with_capacity(8192);
     let mut byte_stream = response.bytes_stream();
-    let mut ttft_ms: Option<u128> = None;
+    let mut chat_body = chat_body;
+    let mut rounds_left = web_search
+        .as_ref()
+        .map(|config| config.max_uses)
+        .unwrap_or(0);
+    let mut web_searches: u64 = 0;
     let result = 'outer: loop {
         tokio::select! {
             _ = tokio::time::sleep_until(watch.next_deadline()) => {
@@ -349,6 +542,56 @@ pub(crate) async fn aggregate_responses(
                                         "upstream stream ended unexpectedly",
                                     ));
                                 }
+                                // Pure server-tool round: execute and
+                                // continue with a fresh upstream generation.
+                                if converter.has_server_tools()
+                                    && !converter.has_client_tools()
+                                    && rounds_left > 0
+                                {
+                                    let calls = converter.server_tool_calls();
+                                    rounds_left = rounds_left.saturating_sub(1);
+                                    let context =
+                                        web_search.as_ref().expect("server round requires context");
+                                    let outcomes = execute_server_round(
+                                        upstream, context, &calls, &session_fp, request_id,
+                                    )
+                                    .await;
+                                    web_searches = web_searches.saturating_add(
+                                        converter
+                                            .emit_web_search_round(
+                                                &calls, &outcomes, &mut Vec::new(),
+                                            )
+                                            as u64,
+                                    );
+                                    crate::websearch::append_server_round(
+                                        &mut chat_body, &calls, &outcomes,
+                                    );
+                                    converter.begin_new_upstream_round();
+                                    match start_continuation(
+                                        upstream,
+                                        &chat_body,
+                                        session_fp.as_deref(),
+                                        request_id,
+                                    )
+                                    .await
+                                    {
+                                        Ok((next_response, _next_key)) => {
+                                            response = next_response;
+                                            byte_stream = response.bytes_stream();
+                                            watch = StreamWatch::new(
+                                                timeouts,
+                                                tokio::time::Instant::now(),
+                                            );
+                                            buffer.clear();
+                                            continue;
+                                        }
+                                        Err(message) => {
+                                            break 'outer Err(
+                                                crate::anthropic::ProtocolError::upstream(message),
+                                            );
+                                        }
+                                    }
+                                }
                                 converter.finish(None, &mut Vec::new());
                                 break 'outer Ok(());
                             }
@@ -359,8 +602,8 @@ pub(crate) async fn aggregate_responses(
                             if semantic {
                                 let elapsed = started_at.elapsed().as_millis();
                                 watch.on_semantic(tokio::time::Instant::now());
-                                if ttft_ms.is_none() {
-                                    ttft_ms = Some(elapsed);
+                                if summary.upstream_headers_ms.is_none() {
+                                    summary.upstream_headers_ms = Some(elapsed);
                                 }
                             }
                         }
@@ -379,6 +622,7 @@ pub(crate) async fn aggregate_responses(
                 reasoning_bytes: converter.reasoning_bytes(),
                 tool_bytes: converter.tool_bytes(),
                 usage: converter.usage().map(openai_usage_shape),
+                web_searches,
                 ..PumpStats::default()
             };
             emit_stream_summary(summary, key_name, &stats, request_id);
@@ -458,7 +702,10 @@ fn emit_stream_summary(
         response_shape: None,
         upstream_status: Some(200),
         outcome,
-        web_search: crate::obs::WebSearchStats::default(),
+        web_search: crate::obs::WebSearchStats {
+            web_searches: stats.web_searches,
+            ..crate::obs::WebSearchStats::default()
+        },
     });
 }
 

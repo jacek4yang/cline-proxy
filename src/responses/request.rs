@@ -21,11 +21,20 @@
 //! - `prompt_cache_key` → forwarded verbatim to the upstream;
 //! - unknown optional fields (`store`, `metadata`, `previous_response_id`,
 //!   `truncation`, `stream_options`, …) are ignored safely;
-//! - hosted backend tools (`web_search`, `x_search`, …) are dropped, not
-//!   forwarded: this proxy cannot execute them and never fakes results, and
-//!   the model must not be offered a tool whose call could never be answered
-//!   (Grok Build sends a default `web_search` declaration routinely; dropping
-//!   it lets the request proceed with the client function tools).
+//! - the hosted `web_search` declaration converts to the same upstream
+//!   `web_search` function the Anthropic frontend offers: this proxy
+//!   executes the search against Cline `/search/websearch` and answers with
+//!   `web_search_call` output items (see `crate::websearch` and the
+//!   server-tool loop in `responses_pump`);
+//! - other backend-hosted tools (`x_search`, `code_interpreter`, MCP, …) are
+//!   dropped, not forwarded: this proxy cannot execute them and never fakes
+//!   results, and the model must not be offered a tool whose call could
+//!   never be answered (Grok Build sends a default `web_search` declaration
+//!   routinely; unsupported entries are dropped so the request can proceed
+//!   with the client function tools);
+//! - replayed `web_search_call` input items (Grok Build replays the
+//!   terminal response's output as next-turn conversation state) rebuild the
+//!   assistant/tool message pair from the item's own `action` data.
 
 use serde_json::{json, Map, Value};
 
@@ -44,6 +53,10 @@ pub struct Converted {
     /// The raw `prompt_cache_key` (fingerprinted by the caller before any
     /// use as a session identity; forwarded verbatim to the upstream).
     pub prompt_cache_key: Option<String>,
+    /// Set when the request declared a hosted `web_search` tool: the
+    /// server-tool loop executes searches up to this budget per request
+    /// (mirrors the Anthropic frontend's `web_search_max_uses`).
+    pub web_search_max_uses: Option<u32>,
 }
 
 /// Convert a Responses request into the normalized chat body.
@@ -126,11 +139,26 @@ pub fn convert_request(request: &Value, default_model: &str) -> Result<Converted
     chat.insert("messages".into(), Value::Array(convert_input(object)?));
 
     // --- tools ---
+    let mut web_search_declared = false;
+    let mut web_search_uses: Option<u32> = None;
     if let Some(tools) = object.get("tools") {
         let tools = tools
             .as_array()
             .ok_or_else(|| ProtocolError::invalid("tools must be an array"))?;
         if !tools.is_empty() {
+            for tool in tools {
+                if tool.get("type").and_then(Value::as_str) == Some("web_search") {
+                    web_search_declared = true;
+                    if let Some(uses) = tool.get("max_uses").and_then(Value::as_u64) {
+                        let clamped = uses.clamp(
+                            1,
+                            u64::from(crate::websearch::MAX_WEB_SEARCH_USES_PER_REQUEST),
+                        ) as u32;
+                        web_search_uses =
+                            Some(web_search_uses.map_or(clamped, |min: u32| min.min(clamped)));
+                    }
+                }
+            }
             let converted = convert_tools(tools)?;
             // Every declaration may have been a dropped hosted tool; an
             // empty tools array is omitted rather than forwarded.
@@ -150,6 +178,8 @@ pub fn convert_request(request: &Value, default_model: &str) -> Result<Converted
         thinking_requested,
         client_model,
         prompt_cache_key,
+        web_search_max_uses: web_search_declared
+            .then(|| web_search_uses.unwrap_or(crate::websearch::MAX_WEB_SEARCH_USES_PER_REQUEST)),
     })
 }
 
@@ -199,6 +229,19 @@ fn convert_input_items(items: &[Value]) -> Result<Vec<Value>, ProtocolError> {
                 // provider-opaque. Text/tool-call semantics are unaffected;
                 // user/assistant/tool ordering is preserved.
                 flush_calls(&mut messages, &mut pending_calls);
+            }
+            "web_search_call" => {
+                // Gateway-executed call from a previous turn, replayed
+                // verbatim by Grok Build (the terminal response carried it).
+                // Split into assistant(tool_calls) + tool(results) so the
+                // OpenAI tool_calls chain stays satisfied. The item owns its
+                // id, so the synthetic call reuses it (ids the proxy mints
+                // for its own calls share the same `ws_` shape and never
+                // collide with client function-call ids).
+                flush_calls(&mut messages, &mut pending_calls);
+                let (assistant, tool) = convert_web_search_call(obj, index)?;
+                messages.push(assistant);
+                messages.push(tool);
             }
             "item_reference" => {
                 return Err(ProtocolError::invalid(
@@ -406,6 +449,59 @@ fn convert_function_call_output(
     Ok(json!({"role": "tool", "tool_call_id": call_id, "content": content}))
 }
 
+/// A replayed `web_search_call` input item → assistant(tool_calls) +
+/// `role=tool` message pair. The result text is rebuilt from the item's own
+/// `action.search.query` + `action.sources` URLs — nothing is invented; a
+/// failed call replays as the failure it was (a failed call's sources list is
+/// empty). The function name is `web_search` (the upstream function this
+/// proxy offers), so the upstream tool_calls chain stays valid.
+fn convert_web_search_call(
+    obj: &Map<String, Value>,
+    index: usize,
+) -> Result<(Value, Value), ProtocolError> {
+    let id = obj
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            ProtocolError::invalid(format!("input[{index}]: web_search_call requires id"))
+        })?;
+    let query = obj
+        .get("action")
+        .and_then(|action| action.get("query"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut text = format!("Web search results for \"{query}\":\n");
+    let sources = obj
+        .get("action")
+        .and_then(|action| action.get("sources"))
+        .and_then(Value::as_array);
+    if let Some(sources) = sources {
+        for (position, source) in sources.iter().enumerate() {
+            let url = source.get("url").and_then(Value::as_str).unwrap_or("");
+            text.push_str(&format!("{}. {url}\n", position + 1));
+            if let Some(title) = source.get("title").and_then(Value::as_str) {
+                text.push_str(&format!("   {title}\n"));
+            }
+        }
+    }
+    let assistant = json!({
+        "role": "assistant",
+        "content": Value::Null,
+        "tool_calls": [{
+            "id": id,
+            "type": "function",
+            "function": {
+                "name": crate::websearch::FUNCTION_NAME,
+                "arguments": serde_json::to_string(&json!({"query": query}))
+                    .map_err(|_| ProtocolError::invalid("web_search_call query is not serializable"))?,
+            }
+        }]
+    });
+    let tool = json!({"role": "tool", "tool_call_id": id, "content": text});
+    Ok((assistant, tool))
+}
+
 // ---------------------------------------------------------------------------
 // tools & tool_choice
 // ---------------------------------------------------------------------------
@@ -421,6 +517,12 @@ fn convert_tools(tools: &[Value]) -> Result<Vec<Value>, ProtocolError> {
         match obj.get("type").and_then(Value::as_str) {
             // Already OpenAI-shaped (defensive; Grok never sends this).
             Some("function") if obj.contains_key("function") => out.push(tool.clone()),
+            // Hosted web_search: the model gets the same plain function the
+            // Anthropic frontend offers; the proxy executes the search and
+            // answers with `web_search_call` output items (see
+            // `crate::websearch` and the server-tool loop in
+            // `responses_pump`).
+            Some("web_search") => out.push(crate::websearch::upstream_function()),
             Some("function") | None => {
                 let name = obj
                     .get("name")
@@ -449,14 +551,15 @@ fn convert_tools(tools: &[Value]) -> Result<Vec<Value>, ProtocolError> {
                 }
                 out.push(json!({"type": "function", "function": function}));
             }
-            // Backend-hosted tools (web_search, x_search, code_interpreter,
-            // MCP, …): this proxy cannot execute them and never fakes
-            // results. Drop the declaration instead of failing the request —
-            // Grok Build sends a default `web_search` entry routinely, and a
-            // hard 400 would break every session with backend search left at
-            // its default. The model simply never sees a tool it could call
-            // but whose result could never be produced; client function
-            // tools continue to pass through.
+            // Backend-hosted tools other than web_search (x_search,
+            // code_interpreter, MCP, …): this proxy cannot execute them and
+            // never fakes results. Drop the declaration instead of failing
+            // the request — Grok Build sends a default `web_search` entry
+            // routinely, and a hard 400 would break every session with
+            // backend search left at its default. Unsupported entries are
+            // dropped so the model never sees a tool it could call but whose
+            // result could never be produced; client function tools continue
+            // to pass through.
             Some(other) => {
                 tracing::debug!(
                     tool_type = other,
@@ -623,12 +726,80 @@ mod tests {
         });
         let converted = convert_request(&request, "m").unwrap();
         let tools = converted.chat_body["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["function"]["name"], "Read");
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["function"]["name"], "web_search");
+        assert_eq!(tools[1]["function"]["name"], "Read");
         assert_eq!(
-            tools[0]["function"]["parameters"]["properties"]["path"]["type"],
+            tools[1]["function"]["parameters"]["properties"]["path"]["type"],
             "string"
         );
+    }
+
+    #[test]
+    fn hosted_web_search_converts_and_other_hosted_tools_dropped() {
+        let request = json!({
+            "input": "hi",
+            "tools": [
+                {"type": "web_search"},
+                {"type": "x_search"},
+                {"type": "function", "name": "Read",
+                 "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}
+            ]
+        });
+        let converted = convert_request(&request, "m").unwrap();
+        let tools = converted.chat_body["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["function"]["name"], "web_search");
+        assert_eq!(tools[1]["function"]["name"], "Read");
+        assert_eq!(
+            converted.web_search_max_uses,
+            Some(crate::websearch::MAX_WEB_SEARCH_USES_PER_REQUEST)
+        );
+        // A declaration budget clamps the per-request budget.
+        let request = json!({
+            "input": "hi",
+            "tools": [{"type": "web_search", "max_uses": 2}]
+        });
+        let converted = convert_request(&request, "m").unwrap();
+        assert_eq!(converted.web_search_max_uses, Some(2));
+    }
+
+    #[test]
+    fn web_search_call_replay_rebuilds_tool_chain() {
+        let request = json!({
+            "input": [
+                {"type": "message", "role": "user", "content": "search"},
+                {"type": "web_search_call", "id": "ws_abc", "status": "completed",
+                 "action": {"type": "search", "query": "glm 5.3 flash",
+                            "sources": [{"type": "url", "url": "https://example.com/a",
+                                         "title": "A"}]}},
+                {"type": "message", "role": "user", "content": "thanks"}
+            ]
+        });
+        let converted = convert_request(&request, "m").unwrap();
+        let messages = converted.chat_body["messages"].as_array().unwrap();
+        let roles: Vec<&str> = messages
+            .iter()
+            .map(|m| m["role"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(roles, vec!["user", "assistant", "tool", "user"]);
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "ws_abc");
+        assert_eq!(
+            messages[1]["tool_calls"][0]["function"]["name"],
+            "web_search"
+        );
+        let arguments: Value = serde_json::from_str(
+            messages[1]["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(arguments["query"], "glm 5.3 flash");
+        assert_eq!(messages[2]["tool_call_id"], "ws_abc");
+        let content = messages[2]["content"].as_str().unwrap();
+        assert!(content.contains("https://example.com/a"));
+        assert!(content.contains("A"));
+        assert!(!content.contains("snippet"), "nothing invented");
     }
 
     #[test]

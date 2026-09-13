@@ -53,16 +53,23 @@ struct ToolSlot {
     /// Responses `output_index` assigned when the item was added.
     output_index: usize,
     done: bool,
+    /// A server-tool call (`web_search`): accumulated for the search loop
+    /// but never emitted to the client as a `function_call` item — the
+    /// proxy executes it and answers with `web_search_call` items (see
+    /// [`ResponsesConverter::emit_web_search_round`]).
+    server: bool,
 }
 
 /// One output item in allocation order (terminal reconstruction ordering).
 /// Text lives in the live accumulators; these descriptors pin the order and
-/// identity only.
+/// identity only. `WebSearchCall` carries its full item (the proxy authors
+/// it — the upstream never emits it).
 #[derive(Debug)]
 enum OutputItem {
     Reasoning { item_id: String },
     Message { item_id: String },
     FunctionCall { item_id: String },
+    WebSearchCall { item: Value },
 }
 
 /// The streaming converter. Feed parsed OpenAI chat chunks; emitted Responses
@@ -83,6 +90,8 @@ pub struct ResponsesConverter {
     message: Option<MessageState>,
 
     tools: std::collections::BTreeMap<i64, ToolSlot>,
+    /// Function names executed server-side (see `crate::websearch`).
+    server_tool_names: std::collections::HashSet<String>,
     /// Completed output items in allocation order (terminal reconstruction).
     output_items: Vec<OutputItem>,
 
@@ -118,6 +127,16 @@ struct MessageState {
 
 impl ResponsesConverter {
     pub fn new(model: &str, expose_thinking: bool) -> Self {
+        Self::with_server_tools(model, expose_thinking, std::collections::HashSet::new())
+    }
+
+    /// Converter that suppresses client-side `function_call` items for the
+    /// given upstream function names (server-executed tools).
+    pub fn with_server_tools(
+        model: &str,
+        expose_thinking: bool,
+        server_tool_names: std::collections::HashSet<String>,
+    ) -> Self {
         Self {
             response_id: new_response_id(),
             model: model.to_owned(),
@@ -132,6 +151,7 @@ impl ResponsesConverter {
             reasoning: None,
             message: None,
             tools: std::collections::BTreeMap::new(),
+            server_tool_names,
             output_items: Vec::new(),
             finish_reason: None,
             usage: None,
@@ -453,6 +473,7 @@ impl ResponsesConverter {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned();
+        let is_server = self.server_tool_names.contains(&name);
         let output_index = self.next_output_index;
         self.next_output_index += 1;
         let item_id = new_function_call_id();
@@ -465,8 +486,14 @@ impl ResponsesConverter {
                 arguments: String::new(),
                 output_index,
                 done: false,
+                server: is_server,
             },
         );
+        // Server-tool calls never reach the client as `function_call` items:
+        // the proxy executes them and emits `web_search_call` items instead.
+        if is_server {
+            return;
+        }
         // Item-added FIRST: Grok Build builds its output_index → tool mapping
         // (and needs call_id + name) from this frame alone. An argument delta
         // emitted before it would be silently dropped.
@@ -513,14 +540,19 @@ impl ResponsesConverter {
             delta_args.push_str(arguments);
         }
         let (item_id, output_index) = (slot.item_id.clone(), slot.output_index);
+        let is_server = slot.server;
         if !delta_args.is_empty() {
-            let event = self.emit(json!({
-                "type": "response.function_call_arguments.delta",
-                "item_id": item_id,
-                "output_index": output_index,
-                "delta": delta_args
-            }));
-            out.extend_from_slice(event.as_bytes());
+            // Argument deltas for server tools stay internal (accumulated in
+            // the slot above); the client sees a `web_search_call` item.
+            if !is_server {
+                let event = self.emit(json!({
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "delta": delta_args
+                }));
+                out.extend_from_slice(event.as_bytes());
+            }
         }
     }
 
@@ -641,11 +673,13 @@ impl ResponsesConverter {
         }
         self.close_reasoning_item(out);
         self.close_message_item(out);
-        // Argument `done` + item `done` for every tool call, in output order.
+        // Argument `done` + item `done` for every client tool call, in
+        // output order. Server-tool slots are skipped (never client-visible
+        // as function_call items).
         let slots: Vec<(String, usize, String, String, String)> = self
             .tools
             .values()
-            .filter(|slot| !slot.done)
+            .filter(|slot| !slot.done && !slot.server)
             .map(|slot| {
                 (
                     slot.item_id.clone(),
@@ -701,6 +735,94 @@ impl ResponsesConverter {
         out.extend_from_slice(event.as_bytes());
     }
 
+    /// True when any upstream function call in this response is server-side.
+    pub fn has_server_tools(&self) -> bool {
+        self.tools.values().any(|slot| slot.server)
+    }
+
+    /// True when any upstream function call is a client tool call (a mixed
+    /// round: server tools execute, then the response ends so the client can
+    /// run its own tools).
+    pub fn has_client_tools(&self) -> bool {
+        self.tools.values().any(|slot| !slot.server)
+    }
+
+    /// Collected server-tool calls (query included).
+    pub fn server_tool_calls(&self) -> Vec<crate::websearch::OpenAiToolCall> {
+        self.tools
+            .values()
+            .filter(|slot| slot.server)
+            .map(|slot| crate::websearch::OpenAiToolCall {
+                id: slot.call_id.clone(),
+                name: slot.name.clone(),
+                arguments: slot.arguments.clone(),
+            })
+            .collect()
+    }
+
+    /// Round boundary after a server-tool continuation: the upstream call
+    /// accumulator is per-round (the next upstream generation starts fresh);
+    /// client-facing accumulators (text, reasoning) and the recorded
+    /// `web_search_call` output items persist for the terminal response.
+    pub fn begin_new_upstream_round(&mut self) {
+        self.tools.clear();
+        self.finish_reason = None;
+    }
+
+    /// Emit one gateway-executed web-search round as Responses SSE:
+    /// `response.web_search_call.in_progress` per call, then — once the
+    /// executions settle — `response.output_item.done` carrying the full
+    /// `web_search_call` item (query + source URLs + status). Returns the
+    /// number of executed searches. Each item is also recorded for terminal
+    /// reconstruction (Grok Build replays `response.completed.output` as
+    /// next-turn conversation state).
+    pub fn emit_web_search_round(
+        &mut self,
+        calls: &[crate::websearch::OpenAiToolCall],
+        outcomes: &[crate::websearch::SearchOutcome],
+        out: &mut Vec<u8>,
+    ) -> u64 {
+        for (_call, outcome) in calls.iter().zip(outcomes.iter()) {
+            let item_id = format!("ws_{}", uuid::Uuid::new_v4().simple());
+            let output_index = self.next_output_index;
+            self.next_output_index += 1;
+            let started = self.emit(json!({
+                "type": "response.web_search_call.in_progress",
+                "output_index": output_index,
+                "item_id": item_id
+            }));
+            out.extend_from_slice(started.as_bytes());
+            let sources: Vec<Value> = outcome
+                .results
+                .iter()
+                .filter_map(|result| {
+                    result
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .map(|url| json!({"type": "url", "url": url}))
+                })
+                .collect();
+            let item = json!({
+                "type": "web_search_call",
+                "id": item_id,
+                "status": if outcome.error.is_some() { "failed" } else { "completed" },
+                "action": {
+                    "type": "search",
+                    "query": outcome.query,
+                    "sources": sources
+                }
+            });
+            let done = self.emit(json!({
+                "type": "response.output_item.done",
+                "output_index": output_index,
+                "item": item
+            }));
+            out.extend_from_slice(done.as_bytes());
+            self.output_items.push(OutputItem::WebSearchCall { item });
+        }
+        outcomes.len() as u64
+    }
+
     /// Reconstruct the full response object for the terminal event (and
     /// non-stream aggregation) from the accumulated output items.
     fn terminal_response(&self, status: &str) -> Value {
@@ -749,6 +871,9 @@ impl ResponsesConverter {
                         "arguments": slot.arguments,
                         "status": "completed"
                     }));
+                }
+                OutputItem::WebSearchCall { item } => {
+                    output.push(item.clone());
                 }
             }
         }

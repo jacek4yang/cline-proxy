@@ -125,7 +125,6 @@ impl AppState {
             log_sink,
         })
     }
-
     /// One synchronous debounced-state flush. Called by the writer task and
     /// once more during graceful shutdown. Never called on the request path.
     pub fn flush_runtime_state(&self) {
@@ -527,6 +526,18 @@ async fn responses(
             return sanitized_upstream_error(&state, error, false, &request_id)
         }
     };
+    // Server-tool loop context for the hosted `web_search` declaration:
+    // per-request execution budget (clamped to the same hard cap as the
+    // Anthropic frontend), no declaration-level domain filters on this wire
+    // format (Grok Build's filters carry domains in a different envelope;
+    // unsupported here, matching the declaration drop for x_search).
+    let responses_web_search =
+        converted
+            .web_search_max_uses
+            .map(|max_uses| crate::websearch::ResponsesWebSearchContext {
+                max_uses,
+                domains: None,
+            });
     let model_family = if optimize::ModelFamily::from_upstream_model(&upstream_model)
         == optimize::ModelFamily::Glm53
     {
@@ -568,27 +579,36 @@ async fn responses(
         upstream_headers_ms: None,
         web_search: crate::obs::WebSearchStats::default(),
     };
+    let state = std::sync::Arc::new(state);
+    let reasoning_shadow = state.reasoning_shadow.clone();
+    let timeouts = state.config.upstream.stream_timeouts();
     if client_stream {
         return crate::responses_pump::responses_stream_response(
+            state,
             response,
+            selected.selected,
+            chat_body,
+            responses_web_search,
             converted.thinking_requested,
             upstream_model,
             session_fp,
-            state.reasoning_shadow.clone(),
-            state.config.upstream.stream_timeouts(),
+            reasoning_shadow,
+            timeouts,
             stream_summary,
-            selected.selected.name.to_string(),
             request_id,
         );
     }
     // Downstream non-stream: aggregate the upstream stream locally.
     let result = crate::responses_pump::aggregate_responses(
+        &state.upstream,
         response,
+        chat_body,
+        responses_web_search,
         converted.thinking_requested,
         upstream_model.clone(),
         session_fp.clone(),
-        state.reasoning_shadow.clone(),
-        state.config.upstream.stream_timeouts(),
+        reasoning_shadow,
+        timeouts,
         started,
         &mut stream_summary,
         &request_id,
