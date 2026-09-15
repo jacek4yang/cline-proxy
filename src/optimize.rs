@@ -771,6 +771,20 @@ mod tests {
                 "{model}"
             );
         }
+        // Issue #46: dynamically discovered free models must ride the
+        // passthrough family — only the GLM id keeps the full strategy.
+        for model in [
+            "cline-free/deepseek-v4.1-flash",
+            "cline-free/muse-spark-1.3-contributor",
+            "cline-free/solar-pro4",
+            "poolside/laguna-s-2.1:free",
+        ] {
+            assert_eq!(
+                ModelFamily::from_upstream_model(model),
+                GenericOpenAi,
+                "{model}"
+            );
+        }
         // Substrings inside unrelated tokens must not match.
         for model in ["aglm-4", "gpt-glmish", "kaggle"] {
             assert_eq!(

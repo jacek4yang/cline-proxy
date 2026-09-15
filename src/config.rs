@@ -118,6 +118,19 @@ impl Default for UpstreamConfig {
 }
 
 impl UpstreamConfig {
+    /// Migrate a deployed config that still carries the *exact* legacy
+    /// default header set (4.1.16 profile) to the current client profile.
+    /// User-customized headers are never touched: only a byte-for-byte
+    /// match with the full legacy set is replaced. Returns `true` when a
+    /// migration happened (the caller logs it once at startup).
+    pub fn migrate_legacy_headers(&mut self) -> bool {
+        if self.headers == legacy_default_cline_headers() {
+            self.headers = default_cline_headers();
+            return true;
+        }
+        false
+    }
+
     pub fn proxy_route(&self) -> Result<ProxyRoute> {
         ProxyRoute::parse(self.proxy.as_deref())
     }
@@ -132,7 +145,42 @@ impl UpstreamConfig {
     }
 }
 
+/// Current client-identity profile for upstream requests (issue #46).
+/// Evidence basis (cline/cline main, 2026-09-15): extension version 4.1.18;
+/// confirmed extension headers are `HTTP-Referer: https://cline.bot` and
+/// `X-Title: Cline` plus a per-client version. The `x-client-*` family is
+/// kept because it is harmless, overridable, and matches the legacy
+/// extension shape. There is no public evidence of header/UA-based bot
+/// detection at api.cline.bot; this profile is a best-effort match to a
+/// current Cline VSCode client, fully overridable via `upstream.headers`.
+pub const CLIENT_PROFILE_VERSION: &str = "4.1.18";
+/// Platform version tracked to the current stable VS Code line.
+pub const CLIENT_PROFILE_PLATFORM_VERSION: &str = "1.106.0";
+
 fn default_cline_headers() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("http-referer".into(), "https://cline.bot".into()),
+        (
+            "user-agent".into(),
+            format!("Cline/{CLIENT_PROFILE_VERSION}"),
+        ),
+        ("x-client-type".into(), "cline-vscode".into()),
+        ("x-client-version".into(), CLIENT_PROFILE_VERSION.into()),
+        ("x-core-version".into(), CLIENT_PROFILE_VERSION.into()),
+        ("x-platform".into(), "vscode".into()),
+        (
+            "x-platform-version".into(),
+            CLIENT_PROFILE_PLATFORM_VERSION.into(),
+        ),
+        ("x-title".into(), "Cline".into()),
+    ])
+}
+
+/// The previous default header set (4.1.16 profile). Deployed configs
+/// serialized these exact values into `upstream.headers`; a config whose
+/// headers match this map byte-for-byte carries no user customization and
+/// is migrated to the current profile at load.
+fn legacy_default_cline_headers() -> BTreeMap<String, String> {
     BTreeMap::from([
         ("http-referer".into(), "https://cline.bot".into()),
         ("user-agent".into(), "Cline/4.1.16".into()),
@@ -437,8 +485,17 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let bytes = std::fs::read(path)
             .with_context(|| format!("reading configuration {}", path.display()))?;
-        let config: Self = serde_json::from_slice(&bytes)
+        let mut config: Self = serde_json::from_slice(&bytes)
             .with_context(|| format!("parsing configuration {}", path.display()))?;
+        // One-time legacy default-header migration (issue #46). Only an
+        // exact match with the old 4.1.16 default set is replaced; user
+        // customizations are preserved.
+        if config.upstream.migrate_legacy_headers() {
+            tracing::info!(
+                profile_version = CLIENT_PROFILE_VERSION,
+                "upstream.headers refreshed from legacy 4.1.16 default profile"
+            );
+        }
         config.validate()?;
         Ok(config)
     }
@@ -650,6 +707,36 @@ mod tests {
             enabled: true,
         }];
         config
+    }
+
+    #[test]
+    fn legacy_default_headers_migrate_and_custom_headers_survive() {
+        // Exact legacy default set → replaced by the current profile.
+        let mut migrated = UpstreamConfig {
+            headers: legacy_default_cline_headers(),
+            ..Default::default()
+        };
+        assert!(migrated.migrate_legacy_headers());
+        assert_eq!(migrated.headers, default_cline_headers());
+        // User customization (any single value differs) → untouched.
+        let mut custom = UpstreamConfig {
+            headers: default_cline_headers(),
+            ..Default::default()
+        };
+        custom
+            .headers
+            .insert("user-agent".into(), "MyAgent/1.0".into());
+        assert!(!custom.migrate_legacy_headers());
+        assert_eq!(custom.headers["user-agent"], "MyAgent/1.0");
+    }
+
+    #[test]
+    fn current_profile_tracks_extension_evidence() {
+        // Issue #46: profile version tracks the current extension (4.1.18).
+        let headers = default_cline_headers();
+        assert_eq!(headers["x-client-version"], "4.1.18");
+        assert_eq!(headers["http-referer"], "https://cline.bot");
+        assert_eq!(headers["x-title"], "Cline");
     }
 
     #[test]

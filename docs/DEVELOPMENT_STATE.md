@@ -1,9 +1,9 @@
 # Development State
 
 Last updated: 2026-09-13
-Code baseline: Responses web-search fix (this PR) on main `27055c1`
+Code baseline: free models + client profile (this PR) on main `9f5a0ec`
 Repository: https://github.com/jacek4yang/cline-proxy
-Status: BUG FIX — Responses frontend: hosted web_search + web_search_call replay (issue #43)
+Status: FEATURE — dynamic free-model catalog + 4.1.18 client profile migration (issue #46)
 
 > Agent recovery protocol — on context compaction or session end:
 > 1. Read this file top to bottom.
@@ -188,34 +188,39 @@ Issues #3, #6, #8, #10, #13, #14, #16, #19, #24, #27 closed with their PRs.
 
 ## Current target
 
-**Responses frontend web-search fix (issue #43, branch
-`fix/responses-web-search`).**
+**Dynamic free-model support + Cline client profile (issue #46, branch
+`feat/free-models-client-profile`).**
 
-Two Grok Build session breakers fixed:
+Evidence-based (live `recommended-models` endpoint + cline/cline main
+2026-09-15): free promotion list rotates (currently 5 ids incl.
+`cline-free/deepseek-v4.1-flash`, `z-ai/glm-5.3-flash`,
+`poolside/laguna-s-2.1:free`); extension version 4.1.18; free-quota 429 body
+markers `free limit reached on model` / `try again in <time>` (errors.ts).
 
-1. The hosted `web_search` tool declaration is no longer dropped: it
-   converts to the same upstream `web_search` function the Anthropic
-   frontend offers. The gateway executes searches against Cline
-   `/search/websearch` (same credential pool discipline as the Anthropic
-   server-tool loop) and streams `response.web_search_call.in_progress` +
-   `output_item.done` frames with `action.search` payloads, then continues
-   the generation with the grounding appended to the upstream conversation
-   (pure server-tool rounds only; mixed rounds end the stream so client
-   tools run). Per-request budget clamped to the implementation cap.
-2. Replayed `web_search_call` input items (Grok Build replays the terminal
-   output as next-turn input) are accepted and rebuilt into the upstream
-   assistant/tool message pair from the item's own `action` data — nothing
-   invented; previously a 400 that permanently broke the session.
+Changes:
+- `model_catalog.rs`: TTL (6h) lazy cache of `free[].id`, ≤64 entries, single
+  in-flight refresh, failures degrade to the previous/static list; wired into
+  `/v1/models` (union with default+aliases, deduplicated).
+- Non-GLM free ids ride the GenericOpenAi passthrough (no `reasoning_effort`
+  injection, model id verbatim); `z-ai/glm-5.3-flash` keeps the full GLM
+  policy (ModelFamily regression-tested for all five free ids).
+- `upstream.headers` default profile refreshed to 4.1.18; deployed configs
+  carrying the exact legacy 4.1.16 default set are migrated at load
+  (`Config::load`); user-customized sets never touched.
+- Free-quota 429 classified as `free_quota` (new RateLimitKind); rotation
+  semantics unchanged (effective-429 only).
+- `fetch_free_models` on ClineUpstream (shared client/route/active key,
+  10s timeout, 256 KiB cap, non-fatal).
 
-Non-`web_search` hosted tools (`x_search`, `code_interpreter`, MCP, …)
-remain dropped, never forwarded. `start_continuation` reuses `send_chat`, so
-effective-429 failover and no-replay-after-commit apply per round.
+Tests: 319 total (293 lib + 4 glm53_policy + 4 reasoning_shadow + 18
+responses_api), debug and release; fmt/clippy `-D warnings` clean.
 
-Tests: 309 total (283 lib + 4 glm53_policy + 4 reasoning_shadow + 18
-responses_api integration), debug and release; fmt/clippy `-D warnings`
-clean. Production `D:\Workspace\cline-proxy-bin` not touched. No release.
+Explicitly not done: WorkOS OAuth account-token flow, TLS fingerprint
+simulation, ClinePass plan gating, background catalog polling. There is no
+public evidence of UA/TLS-based bot detection at api.cline.bot — the client
+profile is a best-effort match, fully overridable.
 
-## Previous target snapshot (Responses API frontend)
+## Previous target snapshot (Responses web-search fix)
 
 **Long-term normal use + production observation under FEATURE FREEZE.**
 
