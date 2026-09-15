@@ -7,6 +7,7 @@ pub mod config;
 pub mod console;
 pub mod context_guard;
 pub mod glm53;
+pub mod model_catalog;
 pub mod obs;
 pub mod optimize;
 pub mod pool;

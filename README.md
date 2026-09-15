@@ -133,6 +133,38 @@ Anthropic Messages, and token-count request accounting. For example:
 
 No live model-list request is needed for readiness or model discovery.
 
+### Cline free models (dynamic, issue #46)
+
+Cline runs rotating free-model promotions served live from
+`GET /api/v1/ai/cline/recommended-models` (`free[].id` — currently
+`cline-free/deepseek-v4.1-flash`, `cline-free/muse-spark-1.3-contributor`,
+`z-ai/glm-5.3-flash`, `cline-free/solar-pro4`, `poolside/laguna-s-2.1:free`).
+The gateway fetches that list lazily with a 6-hour TTL cache (bounded to 64
+entries, single in-flight refresh, failures degrade silently to the static
+list) and advertises the union in `/v1/models`. Any free model id can be used
+in requests directly — non-GLM ids ride the passthrough path with no GLM
+policy applied, so the upstream body keeps the requested model verbatim.
+`models.aliases` still takes precedence if you map a client name onto a free
+id.
+
+Free-quota exhaustion is per account: the gateway returns 429 with body text
+`free limit reached on model … try again in <time>` and the existing
+effective-429 state machine cools that key (parsed retry window, classified
+`free_quota`) and fails over to the next account key.
+
+### Upstream client profile (issue #46)
+
+Upstream requests carry a Cline VSCode client identity. The default profile
+tracks the current extension release (4.1.18): `http-referer: https://cline.bot`,
+`user-agent: Cline/4.1.18`, `x-client-type: cline-vscode`,
+`x-client-version`/`x-core-version` `4.1.18`, `x-platform: vscode`,
+`x-title: Cline`. Every value is overridable per deployment through
+`upstream.headers`. Configs still carrying the exact old 4.1.16 default set
+are migrated to the current profile automatically at load; user-customized
+header sets are never touched. There is no public evidence that
+api.cline.bot inspects User-Agent or TLS fingerprints; treat this profile as
+a best-effort client match, not a bypass.
+
 ### GLM-5.3-Flash request policy (reasoning, output, context)
 
 Requests are optimized for coding-agent workloads before they reach Cline.

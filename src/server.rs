@@ -50,6 +50,9 @@ pub struct AppState {
     /// Bounded non-blocking JSONL log queue (issue #16). `None` disables
     /// file logging; console summary logging always works.
     pub log_sink: Option<crate::obs::LogSink>,
+    /// TTL-cached dynamic free-model catalog (issue #46). Advisory only:
+    /// enriches `/v1/models`; never gates a request.
+    pub model_catalog: std::sync::Arc<crate::model_catalog::ModelCatalog>,
 }
 
 impl AppState {
@@ -123,6 +126,7 @@ impl AppState {
             token_count_permits,
             reasoning_shadow,
             log_sink,
+            model_catalog: Arc::new(crate::model_catalog::ModelCatalog::default()),
         })
     }
     /// One synchronous debounced-state flush. Called by the writer task and
@@ -229,7 +233,17 @@ async fn admin_status(State(state): State<AppState>) -> Response {
 
 async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let request_id = request_id(&headers);
-    let ids = state.config.model_ids();
+    // Static deterministic ids (default + aliases) plus the dynamic free
+    // promotion list (issue #46). The catalog refresh is TTL-bounded and
+    // advisory: failures degrade to the static list, never an error.
+    let mut ids = state.config.model_ids();
+    for id in state.model_catalog.free_model_ids(&state.upstream).await {
+        if !ids.iter().any(|existing| existing == &id) {
+            ids.push(id);
+        }
+    }
+    ids.sort();
+    ids.dedup();
     let data = ids
         .iter()
         .map(|id| {
@@ -2330,8 +2344,10 @@ mod tests {
     struct MockUpstream {
         sequences: Arc<Mutex<HashMap<String, VecDeque<Spec>>>>,
         search_sequences: Arc<Mutex<VecDeque<Spec>>>,
+        models_sequences: Arc<Mutex<VecDeque<Spec>>>,
         calls: Arc<Mutex<Vec<SeenRequest>>>,
         search_calls: Arc<Mutex<Vec<SeenRequest>>>,
+        models_calls: Arc<Mutex<u64>>,
     }
 
     impl MockUpstream {
@@ -2344,6 +2360,14 @@ mod tests {
 
         async fn seen(&self) -> Vec<SeenRequest> {
             self.calls.lock().await.clone()
+        }
+
+        async fn set_models(&self, specs: Vec<Spec>) {
+            *self.models_sequences.lock().await = VecDeque::from(specs);
+        }
+
+        async fn models_call_count(&self) -> u64 {
+            *self.models_calls.lock().await
         }
 
         async fn set_search(&self, specs: Vec<Spec>) {
@@ -2436,6 +2460,21 @@ mod tests {
 
     async fn start_mock() -> (String, MockUpstream, tokio::task::JoinHandle<()>) {
         let mock = MockUpstream::default();
+        async fn mock_models_handler(State(mock): State<MockUpstream>) -> Response {
+            *mock.models_calls.lock().await += 1;
+            let spec = mock
+                .models_sequences
+                .lock()
+                .await
+                .pop_front()
+                .unwrap_or_else(|| Spec::json(200, r#"{"free":[]}"#));
+            Response::builder()
+                .status(spec.status)
+                .header(header::CONTENT_TYPE, spec.content_type)
+                .body(Body::from(spec.body))
+                .unwrap()
+        }
+
         async fn mock_search_handler(
             State(mock): State<MockUpstream>,
             headers: HeaderMap,
@@ -2468,6 +2507,10 @@ mod tests {
         let app = Router::new()
             .route("/api/v1/chat/completions", post(mock_handler))
             .route("/api/v1/search/websearch", post(mock_search_handler))
+            .route(
+                "/api/v1/ai/cline/recommended-models",
+                get(mock_models_handler),
+            )
             .with_state(mock.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -4892,6 +4935,159 @@ mod tests {
         assert!(text.contains("\"type\":\"tool_use\""));
         assert!(!text.contains("server_tool_use"));
         assert!(mock.seen_search().await.is_empty());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn models_endpoint_merges_dynamic_free_catalog() {
+        // Issue #46: /v1/models advertises the statically configured ids plus
+        // the dynamic free promotion list (deduplicated, aliases preserved).
+        let (base, mock, task) = start_mock().await;
+        mock.set_models(vec![Spec::json(
+            200,
+            r#"{"recommended":[],"free":[
+                {"id":"cline-free/deepseek-v4.1-flash"},
+                {"id":"z-ai/glm-5.3-flash"},
+                {"id":"poolside/laguna-s-2.1:free"}]}"#,
+        )])
+        .await;
+        let app = router(AppState::new(test_config(base, 1)).unwrap());
+        let response = app
+            .clone()
+            .oneshot(gateway_request("/v1/models", Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: Value = serde_json::from_str(&response_text(response).await).unwrap();
+        let ids: Vec<&str> = value["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        // Static ids + free ids, deduplicated.
+        assert!(ids.contains(&"z-ai/glm-5.3-flash"));
+        assert!(ids.contains(&"claude-sonnet-4-6"));
+        assert!(ids.contains(&"cline-free/deepseek-v4.1-flash"));
+        assert!(ids.contains(&"poolside/laguna-s-2.1:free"));
+        assert_eq!(
+            ids.iter().filter(|id| **id == "z-ai/glm-5.3-flash").count(),
+            1
+        );
+        assert_eq!(mock.models_call_count().await, 1);
+        // Second call inside the TTL serves from cache: no extra fetch.
+        let response = app
+            .oneshot(gateway_request("/v1/models", Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(mock.models_call_count().await, 1);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn models_endpoint_degrades_when_catalog_fetch_fails() {
+        // Catalog endpoint down: /v1/models still serves the static list.
+        let (base, mock, task) = start_mock().await;
+        mock.set_models(vec![Spec::json(503, r#"{"error":{}}"#)])
+            .await;
+        let app = router(AppState::new(test_config(base, 1)).unwrap());
+        let response = app
+            .oneshot(gateway_request("/v1/models", Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: Value = serde_json::from_str(&response_text(response).await).unwrap();
+        let ids: Vec<&str> = value["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&"z-ai/glm-5.3-flash"));
+        assert!(!ids.iter().any(|id| id.starts_with("cline-free/")));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn free_model_chat_is_passthrough_without_glm_policy() {
+        // A non-GLM free model rides the GenericOpenAi family: the upstream
+        // body keeps the requested model id and gains no GLM reasoning
+        // effort / compaction.
+        let (base, mock, task) = start_mock().await;
+        mock.set(
+            "cline-key-1",
+            vec![Spec::sse(successful_sse("hello from deepseek"))],
+        )
+        .await;
+        let app = router(AppState::new(test_config(base, 1)).unwrap());
+        let body = json!({
+            "model": "cline-free/deepseek-v4.1-flash",
+            "stream": true,
+            "max_tokens": 4096,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let response = app
+            .oneshot(gateway_request(
+                "/v1/chat/completions",
+                Body::from(body.to_string()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let seen = mock.seen().await;
+        assert_eq!(seen.len(), 1);
+        let body = &seen[0].body;
+        assert_eq!(body["model"], "cline-free/deepseek-v4.1-flash");
+        assert!(body.get("reasoning_effort").is_none());
+        assert_eq!(body["max_tokens"], 4096);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn free_limit_429_rotates_keys_like_other_quota_errors() {
+        // Free-model promotion exhaustion (issue #46): the per-account daily
+        // bucket hits its limit; the effective-429 path cools that key and
+        // fails over to the next one (correct semantics, regression-guarded).
+        let (base, mock, task) = start_mock().await;
+        mock.set(
+            "cline-key-1",
+            vec![Spec::json(
+                429,
+                r#"{"error":{"message":"Free limit reached on model cline-free/deepseek-v4.1-flash. Try again in 3h 12m"}}"#,
+            )],
+        )
+        .await;
+        mock.set(
+            "cline-key-2",
+            vec![Spec::sse(successful_sse("from the second account"))],
+        )
+        .await;
+        let app = router(AppState::new(test_config(base, 2)).unwrap());
+        let body = json!({
+            "model": "z-ai/glm-5.3-flash",
+            "stream": true,
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let response = app
+            .oneshot(gateway_request(
+                "/v1/chat/completions",
+                Body::from(body.to_string()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response_text(response).await.contains("second account"));
+        let auths: Vec<String> = mock
+            .seen()
+            .await
+            .iter()
+            .map(|seen| seen.authorization.clone())
+            .collect();
+        assert_eq!(auths.len(), 2);
+        assert_eq!(auths[0], "Bearer cline-key-1");
+        assert_eq!(auths[1], "Bearer cline-key-2");
         task.abort();
     }
 }

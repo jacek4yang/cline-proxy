@@ -21,6 +21,35 @@ use crate::redaction::sanitize_text;
 
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 
+/// Free-model discovery budgets (issue #46): the recommended-models payload
+/// is small; a tight timeout keeps the lazy refresh off the request hot path.
+const RECOMMENDED_MODELS_TIMEOUT_SECS: u64 = 10;
+const MAX_MODELS_RESPONSE_BYTES: usize = 256 * 1024;
+/// Defensive bound on the number of advertised free models per refresh.
+pub const MAX_FREE_MODEL_IDS: usize = 64;
+
+/// Extract the free promotion model IDs from a recommended-models document:
+/// `free[].id` non-empty strings, deduplicated in order, defensively capped
+/// at [`MAX_FREE_MODEL_IDS`]. Malformed shapes yield whatever valid entries
+/// exist (possibly none) rather than an error.
+pub fn parse_free_model_ids(doc: &Value) -> Vec<String> {
+    let mut ids = Vec::new();
+    let Some(entries) = doc.get("free").and_then(Value::as_array) else {
+        return ids;
+    };
+    for entry in entries {
+        if let Some(id) = entry.get("id").and_then(Value::as_str) {
+            if !id.is_empty() && id.len() <= 256 && !ids.iter().any(|existing| existing == id) {
+                ids.push(id.to_owned());
+                if ids.len() >= MAX_FREE_MODEL_IDS {
+                    break;
+                }
+            }
+        }
+    }
+    ids
+}
+
 /// Per-logical-request data shared by every failover attempt. The
 /// serialized body and protocol flags are stable across attempts.
 /// `session_fp` is the INTERNAL session identity (cross-credential stable,
@@ -44,6 +73,7 @@ struct Inner {
     http: reqwest::Client,
     chat_url: reqwest::Url,
     search_url: reqwest::Url,
+    recommended_models_url: reqwest::Url,
     headers: HeaderMap,
     pool: KeyPool,
     fallback_cooldown: Duration,
@@ -116,6 +146,11 @@ impl ClineUpstream {
                 .context("building Cline chat-completions URL")?;
         let search_url = reqwest::Url::parse(&format!("{base}/search/websearch"))
             .context("building Cline websearch URL")?;
+        // Dynamic free-model discovery (issue #46): the free promotion list
+        // is served live and rotates; the extension reads it at runtime.
+        let recommended_models_url =
+            reqwest::Url::parse(&format!("{base}/ai/cline/recommended-models"))
+                .context("building Cline recommended-models URL")?;
         let mut headers = HeaderMap::new();
         for (name, value) in &config.upstream.headers {
             headers.insert(
@@ -142,6 +177,7 @@ impl ClineUpstream {
                 http,
                 chat_url,
                 search_url,
+                recommended_models_url,
                 headers,
                 pool,
                 fallback_cooldown: Duration::from_secs(config.upstream.fallback_429_cooldown_secs),
@@ -273,6 +309,58 @@ impl ClineUpstream {
             headers.insert("x-request-id", value);
         }
         Ok(headers)
+    }
+
+    /// Fetch the dynamic free-model promotion list from Cline
+    /// (`GET /ai/cline/recommended-models`, `free[].id`). Non-fatal: any
+    /// transport/status/parse failure yields `None` and the caller falls
+    /// back to its cached or static list. Uses the active credential and
+    /// the same shared client/route as chat; never rotates the key pool.
+    pub async fn fetch_free_models(&self, request_id: &str) -> Option<Vec<String>> {
+        let selected = self.inner.pool.active_key();
+        let mut headers =
+            match self.credential_headers(&selected, request_id, None, "application/json") {
+                Ok(headers) => headers,
+                Err(_) => return None,
+            };
+        headers.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
+        let result = self
+            .inner
+            .http
+            .get(self.inner.recommended_models_url.clone())
+            .headers(headers)
+            .timeout(Duration::from_secs(RECOMMENDED_MODELS_TIMEOUT_SECS))
+            .send()
+            .await;
+        let response = match result {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(
+                    request_id,
+                    error_class = transport_error_class(&error),
+                    "recommended-models fetch failed"
+                );
+                return None;
+            }
+        };
+        let status = response.status();
+        if status != StatusCode::OK {
+            tracing::warn!(
+                request_id,
+                status = status.as_u16(),
+                "recommended-models fetch returned non-200"
+            );
+            return None;
+        }
+        let raw = read_limited(response, MAX_MODELS_RESPONSE_BYTES).await;
+        let doc: Value = match serde_json::from_slice(&raw) {
+            Ok(doc) => doc,
+            Err(_) => {
+                tracing::warn!(request_id, "recommended-models body was not valid JSON");
+                return None;
+            }
+        };
+        Some(parse_free_model_ids(&doc))
     }
 
     /// Send one logical chat request. Only a classified effective HTTP 429 can
@@ -588,5 +676,57 @@ pub fn transport_error_class(error: &reqwest::Error) -> &'static str {
         "decode"
     } else {
         "transport"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_free_model_ids_extracts_free_array() {
+        let doc = json!({
+            "recommended": [{"id": "anthropic/claude-sonnet-4.6"}],
+            "free": [
+                {"id": "cline-free/deepseek-v4.1-flash", "name": "DeepSeek"},
+                {"id": "z-ai/glm-5.3-flash", "name": "GLM"},
+                {"id": "poolside/laguna-s-2.1:free", "name": "Laguna"}
+            ],
+            "clinePass": [{"id": "cline-pass/gpt-x"}]
+        });
+        let ids = parse_free_model_ids(&doc);
+        assert_eq!(
+            ids,
+            vec![
+                "cline-free/deepseek-v4.1-flash".to_owned(),
+                "z-ai/glm-5.3-flash".to_owned(),
+                "poolside/laguna-s-2.1:free".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_free_model_ids_is_defensive() {
+        assert!(parse_free_model_ids(&json!({})).is_empty());
+        assert!(parse_free_model_ids(&json!({"free": []})).is_empty());
+        assert!(parse_free_model_ids(&json!({"free": "bogus"})).is_empty());
+        // Malformed entries skipped, empty/oversized ids dropped.
+        let doc = json!({"free": [
+            {"name": "no id"},
+            {"id": ""},
+            {"id": 42},
+            {"id": "x".repeat(300)},
+            {"id": "valid/model"}
+        ]});
+        assert_eq!(parse_free_model_ids(&doc), vec!["valid/model".to_owned()]);
+        // Duplicates deduplicated; cap enforced.
+        let mut many = Vec::new();
+        for i in 0..80 {
+            many.push(json!({"id": format!("m/{i}")}));
+        }
+        let doc = json!({"free": many});
+        let ids = parse_free_model_ids(&doc);
+        assert_eq!(ids.len(), MAX_FREE_MODEL_IDS);
     }
 }

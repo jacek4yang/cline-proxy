@@ -16,6 +16,10 @@ pub enum RateLimitKind {
     /// Daily (or otherwise long-lived) free-quota exhaustion. Strong retry
     /// deadline, persistent until the quota window resets.
     DailyQuota,
+    /// Per-account free-model promotion exhaustion (issue #46: gateway
+    /// body "free limit reached on model … try again in <time>"). Retry
+    /// deadline comes from the parsed "try again in" text.
+    FreeQuota,
     /// Short-lived request-rate limiting (e.g. "too many requests, retry in
     /// 10s"). Expected to clear quickly.
     Transient,
@@ -27,6 +31,7 @@ impl RateLimitKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::DailyQuota => "daily_quota",
+            Self::FreeQuota => "free_quota",
             Self::Transient => "transient",
             Self::Unknown => "unknown",
         }
@@ -35,8 +40,11 @@ impl RateLimitKind {
 
 /// Classify a confirmed effective 429 into a rate-limit kind. Classification
 /// is deliberately conservative: only the explicit daily-free-limit wording
-/// used by Cline quota errors yields DailyQuota, short retry windows yield
-/// Transient, and everything else stays Unknown rather than guessed.
+/// used by Cline quota errors yields DailyQuota, the per-account
+/// free-model promotion wording yields FreeQuota (issue #46: gateway body
+/// "free limit reached on model" / "try again in <time>" — confirmed strings
+/// in cline/cline errors.ts), short retry windows yield Transient, and
+/// everything else stays Unknown rather than guessed.
 pub fn classify_rate_limit_kind(message: Option<&str>, duration: Duration) -> RateLimitKind {
     const TRANSIENT_WINDOW: Duration = Duration::from_secs(60);
     if let Some(message) = message {
@@ -45,6 +53,11 @@ pub fn classify_rate_limit_kind(message: Option<&str>, duration: Duration) -> Ra
             || (lower.contains("daily") && lower.contains("limit"))
         {
             return RateLimitKind::DailyQuota;
+        }
+        if lower.contains("free limit reached on model")
+            || (lower.contains("free") && lower.contains("limit"))
+        {
+            return RateLimitKind::FreeQuota;
         }
     }
     if duration <= TRANSIENT_WINDOW {
@@ -465,6 +478,20 @@ mod tests {
         assert_eq!(
             classify_rate_limit_kind(Some("daily limit exceeded"), Duration::from_secs(60)),
             RateLimitKind::DailyQuota
+        );
+        // Free-model promotion exhaustion (issue #46): gateway wording from
+        // cline/cline errors.ts. Classification never needs the "try again
+        // in" phrase to be present (the retry duration is parsed separately).
+        assert_eq!(
+            classify_rate_limit_kind(
+                Some("Free limit reached on model cline-free/deepseek-v4.1-flash. Try again in 3h 12m"),
+                Duration::from_secs(11_520),
+            ),
+            RateLimitKind::FreeQuota
+        );
+        assert_eq!(
+            classify_rate_limit_kind(Some("free limit exceeded"), Duration::from_secs(120)),
+            RateLimitKind::FreeQuota
         );
         assert_eq!(
             classify_rate_limit_kind(Some("too many requests"), Duration::from_secs(10)),
