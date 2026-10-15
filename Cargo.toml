@@ -20,7 +20,7 @@ httpdate = "1"
 # serializes them with Python's insertion-ordered dicts; minijinja sorts map
 # keys unless this feature is enabled, which would change the exact prompt
 # bytes (and therefore the exact token count) relative to the reference.
-minijinja = { version = "2", default-features = false, features = ["builtins", "macros", "serde", "loop_controls", "json", "preserve_order"] }
+minijinja = { version = "3", default-features = false, features = ["builtins", "macros", "serde", "loop_controls", "json", "preserve_order"] }
 # pycompat: the official GLM chat template uses Python-style methods
 # (dict.items(), str.strip(), str.split()); pycompat supplies them without
 # modifying the official template file.
